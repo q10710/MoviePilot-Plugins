@@ -1,0 +1,14 @@
+{
+  "BestVersionGuard": {
+    "name": "洗版守护",
+    "description": "定时检查电视剧订阅：未完结的误标洗版自动取消，恢复普通订阅继续追更。",
+    "labels": "订阅",
+    "version": "2.4.1",
+    "icon": "bestversionguard.png",
+    "author": "local",
+    "level": 1,
+    "history": {
+      "v2.4.1": "修复API调用bug，加入媒体库对比，只取消未完结的误标洗版，不主动补洗版"
+    }
+  }
+}
