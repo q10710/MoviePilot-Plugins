@@ -22,5 +22,17 @@
     "history": {
       "v3.1.0": "按天计数，连续3天孤立自动删除，每次实时扫描不依赖历史"
     }
+  },
+  "StaleSubCleaner": {
+    "name": "过期订阅清理",
+    "description": "检查订阅，超过指定天数未下载的自动取消。电视剧和电影可分别设置天数。",
+    "labels": "订阅",
+    "version": "1.1.0",
+    "icon": "stalesubcleaner.png",
+    "author": "local",
+    "level": 1,
+    "history": {
+      "v1.1.0": "支持电视剧和电影分别设置过期天数，电影默认180天"
+    }
   }
 }
