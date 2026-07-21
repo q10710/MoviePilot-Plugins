@@ -10,5 +10,17 @@
     "history": {
       "v2.4.1": "修复API调用bug，加入媒体库对比，只取消未完结的误标洗版，不主动补洗版"
     }
+  },
+  "LinkChecker": {
+    "name": "硬链接检查",
+    "description": "扫描下载目录和媒体库目录中的孤立硬链接文件，连续3天孤立自动删除。",
+    "labels": "文件管理",
+    "version": "3.1.0",
+    "icon": "linkchecker.png",
+    "author": "local",
+    "level": 1,
+    "history": {
+      "v3.1.0": "按天计数，连续3天孤立自动删除，每次实时扫描不依赖历史"
+    }
   }
 }
