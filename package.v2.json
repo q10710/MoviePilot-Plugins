@@ -34,5 +34,17 @@
     "history": {
       "v1.1.0": "支持电视剧和电影分别设置过期天数，电影默认180天"
     }
+  },
+  "TrafficAssistantQ": {
+    "name": "站点流量管理（Q魔改版）",
+    "description": "自动管理流量，保障站点分享率。适配 BrushFlow 5.0.0 tasks 结构。",
+    "labels": "站点管理",
+    "version": "1.7",
+    "icon": "trafficassistantq.png",
+    "author": "Q",
+    "level": 2,
+    "history": {
+      "v1.7": "适配 BrushFlow 5.0.0 tasks 结构，自动创建缺失刷流任务，智能选择下载器/保存路径/时间配置，自动修复不完整配置"
+    }
   }
 }
