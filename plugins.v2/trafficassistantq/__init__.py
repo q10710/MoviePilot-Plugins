@@ -876,15 +876,16 @@ class TrafficAssistantQ(_PluginBase):
                     config_needs_update = True
                 # 启用时自动修复配置不完整的 task（仅补全空字段，已有值的字段不覆盖）
                 if enable and task.get("enabled"):
+                    template = self.__get_brush_template_config(tasks)
                     fixed_fields = []
                     if not task.get("downloader"):
-                        downloader_name = self.__get_brush_downloader(tasks)
+                        downloader_name = template.get("downloader", "")
                         if downloader_name:
                             task["downloader"] = downloader_name
                             fixed_fields.append(f"下载器→{downloader_name}")
                             config_needs_update = True
                     if not task.get("save_path"):
-                        save_path = self.__get_brush_save_path(tasks)
+                        save_path = template.get("save_path", "")
                         if save_path:
                             task["save_path"] = save_path
                             fixed_fields.append(f"保存路径→{save_path}")
@@ -917,55 +918,51 @@ class TrafficAssistantQ(_PluginBase):
                 actions.append(action_msg)
             else:
                 import uuid
-                # 智能选择下载器：优先使用已有刷流任务的下载器，否则选第一个 qbittorrent 下载器
-                downloader_name = self.__get_brush_downloader(tasks)
-                # 智能获取保存路径：从已有刷流任务中获取
-                save_path = self.__get_brush_save_path(tasks)
-                # 智能获取时间配置：优先复制已有刷流任务的时间配置，没有则默认全天
-                time_config = self.__get_brush_time_config(tasks)
+                # 从已有刷流任务中提取可复用的配置模板（取最后修改的）
+                template = self.__get_brush_template_config(tasks)
                 new_task = {
                     "id": uuid.uuid4().hex,
                     "name": site_name,
                     "enabled": True,
                     "notify": False,
                     "site_id": site_id,
-                    "downloader": downloader_name,
+                    "downloader": template["downloader"],
                     "brush_interval": 10,
                     "check_interval": 5,
-                    "cron": time_config.get("cron", ""),
-                    "active_time_range": time_config.get("active_time_range", ""),
-                    "disksize": None,
-                    "maxupspeed": None,
-                    "maxdlspeed": None,
-                    "maxdlcount": None,
-                    "freeleech": "free",
-                    "hr": "yes",
-                    "include": None,
-                    "exclude": None,
-                    "size": None,
-                    "seeder": None,
-                    "timezone_offset": 0.0,
-                    "pubtime": None,
-                    "seed_time": None,
-                    "hr_seed_time": None,
-                    "seed_ratio": None,
-                    "seed_size": None,
-                    "download_time": None,
-                    "seed_avgspeed": None,
-                    "seed_inactivetime": None,
-                    "delete_size_range": None,
-                    "up_speed": None,
-                    "dl_speed": None,
-                    "auto_archive_days": None,
-                    "save_path": save_path,
-                    "delete_except_tags": None,
-                    "except_subscribe": False,
-                    "proxy_delete": False,
-                    "del_no_free": False,
-                    "qb_category": None,
-                    "site_hr_active": False,
-                    "site_skip_tips": False,
-                    "rss_support": False,
+                    "cron": template["cron"],
+                    "active_time_range": template["active_time_range"],
+                    "disksize": template["disksize"],
+                    "maxupspeed": template["maxupspeed"],
+                    "maxdlspeed": template["maxdlspeed"],
+                    "maxdlcount": template["maxdlcount"],
+                    "freeleech": template["freeleech"],
+                    "hr": template["hr"],
+                    "include": template["include"],
+                    "exclude": template["exclude"],
+                    "size": template["size"],
+                    "seeder": template["seeder"],
+                    "timezone_offset": template["timezone_offset"],
+                    "pubtime": template["pubtime"],
+                    "seed_time": template["seed_time"],
+                    "hr_seed_time": template["hr_seed_time"],
+                    "seed_ratio": template["seed_ratio"],
+                    "seed_size": template["seed_size"],
+                    "download_time": template["download_time"],
+                    "seed_avgspeed": template["seed_avgspeed"],
+                    "seed_inactivetime": template["seed_inactivetime"],
+                    "delete_size_range": template["delete_size_range"],
+                    "up_speed": template["up_speed"],
+                    "dl_speed": template["dl_speed"],
+                    "auto_archive_days": template["auto_archive_days"],
+                    "save_path": template["save_path"],
+                    "delete_except_tags": template["delete_except_tags"],
+                    "except_subscribe": template["except_subscribe"],
+                    "proxy_delete": template["proxy_delete"],
+                    "del_no_free": template["del_no_free"],
+                    "qb_category": template["qb_category"],
+                    "site_hr_active": template["site_hr_active"],
+                    "site_skip_tips": template["site_skip_tips"],
+                    "rss_support": template["rss_support"],
                 }
                 tasks.append(new_task)
                 task_updated = True
