@@ -1011,8 +1011,7 @@ class TrafficAssistantQ(_PluginBase):
         return ""
 
     def __get_brush_template_config(self, tasks: list) -> dict:
-        """从已有刷流任务中提取可复用的配置模板，没有则使用安全默认值"""
-        # 先尝试从已有 task 中获取各项配置
+        """从已有刷流任务中提取可复用的配置模板（取最后一个有值的，即最新修改的），没有则使用安全默认值"""
         downloader = ""
         save_path = ""
         cron = ""
@@ -1050,49 +1049,48 @@ class TrafficAssistantQ(_PluginBase):
         rss_support = False
 
         for task in tasks:
-            if not downloader and task.get("downloader"):
+            if task.get("downloader"):
                 downloader = task["downloader"]
-            if not save_path and task.get("save_path"):
+            if task.get("save_path"):
                 save_path = task["save_path"]
-            if not cron and not active_time_range:
-                if task.get("cron") or task.get("active_time_range"):
-                    cron = task.get("cron", "")
-                    active_time_range = task.get("active_time_range", "")
-            if disksize is None and task.get("disksize") is not None:
+            if task.get("cron") or task.get("active_time_range"):
+                cron = task.get("cron", "")
+                active_time_range = task.get("active_time_range", "")
+            if task.get("disksize") is not None:
                 disksize = task["disksize"]
-            if maxupspeed is None and task.get("maxupspeed") is not None:
+            if task.get("maxupspeed") is not None:
                 maxupspeed = task["maxupspeed"]
-            if maxdlspeed is None and task.get("maxdlspeed") is not None:
+            if task.get("maxdlspeed") is not None:
                 maxdlspeed = task["maxdlspeed"]
-            if maxdlcount is None and task.get("maxdlcount") is not None:
+            if task.get("maxdlcount") is not None:
                 maxdlcount = task["maxdlcount"]
-            if seeder is None and task.get("seeder") is not None:
+            if task.get("seeder") is not None:
                 seeder = task["seeder"]
-            if pubtime is None and task.get("pubtime") is not None:
+            if task.get("pubtime") is not None:
                 pubtime = task["pubtime"]
-            if seed_time is None and task.get("seed_time") is not None:
+            if task.get("seed_time") is not None:
                 seed_time = task["seed_time"]
-            if hr_seed_time is None and task.get("hr_seed_time") is not None:
+            if task.get("hr_seed_time") is not None:
                 hr_seed_time = task["hr_seed_time"]
-            if seed_ratio is None and task.get("seed_ratio") is not None:
+            if task.get("seed_ratio") is not None:
                 seed_ratio = task["seed_ratio"]
-            if seed_size is None and task.get("seed_size") is not None:
+            if task.get("seed_size") is not None:
                 seed_size = task["seed_size"]
-            if download_time is None and task.get("download_time") is not None:
+            if task.get("download_time") is not None:
                 download_time = task["download_time"]
-            if seed_avgspeed is None and task.get("seed_avgspeed") is not None:
+            if task.get("seed_avgspeed") is not None:
                 seed_avgspeed = task["seed_avgspeed"]
-            if seed_inactivetime is None and task.get("seed_inactivetime") is not None:
+            if task.get("seed_inactivetime") is not None:
                 seed_inactivetime = task["seed_inactivetime"]
-            if delete_size_range is None and task.get("delete_size_range") is not None:
+            if task.get("delete_size_range") is not None:
                 delete_size_range = task["delete_size_range"]
-            if up_speed is None and task.get("up_speed") is not None:
+            if task.get("up_speed") is not None:
                 up_speed = task["up_speed"]
-            if dl_speed is None and task.get("dl_speed") is not None:
+            if task.get("dl_speed") is not None:
                 dl_speed = task["dl_speed"]
-            if auto_archive_days is None and task.get("auto_archive_days") is not None:
+            if task.get("auto_archive_days") is not None:
                 auto_archive_days = task["auto_archive_days"]
-            if delete_except_tags is None and task.get("delete_except_tags") is not None:
+            if task.get("delete_except_tags") is not None:
                 delete_except_tags = task["delete_except_tags"]
             if task.get("except_subscribe") is not None:
                 except_subscribe = task["except_subscribe"]
@@ -1100,7 +1098,7 @@ class TrafficAssistantQ(_PluginBase):
                 proxy_delete = True
             if task.get("del_no_free"):
                 del_no_free = True
-            if qb_category is None and task.get("qb_category") is not None:
+            if task.get("qb_category") is not None:
                 qb_category = task["qb_category"]
             if task.get("site_hr_active"):
                 site_hr_active = True
