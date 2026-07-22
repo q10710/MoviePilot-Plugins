@@ -890,10 +890,10 @@ class TrafficAssistantQ(_PluginBase):
                             fixed_fields.append(f"保存路径→{save_path}")
                             config_needs_update = True
                     if not task.get("cron") and not task.get("active_time_range"):
-                        time_config = self.__get_brush_time_config(tasks)
-                        if time_config.get("cron") or time_config.get("active_time_range"):
-                            task["cron"] = time_config.get("cron", "")
-                            task["active_time_range"] = time_config.get("active_time_range", "")
+                        template = self.__get_brush_template_config(tasks)
+                        if template.get("cron") or template.get("active_time_range"):
+                            task["cron"] = template.get("cron", "")
+                            task["active_time_range"] = template.get("active_time_range", "")
                             fixed_fields.append("时间配置已补全")
                             config_needs_update = True
                     if task.get("except_subscribe") is True:
@@ -970,7 +970,7 @@ class TrafficAssistantQ(_PluginBase):
                 tasks.append(new_task)
                 task_updated = True
                 config_needs_update = True
-                action_msg = f"刷流站点：已为站点 {site_name}({site_id}) 创建并启用刷流任务（下载器：{downloader_name}，保存路径：{save_path}）"
+                action_msg = f"刷流站点：已为站点 {site_name}({site_id}) 创建并启用刷流任务"
                 logger.info(action_msg)
                 actions.append(action_msg)
 
@@ -1010,22 +1010,146 @@ class TrafficAssistantQ(_PluginBase):
                 return first_name
         return ""
 
-    def __get_brush_save_path(self, tasks: list) -> str:
-        """智能获取刷流保存路径：从已有刷流任务中获取"""
-        for task in tasks:
-            save_path = task.get("save_path", "")
-            if save_path:
-                return save_path
-        return ""
+    def __get_brush_template_config(self, tasks: list) -> dict:
+        """从已有刷流任务中提取可复用的配置模板，没有则使用安全默认值"""
+        # 先尝试从已有 task 中获取各项配置
+        downloader = ""
+        save_path = ""
+        cron = ""
+        active_time_range = ""
+        disksize = None
+        maxupspeed = None
+        maxdlspeed = None
+        maxdlcount = None
+        freeleech = "free"
+        hr = "yes"
+        include = None
+        exclude = None
+        size = None
+        seeder = None
+        timezone_offset = 0.0
+        pubtime = None
+        seed_time = None
+        hr_seed_time = None
+        seed_ratio = None
+        seed_size = None
+        download_time = None
+        seed_avgspeed = None
+        seed_inactivetime = None
+        delete_size_range = None
+        up_speed = None
+        dl_speed = None
+        auto_archive_days = None
+        delete_except_tags = None
+        except_subscribe = False
+        proxy_delete = False
+        del_no_free = False
+        qb_category = None
+        site_hr_active = False
+        site_skip_tips = False
+        rss_support = False
 
-    def __get_brush_time_config(self, tasks: list) -> dict:
-        """智能获取刷流时间配置：优先复制已有刷流任务的时间配置，没有则默认全天"""
         for task in tasks:
-            cron = task.get("cron", "")
-            active_time_range = task.get("active_time_range", "")
-            if cron or active_time_range:
-                return {"cron": cron or "", "active_time_range": active_time_range or ""}
-        return {"cron": "", "active_time_range": ""}
+            if not downloader and task.get("downloader"):
+                downloader = task["downloader"]
+            if not save_path and task.get("save_path"):
+                save_path = task["save_path"]
+            if not cron and not active_time_range:
+                if task.get("cron") or task.get("active_time_range"):
+                    cron = task.get("cron", "")
+                    active_time_range = task.get("active_time_range", "")
+            if disksize is None and task.get("disksize") is not None:
+                disksize = task["disksize"]
+            if maxupspeed is None and task.get("maxupspeed") is not None:
+                maxupspeed = task["maxupspeed"]
+            if maxdlspeed is None and task.get("maxdlspeed") is not None:
+                maxdlspeed = task["maxdlspeed"]
+            if maxdlcount is None and task.get("maxdlcount") is not None:
+                maxdlcount = task["maxdlcount"]
+            if seeder is None and task.get("seeder") is not None:
+                seeder = task["seeder"]
+            if pubtime is None and task.get("pubtime") is not None:
+                pubtime = task["pubtime"]
+            if seed_time is None and task.get("seed_time") is not None:
+                seed_time = task["seed_time"]
+            if hr_seed_time is None and task.get("hr_seed_time") is not None:
+                hr_seed_time = task["hr_seed_time"]
+            if seed_ratio is None and task.get("seed_ratio") is not None:
+                seed_ratio = task["seed_ratio"]
+            if seed_size is None and task.get("seed_size") is not None:
+                seed_size = task["seed_size"]
+            if download_time is None and task.get("download_time") is not None:
+                download_time = task["download_time"]
+            if seed_avgspeed is None and task.get("seed_avgspeed") is not None:
+                seed_avgspeed = task["seed_avgspeed"]
+            if seed_inactivetime is None and task.get("seed_inactivetime") is not None:
+                seed_inactivetime = task["seed_inactivetime"]
+            if delete_size_range is None and task.get("delete_size_range") is not None:
+                delete_size_range = task["delete_size_range"]
+            if up_speed is None and task.get("up_speed") is not None:
+                up_speed = task["up_speed"]
+            if dl_speed is None and task.get("dl_speed") is not None:
+                dl_speed = task["dl_speed"]
+            if auto_archive_days is None and task.get("auto_archive_days") is not None:
+                auto_archive_days = task["auto_archive_days"]
+            if delete_except_tags is None and task.get("delete_except_tags") is not None:
+                delete_except_tags = task["delete_except_tags"]
+            if task.get("except_subscribe") is not None:
+                except_subscribe = task["except_subscribe"]
+            if task.get("proxy_delete"):
+                proxy_delete = True
+            if task.get("del_no_free"):
+                del_no_free = True
+            if qb_category is None and task.get("qb_category") is not None:
+                qb_category = task["qb_category"]
+            if task.get("site_hr_active"):
+                site_hr_active = True
+            if task.get("site_skip_tips"):
+                site_skip_tips = True
+            if task.get("rss_support"):
+                rss_support = True
+
+        # 如果 downloader 仍为空，回退到系统下载器
+        if not downloader:
+            downloader = self.__get_brush_downloader(tasks)
+
+        return {
+            "downloader": downloader,
+            "save_path": save_path,
+            "cron": cron,
+            "active_time_range": active_time_range,
+            "disksize": disksize,
+            "maxupspeed": maxupspeed,
+            "maxdlspeed": maxdlspeed,
+            "maxdlcount": maxdlcount,
+            "freeleech": freeleech,
+            "hr": hr,
+            "include": include,
+            "exclude": exclude,
+            "size": size,
+            "seeder": seeder,
+            "timezone_offset": timezone_offset,
+            "pubtime": pubtime,
+            "seed_time": seed_time,
+            "hr_seed_time": hr_seed_time,
+            "seed_ratio": seed_ratio,
+            "seed_size": seed_size,
+            "download_time": download_time,
+            "seed_avgspeed": seed_avgspeed,
+            "seed_inactivetime": seed_inactivetime,
+            "delete_size_range": delete_size_range,
+            "up_speed": up_speed,
+            "dl_speed": dl_speed,
+            "auto_archive_days": auto_archive_days,
+            "delete_except_tags": delete_except_tags,
+            "except_subscribe": except_subscribe,
+            "proxy_delete": proxy_delete,
+            "del_no_free": del_no_free,
+            "qb_category": qb_category,
+            "site_hr_active": site_hr_active,
+            "site_skip_tips": site_skip_tips,
+            "rss_support": rss_support,
+        }
 
     def __reload_plugin(self, plugin_id: str):
         logger.info(f"准备热加载插件: {plugin_id}")
