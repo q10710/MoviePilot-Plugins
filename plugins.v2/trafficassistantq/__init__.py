@@ -857,8 +857,53 @@ class TrafficAssistantQ(_PluginBase):
 
         # 查找匹配 site_id 的 task
         task_updated = False
+        rss_support = False
+
+        # 优先使用同站点已有任务的完整配置（手动调整过的）
+        if site_id is not None:
+            for task in tasks:
+                if task.get("site_id") == site_id:
+                    return {
+                        "downloader": task.get("downloader", ""),
+                        "save_path": task.get("save_path", ""),
+                        "cron": task.get("cron", ""),
+                        "active_time_range": task.get("active_time_range", ""),
+                        "disksize": task.get("disksize"),
+                        "maxupspeed": task.get("maxupspeed"),
+                        "maxdlspeed": task.get("maxdlspeed"),
+                        "maxdlcount": task.get("maxdlcount"),
+                        "freeleech": task.get("freeleech", "free"),
+                        "hr": task.get("hr", "yes"),
+                        "include": task.get("include"),
+                        "exclude": task.get("exclude"),
+                        "size": task.get("size"),
+                        "seeder": task.get("seeder"),
+                        "timezone_offset": task.get("timezone_offset", 0.0),
+                        "pubtime": task.get("pubtime"),
+                        "seed_time": task.get("seed_time"),
+                        "hr_seed_time": task.get("hr_seed_time"),
+                        "seed_ratio": task.get("seed_ratio"),
+                        "seed_size": task.get("seed_size"),
+                        "download_time": task.get("download_time"),
+                        "seed_avgspeed": task.get("seed_avgspeed"),
+                        "seed_inactivetime": task.get("seed_inactivetime"),
+                        "delete_size_range": task.get("delete_size_range"),
+                        "up_speed": task.get("up_speed"),
+                        "dl_speed": task.get("dl_speed"),
+                        "auto_archive_days": task.get("auto_archive_days"),
+                        "delete_except_tags": task.get("delete_except_tags"),
+                        "except_subscribe": task.get("except_subscribe", False),
+                        "proxy_delete": task.get("proxy_delete", False),
+                        "del_no_free": task.get("del_no_free", False),
+                        "qb_category": task.get("qb_category"),
+                        "site_hr_active": task.get("site_hr_active", False),
+                        "site_skip_tips": task.get("site_skip_tips", False),
+                        "rss_support": task.get("rss_support", False),
+                    }
+
         for task in tasks:
             if task.get("site_id") == site_id:
+                task_updated = True
                 current_enabled = task.get("enabled", False)
                 if enable and not current_enabled:
                     task["enabled"] = True
@@ -876,7 +921,7 @@ class TrafficAssistantQ(_PluginBase):
                     config_needs_update = True
                 # 启用时自动修复配置不完整的 task（仅补全空字段，已有值的字段不覆盖）
                 if enable and task.get("enabled"):
-                    template = self.__get_brush_template_config(tasks)
+                    template = self.__get_brush_template_config(tasks, site_id)
                     fixed_fields = []
                     if not task.get("downloader"):
                         downloader_name = template.get("downloader", "")
@@ -891,7 +936,7 @@ class TrafficAssistantQ(_PluginBase):
                             fixed_fields.append(f"保存路径→{save_path}")
                             config_needs_update = True
                     if not task.get("cron") and not task.get("active_time_range"):
-                        template = self.__get_brush_template_config(tasks)
+                        template = self.__get_brush_template_config(tasks, site_id)
                         if template.get("cron") or template.get("active_time_range"):
                             task["cron"] = template.get("cron", "")
                             task["active_time_range"] = template.get("active_time_range", "")
@@ -902,8 +947,6 @@ class TrafficAssistantQ(_PluginBase):
                         fixed_fields.append("排除订阅→关闭")
                         config_needs_update = True
                     if fixed_fields:
-                        if not task_updated:
-                            task_updated = True
                         action_msg = f"刷流站点：已修复站点 {site_id} 的刷流任务配置（{', '.join(fixed_fields)}）"
                         logger.info(action_msg)
                         actions.append(action_msg)
@@ -918,8 +961,8 @@ class TrafficAssistantQ(_PluginBase):
                 actions.append(action_msg)
             else:
                 import uuid
-                # 从已有刷流任务中提取可复用的配置模板（取最后修改的）
-                template = self.__get_brush_template_config(tasks)
+                # 优先使用同站点已有任务的完整配置，没有则从所有任务中提取模板
+                template = self.__get_brush_template_config(tasks, site_id)
                 new_task = {
                     "id": uuid.uuid4().hex,
                     "name": site_name,
@@ -991,6 +1034,50 @@ class TrafficAssistantQ(_PluginBase):
     def __get_brush_downloader(self, tasks: list) -> str:
         """智能选择刷流下载器：优先使用已有刷流任务的下载器，否则选第一个 qbittorrent 下载器"""
         # 从已有 task 中获取下载器
+        rss_support = False
+
+        # 优先使用同站点已有任务的完整配置（手动调整过的）
+        if site_id is not None:
+            for task in tasks:
+                if task.get("site_id") == site_id:
+                    return {
+                        "downloader": task.get("downloader", ""),
+                        "save_path": task.get("save_path", ""),
+                        "cron": task.get("cron", ""),
+                        "active_time_range": task.get("active_time_range", ""),
+                        "disksize": task.get("disksize"),
+                        "maxupspeed": task.get("maxupspeed"),
+                        "maxdlspeed": task.get("maxdlspeed"),
+                        "maxdlcount": task.get("maxdlcount"),
+                        "freeleech": task.get("freeleech", "free"),
+                        "hr": task.get("hr", "yes"),
+                        "include": task.get("include"),
+                        "exclude": task.get("exclude"),
+                        "size": task.get("size"),
+                        "seeder": task.get("seeder"),
+                        "timezone_offset": task.get("timezone_offset", 0.0),
+                        "pubtime": task.get("pubtime"),
+                        "seed_time": task.get("seed_time"),
+                        "hr_seed_time": task.get("hr_seed_time"),
+                        "seed_ratio": task.get("seed_ratio"),
+                        "seed_size": task.get("seed_size"),
+                        "download_time": task.get("download_time"),
+                        "seed_avgspeed": task.get("seed_avgspeed"),
+                        "seed_inactivetime": task.get("seed_inactivetime"),
+                        "delete_size_range": task.get("delete_size_range"),
+                        "up_speed": task.get("up_speed"),
+                        "dl_speed": task.get("dl_speed"),
+                        "auto_archive_days": task.get("auto_archive_days"),
+                        "delete_except_tags": task.get("delete_except_tags"),
+                        "except_subscribe": task.get("except_subscribe", False),
+                        "proxy_delete": task.get("proxy_delete", False),
+                        "del_no_free": task.get("del_no_free", False),
+                        "qb_category": task.get("qb_category"),
+                        "site_hr_active": task.get("site_hr_active", False),
+                        "site_skip_tips": task.get("site_skip_tips", False),
+                        "rss_support": task.get("rss_support", False),
+                    }
+
         for task in tasks:
             downloader = task.get("downloader", "")
             if downloader:
@@ -1007,8 +1094,10 @@ class TrafficAssistantQ(_PluginBase):
                 return first_name
         return ""
 
-    def __get_brush_template_config(self, tasks: list) -> dict:
-        """从已有刷流任务中提取可复用的配置模板（取最后一个有值的，即最新修改的），没有则使用安全默认值"""
+    def __get_brush_template_config(self, tasks: list, site_id: int = None) -> dict:
+        """从已有刷流任务中提取可复用的配置模板。
+        优先使用同站点已有任务的完整配置（手动调整过的），
+        没有同站点任务时从所有任务中取最后一个有值的字段作为默认值。"""
         downloader = ""
         save_path = ""
         cron = ""
@@ -1044,6 +1133,50 @@ class TrafficAssistantQ(_PluginBase):
         site_hr_active = False
         site_skip_tips = False
         rss_support = False
+
+        rss_support = False
+
+        # 优先使用同站点已有任务的完整配置（手动调整过的）
+        if site_id is not None:
+            for task in tasks:
+                if task.get("site_id") == site_id:
+                    return {
+                        "downloader": task.get("downloader", ""),
+                        "save_path": task.get("save_path", ""),
+                        "cron": task.get("cron", ""),
+                        "active_time_range": task.get("active_time_range", ""),
+                        "disksize": task.get("disksize"),
+                        "maxupspeed": task.get("maxupspeed"),
+                        "maxdlspeed": task.get("maxdlspeed"),
+                        "maxdlcount": task.get("maxdlcount"),
+                        "freeleech": task.get("freeleech", "free"),
+                        "hr": task.get("hr", "yes"),
+                        "include": task.get("include"),
+                        "exclude": task.get("exclude"),
+                        "size": task.get("size"),
+                        "seeder": task.get("seeder"),
+                        "timezone_offset": task.get("timezone_offset", 0.0),
+                        "pubtime": task.get("pubtime"),
+                        "seed_time": task.get("seed_time"),
+                        "hr_seed_time": task.get("hr_seed_time"),
+                        "seed_ratio": task.get("seed_ratio"),
+                        "seed_size": task.get("seed_size"),
+                        "download_time": task.get("download_time"),
+                        "seed_avgspeed": task.get("seed_avgspeed"),
+                        "seed_inactivetime": task.get("seed_inactivetime"),
+                        "delete_size_range": task.get("delete_size_range"),
+                        "up_speed": task.get("up_speed"),
+                        "dl_speed": task.get("dl_speed"),
+                        "auto_archive_days": task.get("auto_archive_days"),
+                        "delete_except_tags": task.get("delete_except_tags"),
+                        "except_subscribe": task.get("except_subscribe", False),
+                        "proxy_delete": task.get("proxy_delete", False),
+                        "del_no_free": task.get("del_no_free", False),
+                        "qb_category": task.get("qb_category"),
+                        "site_hr_active": task.get("site_hr_active", False),
+                        "site_skip_tips": task.get("site_skip_tips", False),
+                        "rss_support": task.get("rss_support", False),
+                    }
 
         for task in tasks:
             if task.get("downloader"):
