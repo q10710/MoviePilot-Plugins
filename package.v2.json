@@ -39,11 +39,12 @@
     "name": "站点流量管理（Q魔改版）",
     "description": "自动管理流量，保障站点分享率。适配 BrushFlow 5.0.0 tasks 结构。",
     "labels": "站点管理",
-    "version": "1.7",
+    "version": "1.7.1",
     "icon": "trafficassistantq.png",
     "author": "Q",
     "level": 2,
     "history": {
+      "v1.7.1": "修复重复创建刷流任务bug（task_updated标志位缺陷）；创建/补全任务时优先使用同站点已有配置",
       "v1.7": "适配 BrushFlow 5.0.0 tasks 结构，自动创建缺失刷流任务，智能选择下载器/保存路径/时间配置，自动修复不完整配置"
     }
   }
