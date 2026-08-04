@@ -34,7 +34,7 @@ class BestVersionGuard(_PluginBase):
     plugin_name = "洗版守护"
     plugin_desc = "定时检查电视剧订阅：未完结的误标洗版自动取消，恢复普通订阅继续追更。"
     plugin_icon = "bestversionguard.png"
-    plugin_version = "2.4.2"
+    plugin_version = "2.4.3"
     plugin_label = "订阅"
     plugin_author = "local"
     plugin_config_prefix = "bestversionguard_"
@@ -280,7 +280,7 @@ class BestVersionGuard(_PluginBase):
 
     def _guard_check(self) -> None:
         logger.info("开始检查")
-        subscribes = self._subscribe_oper.list(state="R")
+        subscribes = self._subscribe_oper.list(state=None)
         if not subscribes:
             logger.info("无订阅，跳过")
             return
@@ -303,6 +303,9 @@ class BestVersionGuard(_PluginBase):
             if sub.type != MediaType.TV.value:
                 continue
             if not sub.tmdbid:
+                continue
+            # 跳过用户手动暂停(S)的订阅，只处理运行中(R)、待定(P)、新建(N)等
+            if sub.state == "S":
                 continue
 
             # ── 处理订阅助手魔改版创建的洗版订阅 ──
