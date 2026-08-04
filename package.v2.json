@@ -1,15 +1,25 @@
 {
   "BestVersionGuard": {
+    "id": "BestVersionGuard",
     "name": "洗版守护",
-    "description": "定时检查电视剧订阅：未完结的误标洗版自动取消，恢复普通订阅继续追更。",
-    "labels": "订阅",
-    "version": "2.4.1",
-    "icon": "bestversionguard.png",
+    "description": "定时检查电视剧订阅：未完结的误标洗版自动取消，恢复普通订阅继续追更。修复 fixed_ids 重复跳过问题。",
+    "version": "2.4.2",
+    "version_name": "2.4.2",
     "author": "local",
     "level": 1,
     "history": {
-      "v2.4.1": "修复API调用bug，加入媒体库对比，只取消未完结的误标洗版，不主动补洗版"
-    }
+      "2.4.2": "修复 fixed_ids 导致已被重新开启洗版的订阅被永久跳过的问题",
+      "2.4.1": "增加手动检查命令和页面展示",
+      "2.4.0": "支持识别订阅助手魔改版创建的洗版订阅",
+      "2.3.0": "基于媒体库全集入库判断季完结状态",
+      "2.2.0": "增加 TMDB Ended 状态判断",
+      "2.1.0": "增加通知功能",
+      "2.0.0": "初始版本：定时检查并取消未完结订阅的洗版标记"
+    },
+    "plugin_icon": "bestversionguard.png",
+    "labels": [
+      "订阅"
+    ]
   },
   "LinkChecker": {
     "name": "硬链接检查",
