@@ -34,7 +34,7 @@ class BestVersionGuard(_PluginBase):
     plugin_name = "洗版守护"
     plugin_desc = "定时检查电视剧订阅：未完结的误标洗版自动取消，恢复普通订阅继续追更。"
     plugin_icon = "bestversionguard.png"
-    plugin_version = "2.4.1"
+    plugin_version = "2.4.2"
     plugin_label = "订阅"
     plugin_author = "local"
     plugin_config_prefix = "bestversionguard_"
@@ -344,7 +344,8 @@ class BestVersionGuard(_PluginBase):
             # ── 未完结，需要处理 ──
             fix_key = str(sub.id)
             if fix_key in self._fixed_ids:
-                continue
+                # 之前取消过洗版但被重新开启了，清除记录重新处理
+                self._fixed_ids.discard(fix_key)
 
             if in_production:
                 reason = "TMDB 制作中"
