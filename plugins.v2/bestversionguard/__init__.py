@@ -34,7 +34,7 @@ class BestVersionGuard(_PluginBase):
     plugin_name = "洗版守护"
     plugin_desc = "定时检查电视剧订阅：未完结的误标洗版自动取消，恢复普通订阅继续追更。"
     plugin_icon = "bestversionguard.png"
-    plugin_version = "2.4.3"
+    plugin_version = "2.4.4"
     plugin_label = "订阅"
     plugin_author = "local"
     plugin_config_prefix = "bestversionguard_"
@@ -342,6 +342,13 @@ class BestVersionGuard(_PluginBase):
                 if fix_key in self._fixed_ids:
                     self._fixed_ids.discard(fix_key)
                     self._save_state()
+                # 已完结的洗版订阅，确保只下载整季合集而非散装
+                if not sub.best_version_full:
+                    try:
+                        self._subscribe_oper.update(sid=sub.id, payload={"best_version_full": 1})
+                        logger.info(f"设置整季洗版: {sub.name} S{sub.season}")
+                    except Exception as e:
+                        logger.info(f"设置整季洗版失败: {sub.name} - {e}")
                 continue
 
             # ── 未完结，需要处理 ──
