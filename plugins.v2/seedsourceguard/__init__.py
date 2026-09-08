@@ -1,12 +1,15 @@
 """做种守卫插件。
 
-检测两类做种异常并持续追踪：
+检测三类做种异常并持续追踪：
 1. 无效做种：下载器中存在已完成/应做种的任务，但本地文件已丢失或任务报错，实际无法做种；
-2. 孤儿源文件：本地下载目录中存在文件，但所有启用下载器都没有对应的做种任务。
+2. 孤儿源文件：本地下载目录中存在文件，但所有启用下载器都没有对应的做种任务；
+3. 红种做种：做种任务的 tracker 全部通告失败（站点删除/风控），可按配置删除种子，
+   当源文件无其它正常辅种覆盖时连同源文件一起删除。
 
-两类异常均按"连续 N 天"宽限期追踪，达标后按配置的动作处理（仅通知 / 移动 / 删除），
+三类异常均按"连续 N 天"宽限期追踪，达标后按配置的动作处理（仅通知 / 移动 / 删除），
 支持 qBittorrent、Transmission、rTorrent 等所有 MoviePilot 已配置的下载器实例。
-安全设计：下载器连接失败时本轮直接跳过对应下载器，绝不把任何文件误判为孤儿。
+安全设计：下载器连接失败时本轮直接跳过对应下载器，绝不把任何文件误判为孤儿；
+红种达 50% 阈值时判定站点/网络级故障，自动保护不处置。
 """
 
 from datetime import datetime, timedelta
@@ -26,10 +29,10 @@ class SeedSourceGuard(_PluginBase):
     """做种守卫插件。"""
 
     plugin_name = "做种守卫"
-    plugin_desc = ("检测本地源文件是否有下载器在做种、下载器是否存在文件丢失的无效做种任务；"
-                   "连续N天异常可通知或按策略处置，杜绝无效做种与孤儿文件。")
+    plugin_desc = ("检测本地源文件是否有下载器在做种、下载器是否存在文件丢失的无效做种或"
+                   "tracker 全部失败的做种任务；连续N天异常可通知或按策略处置，杜绝无效做种与孤儿文件。")
     plugin_icon = "seedguard.png"
-    plugin_version = "1.0.0"
+    plugin_version = "1.1.0"
     plugin_label = "下载管理"
     plugin_author = "local"
     plugin_config_prefix = "seedsourceguard_"
@@ -40,15 +43,22 @@ class SeedSourceGuard(_PluginBase):
     _enabled: bool = False
     _notify: bool = True
     _cron: str = "15 3 * * *"
-    _days: int = 3
+    _days: int = 7
     _scan_dirs: List[str] = []
     _exclude_keys: List[str] = []
     _downloaders: List[str] = []
     _max_depth: int = 3
     _no_seed_action: str = "notify"
     _invalid_action: str = "notify"
+    _red_action: str = "delete"
     _move_path: str = ""
     _allow_delete: bool = False
+
+    # 红种做种保护：单下载器红种数达到下限且占比达标时视为站点/网络故障，本轮只通知不处置
+    _RED_PROTECT_MIN: int = 5
+    _RED_PROTECT_RATIO: float = 0.5
+    # qBittorrent 需逐任务查询 tracker 状态，任务数超过该上限时跳过红种检测
+    _QB_TRACKER_QUERY_LIMIT: int = 500
 
     # 下载中/排队下载等不应视为异常的状态（文件未就绪）
     _IGNORE_STATES = {
@@ -76,7 +86,7 @@ class SeedSourceGuard(_PluginBase):
         self._enabled = bool(config.get("enabled"))
         self._notify = bool(config.get("notify", True))
         self._cron = str(config.get("cron") or "15 3 * * *")
-        self._days = int(config.get("days") or 3)
+        self._days = int(config.get("days") or 7)
         if self._days < 1:
             self._days = 1
         self._max_depth = int(config.get("max_depth") or 3)
@@ -87,6 +97,7 @@ class SeedSourceGuard(_PluginBase):
         self._downloaders = self._split_comma(config.get("downloaders"))
         self._no_seed_action = str(config.get("no_seed_action") or "notify")
         self._invalid_action = str(config.get("invalid_action") or "notify")
+        self._red_action = str(config.get("red_action") or "delete")
         self._move_path = str(config.get("move_path") or "").strip()
         self._allow_delete = bool(config.get("allow_delete"))
 
@@ -302,6 +313,45 @@ class SeedSourceGuard(_PluginBase):
                                 "props": {"cols": 12, "md": 4},
                                 "content": [
                                     {
+                                        "component": "VSelect",
+                                        "props": {
+                                            "model": "red_action",
+                                            "label": "红种做种处置",
+                                            "items": [
+                                                {"title": "仅通知", "value": "notify"},
+                                                {"title": "删除种子(无其它辅种时连同源文件删除)", "value": "delete"},
+                                            ],
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 8},
+                                "content": [
+                                    {
+                                        "component": "VAlert",
+                                        "props": {
+                                            "type": "info",
+                                            "variant": "tonal",
+                                            "text": ("红种判定：做种任务的全部 tracker 连续通告失败。"
+                                                     "删除种子时自动判断：该源文件仍被其它正常任务覆盖则只删种子保留文件；"
+                                                     "无任何其它正常辅种时删除种子并连同源文件一起删除。"
+                                                     "单下载器红种达 5 个且占做种数 50% 以上时触发站点/网络级故障保护，本轮只通知不处置。"),
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
                                         "component": "VTextField",
                                         "props": {
                                             "model": "max_depth",
@@ -334,7 +384,8 @@ class SeedSourceGuard(_PluginBase):
                             "type": "warning",
                             "variant": "tonal",
                             "text": ("安全规则：下载器连接失败或取不到任务列表时，本轮自动跳过该下载器，"
-                                     "绝不会把任何文件判为孤儿。删除/移动类处置要求：连续 N 天异常 + 本页开关已打开。"),
+                                     "绝不会把任何文件判为孤儿；红种达 50% 阈值时自动保护不处置。"
+                                     "删除/移动类处置要求：连续 7 天异常 + 本页开关已打开。"),
                         },
                     },
                 ],
@@ -343,13 +394,14 @@ class SeedSourceGuard(_PluginBase):
             "enabled": False,
             "notify": True,
             "cron": "15 3 * * *",
-            "days": 3,
+            "days": 7,
             "scan_dirs": "/nastools/data/downloads/dianying/\n/nastools/data/downloads/tv/",
             "exclude_dirs": "音乐\nmusic\n儿童\n临时下载\ndouyin\n杰伦十代\nflac\nape\nwav",
             "downloaders": "",
             "max_depth": 3,
             "no_seed_action": "notify",
             "invalid_action": "notify",
+            "red_action": "delete",
             "move_path": "",
             "allow_delete": False,
         }
@@ -361,18 +413,19 @@ class SeedSourceGuard(_PluginBase):
         state = self.get_data("state") or {}
         no_seed = state.get("no_seed_active") or []
         invalid = state.get("invalid_active") or []
+        red = state.get("red_active") or []
         unavailable = state.get("unavailable") or []
         last_run = state.get("last_run") or "尚未运行"
         handled = state.get("handled") or []
-        total = len(no_seed) + len(invalid) + len(unavailable)
+        total = len(no_seed) + len(invalid) + len(red) + len(unavailable)
         # ── 顶部状态条 ──
         if total == 0:
             head_type = "success"
-            head_text = f"一切正常：未发现孤儿文件与无效做种（最近检测：{last_run}）"
+            head_text = f"一切正常：未发现孤儿文件、无效做种与红种做种（最近检测：{last_run}）"
         else:
             head_type = "warning"
             head_text = (f"共发现 {total} 项异常（最近检测：{last_run}）"
-                         "，连续 3 天仍存在将按配置处置，删除类处置需先开启允许开关")
+                         "，连续 7 天仍存在将按配置处置，删除类处置需先开启允许开关")
         children = [
             {
                 "component": "VAlert",
@@ -387,13 +440,14 @@ class SeedSourceGuard(_PluginBase):
         stats = [
             ("孤儿源文件", len(no_seed), "orange-darken-2"),
             ("无效做种", len(invalid), "red-darken-2"),
+            ("红种做种", len(red), "deep-purple-darken-2"),
             ("下载器异常", len(unavailable), "grey-darken-1"),
         ]
         row_content = []
         for label, num, color in stats:
             row_content.append({
                 "component": "VCol",
-                "props": {"cols": 12, "md": 4},
+                "props": {"cols": 12, "md": 3},
                 "content": [
                     {
                         "component": "VCard",
@@ -439,6 +493,13 @@ class SeedSourceGuard(_PluginBase):
                 "color": "error",
                 "empty": "未发现无效做种任务",
                 "items": invalid,
+            },
+            {
+                "key": "red",
+                "title": "红种做种（tracker 全部通告失败，已达 50% 阈值时自动保护）",
+                "color": "deep-purple-darken-2",
+                "empty": "未发现红种做种任务",
+                "items": red,
             },
             {
                 "key": "unavailable",
@@ -515,7 +576,7 @@ class SeedSourceGuard(_PluginBase):
                     if sec["key"] == "no_seed":
                         line = f"{item.get('path', '')}"
                         extra = f"已持续 {item.get('days', 1)} 天"
-                    elif sec["key"] == "invalid":
+                    elif sec["key"] in ("invalid", "red"):
                         line = f"[{item.get('dl', '')}] {item.get('name', '')}"
                         extra = f"已持续 {item.get('days', 1)} 天"
                     else:
@@ -578,7 +639,7 @@ class SeedSourceGuard(_PluginBase):
                 "props": {
                     "type": "info",
                     "variant": "tonal",
-                    "text": "暂无处置记录（当前处于仅通知模式）",
+                    "text": "暂无处置记录",
                 },
             }
         ] if not handled_rows else [
@@ -702,12 +763,17 @@ class SeedSourceGuard(_PluginBase):
         invalid_candidates = self._detect_invalid(task_index)
         report["invalid"] = invalid_candidates
 
+        # 3b. 红种做种检测（tracker 全部通告失败）
+        red_candidates, hold_count = self._detect_red(task_index, services)
+        report["red"] = red_candidates
+        report["hold_count"] = hold_count
+
         # 4. 孤儿源文件检测
         no_seed_candidates = self._detect_no_seed(task_index)
         report["no_seed"] = no_seed_candidates
 
         # 5. 按天计数并处置
-        handled_list = self._settle(report, handle=handle)
+        handled_list = self._settle(report, handle=handle, task_index=task_index)
 
         # 6. 落盘与通知
         self._save_report(report, handled_list=handled_list)
@@ -774,6 +840,10 @@ class SeedSourceGuard(_PluginBase):
                     "state": state,
                     "progress": float(progress or 0),
                     "root": root,
+                    # Transmission 的 get_torrents 已附带 trackerStats，供红种判定；qb/rTorrent 为空
+                    "tracker_stats": self._tget(
+                        torrent, "trackerStats", "tracker_stats", default=None
+                    ),
                 })
             except Exception as err:
                 logger.debug(f"解析下载器 {dl_name} 任务失败：{err}")
@@ -829,6 +899,154 @@ class SeedSourceGuard(_PluginBase):
                         "state": state,
                     })
         return invalid
+
+    def _detect_red(self, task_index: Dict[str, list],
+                    services: Optional[dict] = None) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+        """检测红种做种任务：处于做种状态但 tracker 全部通告失败。
+
+        返回 (红种明细列表, 各下载器做种候选数)。qBittorrent 需逐任务查询
+        tracker 状态，候选超过上限时跳过；Transmission 直接使用任务自带的
+        trackerStats，无额外请求开销。
+        """
+        red: List[Dict[str, Any]] = []
+        hold_count: Dict[str, int] = {}
+        for dl_name, tasks in task_index.items():
+            candidates = [t for t in tasks if self._is_hold_state(t["state"])]
+            hold_count[dl_name] = len(candidates)
+            if not candidates:
+                continue
+            instance = None
+            if services:
+                instance = getattr(services.get(dl_name), "instance", None)
+            provider = self._provider_kind(instance)
+            if provider == "qb":
+                if len(candidates) > self._QB_TRACKER_QUERY_LIMIT:
+                    logger.warning(
+                        f"下载器 {dl_name} 做种任务 {len(candidates)} 个超过红种检测上限，本轮跳过红种检测"
+                    )
+                    continue
+                qbc = getattr(instance, "qbc", None)
+                if qbc is None:
+                    continue
+                try:
+                    for task in candidates:
+                        hash_value = task.get("hash", "")
+                        if not hash_value:
+                            continue
+                        trackers = qbc.torrents_trackers(torrent_hash=hash_value) or []
+                        if self._torrent_red(task, trackers):
+                            red.append(self._red_item(task, dl_name))
+                except Exception as err:
+                    logger.error(f"下载器 {dl_name} 查询 tracker 状态出错：{err}")
+                continue
+            # Transmission / 其它：优先使用任务自带 trackerStats
+            for task in candidates:
+                if self._torrent_red(task, task.get("tracker_stats")):
+                    red.append(self._red_item(task, dl_name))
+        return red, hold_count
+
+    @staticmethod
+    def _provider_kind(instance: Any) -> str:
+        """判断下载器实例类型（qb/tr/其它）。"""
+        if instance is None:
+            return "unknown"
+        try:
+            if getattr(instance, "qbc", None) is not None:
+                return "qb"
+            if getattr(instance, "trc", None) is not None:
+                return "tr"
+        except Exception:
+            return "unknown"
+        return "unknown"
+
+    @staticmethod
+    def _red_item(task: Dict[str, Any], dl_name: str) -> Dict[str, Any]:
+        """构造红种明细项。"""
+        return {
+            "dl": dl_name,
+            "hash": task.get("hash", ""),
+            "name": task.get("name", ""),
+            "root": task.get("root", ""),
+            "state": task.get("state", ""),
+        }
+
+    def _torrent_red(self, task: Dict[str, Any], tracker_stats: Any) -> bool:
+        """判定单个任务是否为红种：做种状态、文件完好且 tracker 全部失败。"""
+        state = task.get("state", "")
+        if state in self._INVALID_STATES or not self._is_hold_state(state):
+            return False
+        if not self._path_ok(task.get("root", "")):
+            # 文件丢失/目录为空归无效做种处理，不在红种路径重复计数
+            return False
+        return self._tracker_all_failed(tracker_stats)
+
+    @staticmethod
+    def _tracker_all_failed(tracker_stats: Any) -> bool:
+        """解析 tracker 数据：存在失败记录且无任何成功通告时判红。
+
+        兼容 qBittorrent 的 torrents_trackers（status 字段）与 Transmission 的
+        trackerStats（lastAnnounceSucceeded / lastAnnounceTime 字段）。
+        """
+        stats = tracker_stats or []
+        real = []
+        for item in stats:
+            if not item:
+                continue
+            if isinstance(item, dict):
+                url = str(item.get("url") or item.get("host") or "")
+            else:
+                url = str(getattr(item, "url", "") or getattr(item, "host", ""))
+            if url.startswith("**"):  # DHT / PeX / LSD 等内置 tracker 不计
+                continue
+            real.append(item)
+        if not real:
+            return False
+
+        def fget(it: Any, key: str, default: Any = None) -> Any:
+            """兼容 dict 与对象的字段读取。"""
+            try:
+                if isinstance(it, dict):
+                    return it.get(key, default)
+                return getattr(it, key, default)
+            except Exception:
+                return default
+
+        announced = False
+        succeeded = False
+        for it in real:
+            if fget(it, "status") is not None:  # qBittorrent tracker 状态
+                status = int(fget(it, "status") or 0)
+                if status in (2, 3):  # working / updating：至少一个正常则不红
+                    return False
+                if status == 4:  # notWorking：明确通告失败
+                    announced = True
+                continue
+            # Transmission trackerStats
+            succ = fget(it, "lastAnnounceSucceeded")
+            atime = int(fget(it, "lastAnnounceTime") or 0)
+            result = str(fget(it, "lastAnnounceResult") or "")
+            if atime > 0:
+                announced = True
+            if succ:
+                succeeded = True
+            if result and "Success" in result:
+                succeeded = True
+        if succeeded:
+            return False
+        return announced
+
+    @staticmethod
+    def _is_hold_state(state: Any) -> bool:
+        """判断任务是否处于应做种/保种的状态。
+
+        兼容 qBittorrent 文本状态与 Transmission 的数字状态（seed=6、seed_wait=5）。
+        """
+        text = str(state or "").strip().lower()
+        if text in SeedSourceGuard._HOLD_STATES:
+            return True
+        if text.isdigit() and int(text) in (5, 6):  # seed_wait / seed
+            return True
+        return False
 
     @staticmethod
     def _path_ok(root: str) -> bool:
@@ -937,7 +1155,8 @@ class SeedSourceGuard(_PluginBase):
 
     # ── 计数与处置 ────────────────────────────────────────────
 
-    def _settle(self, report: Dict[str, Any], handle: bool) -> List[Dict[str, Any]]:
+    def _settle(self, report: Dict[str, Any], handle: bool,
+                task_index: Optional[Dict[str, list]] = None) -> List[Dict[str, Any]]:
         """按连续天数阈值推进记录，并执行达标项的处置动作。"""
         days_data = self.get_data("days") or {}
         handled_list = []
@@ -968,12 +1187,37 @@ class SeedSourceGuard(_PluginBase):
                 handled_list.append(handled)
                 days_data.pop(key, None)
 
+        # 红种做种计数（带站点/网络级故障保护）
+        red_map = {}
+        for item in report.get("red") or []:
+            key = f"{item['dl']}:{item['hash'] or item['root']}"
+            red_map[key] = item
+        protected = self._red_protected_keys(red_map, report.get("hold_count") or {})
+        for key in sorted(protected):
+            item = red_map[key]
+            handled_list.append({
+                "time": datetime.now().strftime("%m-%d %H:%M"),
+                "text": (f"站点级故障保护：{item.get('dl', '')} 红种 {protected[key]}，"
+                         "本轮不处置，仅通知"),
+            })
+        red_map_active = {k: v for k, v in red_map.items() if k not in protected}
+        stale_red = self._bump_days(days_data, "red", red_map_active, today)
+        for key, days in stale_red.items():
+            item = red_map_active.get(key) or {}
+            handled = self._handle_red(item, days, handle, task_index)
+            if handled:
+                handled_list.append(handled)
+                days_data.pop(key, None)
+
         # 清理已恢复的旧记录（保留当前仍异常项的天数历史）
-        for prefix in ("no_seed:", "invalid:"):
+        for prefix in ("no_seed:", "invalid:", "red:"):
             for old_key in [k for k in days_data if k.startswith(prefix)]:
-                if prefix == "no_seed:" and old_key.split(":", 1)[1] not in no_seed_map:
+                body = old_key[len(prefix):]
+                if prefix == "no_seed:" and body not in no_seed_map:
                     days_data.pop(old_key, None)
-                elif prefix == "invalid:" and old_key[len(prefix):] not in invalid_map:
+                elif prefix == "invalid:" and body not in invalid_map:
+                    days_data.pop(old_key, None)
+                elif prefix == "red:" and body not in red_map_active:
                     days_data.pop(old_key, None)
 
         self.save_data("days", days_data)
@@ -989,11 +1233,44 @@ class SeedSourceGuard(_PluginBase):
                 "name": item.get("name", ""),
                 "days": self._calc_days(days_data, f"invalid:{key}", today),
             })
+        active_red = []
+        for key, item in red_map_active.items():
+            active_red.append({
+                "dl": item.get("dl", ""),
+                "name": item.get("name", ""),
+                "days": self._calc_days(days_data, f"red:{key}", today),
+            })
         self.save_data("active", {
             "no_seed_active": active_no_seed,
             "invalid_active": active_invalid,
+            "red_active": active_red,
         })
         return handled_list
+
+    def _red_protected_keys(self, red_map: Dict[str, Any],
+                            hold_count: Dict[str, int]) -> Dict[str, str]:
+        """按下载器判定是否触发站点/网络级故障保护。
+
+        单下载器红种数达到下限且占该下载器做种候选数比例 >=50% 时，
+        该下载器所有红种本轮不处置（不计天数），仅返回保护说明。
+        """
+        protected: Dict[str, str] = {}
+        red_by_dl: Dict[str, List[str]] = {}
+        for key, item in red_map.items():
+            dl = item.get("dl", "")
+            red_by_dl.setdefault(dl, []).append(key)
+        for dl, keys in red_by_dl.items():
+            total = int(hold_count.get(dl) or 0)
+            if total <= 0:
+                total = len(keys)
+            count = len(keys)
+            if count >= self._RED_PROTECT_MIN and count / total >= self._RED_PROTECT_RATIO:
+                for key in keys:
+                    protected[key] = f"{count}/{total}"
+                logger.warning(
+                    f"下载器 {dl} 红种 {count}/{total} 达 50% 阈值，判定站点/网络故障，本轮保护不处置"
+                )
+        return protected
 
     def _bump_days(self, days_data: dict, prefix: str,
                    current: Dict[str, Any], today: str) -> Dict[str, int]:
@@ -1091,6 +1368,60 @@ class SeedSourceGuard(_PluginBase):
                         "text": f"删除失败 {text}：{err}"}
         return None
 
+    def _handle_red(self, item: Dict[str, Any], days: int,
+                    handle: bool, task_index: Optional[Dict[str, list]] = None,
+                    ) -> Optional[Dict[str, Any]]:
+        """处置达到天数的红种做种任务。
+
+        删除种子时联动判定源文件归属：该源文件仍被其它正常任务覆盖则仅删任务
+        保留文件；无任何其它正常做种任务覆盖时删除任务并连同源文件一起删除。
+        正常任务指未进入无效/红种清单且文件完好的任务。
+        """
+        action = self._red_action
+        dl = item.get("dl", "")
+        name = item.get("name", "")
+        hash_value = item.get("hash", "")
+        root = item.get("root", "")
+        text = f"红种做种 {dl}：{name}（连续 {days} 天 tracker 通告失败）"
+        if action != "delete" or not handle:
+            logger.warning(f"检测到红种做种：{dl} / {name}，连续 {days} 天")
+            return {"time": datetime.now().strftime("%m-%d %H:%M"), "text": f"检测到 {text}"}
+        if not self._allow_delete:
+            logger.warning(f"红种做种 {dl} / {name} 已达标但未开启删除开关，跳过处置")
+            return {"time": datetime.now().strftime("%m-%d %H:%M"),
+                    "text": f"达标未处置 {text}"}
+        if not hash_value:
+            return None
+        # 计算“其它正常任务”的根路径集合，判定源文件是否仍被覆盖
+        delete_file = True
+        if task_index:
+            roots = []
+            for dl_name, tasks in task_index.items():
+                for task in tasks:
+                    if str(task.get("hash", "")) == str(hash_value):
+                        continue
+                    root_v = task.get("root", "")
+                    if root_v:
+                        roots.append(root_v.rstrip("/"))
+            if root and root.rstrip("/") in roots:
+                delete_file = False
+        try:
+            services = self._downloader_helper.get_services(name_filters=[dl])
+            instance = getattr(services.get(dl), "instance", None) if services else None
+            if instance is None:
+                logger.warning(f"下载器 {dl} 不可用，无法删除任务")
+                return None
+            instance.delete_torrents(delete_file, [hash_value])
+            logger.info(
+                f"已删除红种做种任务：{dl} / {name}（delete_file={delete_file}）"
+            )
+            return {"time": datetime.now().strftime("%m-%d %H:%M"),
+                    "text": (f"已删除 {'任务及源文件 ' if delete_file else '任务 '}{text}")}
+        except Exception as err:
+            logger.error(f"删除红种做种任务失败 {dl} / {name}：{err}")
+            return {"time": datetime.now().strftime("%m-%d %H:%M"),
+                    "text": f"删除失败 {text}：{err}"}
+
     # ── 落盘与通知 ────────────────────────────────────────────
 
     def _save_report(self, report: Dict[str, Any], last_run: str = None,
@@ -1116,6 +1447,7 @@ class SeedSourceGuard(_PluginBase):
         lines = []
         no_seed = report.get("no_seed") or []
         invalid = report.get("invalid") or []
+        red = report.get("red") or []
         unavailable = report.get("unavailable") or []
         if no_seed:
             lines.append(f"孤儿源文件 {len(no_seed)} 个（无做种任务）")
@@ -1129,6 +1461,12 @@ class SeedSourceGuard(_PluginBase):
                 lines.append(f"  - [{item.get('dl', '')}] {item.get('name', '')}")
             if len(invalid) > 8:
                 lines.append(f"  ...等 {len(invalid)} 个")
+        if red:
+            lines.append(f"红种做种任务 {len(red)} 个（tracker 全部通告失败）")
+            for item in red[:8]:
+                lines.append(f"  - [{item.get('dl', '')}] {item.get('name', '')}")
+            if len(red) > 8:
+                lines.append(f"  ...等 {len(red)} 个")
         if unavailable:
             lines.append(f"下载器异常 {len(unavailable)} 个（已跳过，未做任何处置）")
             for item in unavailable[:5]:
@@ -1140,7 +1478,7 @@ class SeedSourceGuard(_PluginBase):
                 for h in done[-5:]:
                     lines.append(f"  - {h.get('text', '')[:100]}")
         if not lines:
-            lines.append("本轮检测正常，无孤儿文件、无无效做种、下载器全部在线。")
+            lines.append("本轮检测正常，无孤儿文件、无无效做种、无红种做种、下载器全部在线。")
         self.post_message(
             title=f"做种守卫（{'处置模式' if handled else '仅检测'}）",
             text="\n".join(lines),
