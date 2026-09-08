@@ -32,7 +32,7 @@ class SeedSourceGuard(_PluginBase):
     plugin_desc = ("检测本地源文件是否有下载器在做种、下载器是否存在文件丢失的无效做种或"
                    "tracker 全部失败的做种任务；连续N天异常可通知或按策略处置，杜绝无效做种与孤儿文件。")
     plugin_icon = "seedguard.png"
-    plugin_version = "1.1.0"
+    plugin_version = "1.1.1"
     plugin_label = "下载管理"
     plugin_author = "local"
     plugin_config_prefix = "seedsourceguard_"
@@ -42,8 +42,8 @@ class SeedSourceGuard(_PluginBase):
     # 状态字段默认值
     _enabled: bool = False
     _notify: bool = True
-    _cron: str = "15 3 * * *"
-    _days: int = 7
+    _cron: str = "15 3,15 * * *"
+    _days: int = 14
     _scan_dirs: List[str] = []
     _exclude_keys: List[str] = []
     _downloaders: List[str] = []
@@ -85,8 +85,8 @@ class SeedSourceGuard(_PluginBase):
             return
         self._enabled = bool(config.get("enabled"))
         self._notify = bool(config.get("notify", True))
-        self._cron = str(config.get("cron") or "15 3 * * *")
-        self._days = int(config.get("days") or 7)
+        self._cron = str(config.get("cron") or "15 3,15 * * *")
+        self._days = int(config.get("days") or 14)
         if self._days < 1:
             self._days = 1
         self._max_depth = int(config.get("max_depth") or 3)
@@ -174,9 +174,10 @@ class SeedSourceGuard(_PluginBase):
                                         "component": "VTextField",
                                         "props": {
                                             "model": "days",
-                                            "label": "连续异常天数阈值",
+                                            "label": "连续扫描次数阈值",
                                             "type": "number",
-                                            "hint": "连续 N 天仍异常才触发处置",
+                                            "hint": ("连续 N 次实际扫描仍异常才触发处置；按扫描轮次累计，"
+                                                     "关机/停用期不计数。每日扫描 2 次，默认 14 次 ≈ 7 天"),
                                         },
                                     }
                                 ],
@@ -385,7 +386,7 @@ class SeedSourceGuard(_PluginBase):
                             "variant": "tonal",
                             "text": ("安全规则：下载器连接失败或取不到任务列表时，本轮自动跳过该下载器，"
                                      "绝不会把任何文件判为孤儿；红种达 50% 阈值时自动保护不处置。"
-                                     "删除/移动类处置要求：连续 7 天异常 + 本页开关已打开。"),
+                                     "删除/移动类处置要求：连续 N 次扫描仍异常（按实际扫描轮次累计，关机/停用期不计数） + 本页开关已打开。"),
                         },
                     },
                 ],
@@ -393,8 +394,8 @@ class SeedSourceGuard(_PluginBase):
         ], {
             "enabled": False,
             "notify": True,
-            "cron": "15 3 * * *",
-            "days": 7,
+            "cron": "15 3,15 * * *",
+            "days": 14,
             "scan_dirs": "/nastools/data/downloads/dianying/\n/nastools/data/downloads/tv/",
             "exclude_dirs": "音乐\nmusic\n儿童\n临时下载\ndouyin\n杰伦十代\nflac\nape\nwav",
             "downloaders": "",
@@ -425,7 +426,7 @@ class SeedSourceGuard(_PluginBase):
         else:
             head_type = "warning"
             head_text = (f"共发现 {total} 项异常（最近检测：{last_run}）"
-                         "，连续 7 天仍存在将按配置处置，删除类处置需先开启允许开关")
+                         f"，连续 {self._days} 次扫描仍存在将按配置处置，删除类处置需先开启允许开关")
         children = [
             {
                 "component": "VAlert",
@@ -575,10 +576,10 @@ class SeedSourceGuard(_PluginBase):
                 for item in items:
                     if sec["key"] == "no_seed":
                         line = f"{item.get('path', '')}"
-                        extra = f"已持续 {item.get('days', 1)} 天"
+                        extra = f"已持续 {item.get('days', 1)} 次扫描"
                     elif sec["key"] in ("invalid", "red"):
                         line = f"[{item.get('dl', '')}] {item.get('name', '')}"
-                        extra = f"已持续 {item.get('days', 1)} 天"
+                        extra = f"已持续 {item.get('days', 1)} 次扫描"
                     else:
                         line = f"{item.get('name', '')}"
                         extra = str(item.get("err", ""))[:120]
@@ -1274,29 +1275,34 @@ class SeedSourceGuard(_PluginBase):
 
     def _bump_days(self, days_data: dict, prefix: str,
                    current: Dict[str, Any], today: str) -> Dict[str, int]:
-        """推进计数并返回达到阈值的关键项。"""
+        """按实际扫描轮次推进计数并返回达到阈值的关键项。
+
+        每轮真实扫描中该项仍存在则计数 +1，关机/停用期不扫描即不累计；
+        旧版按自然日记录（形如 2026-09-08）自动迁移为首轮计数 1。
+        """
         stale = {}
         for key in current:
             full_key = f"{prefix}:{key}"
-            first = days_data.get(full_key) or today
-            days = self._calc_days(days_data, full_key, today)
-            if days >= self._days:
-                stale[key] = days
+            count = self._calc_days(days_data, full_key, today)
+            count += 1
+            if count >= self._days:
+                stale[key] = count
             else:
-                days_data[full_key] = first
+                days_data[full_key] = count
         return stale
 
     @staticmethod
     def _calc_days(days_data: dict, full_key: str, today: str) -> int:
-        """计算某项已持续的天数。"""
-        first = days_data.get(full_key)
-        if not first:
-            return 1
+        """计算某项已连续出现的扫描轮次数。
+
+        存储值为整数计数；兼容旧版日期字符串记录（迁移为 1 次）。
+        """
+        raw = days_data.get(full_key)
+        if raw is None:
+            return 0
         try:
-            start = datetime.strptime(str(first), "%Y-%m-%d")
-            end = datetime.strptime(today, "%Y-%m-%d")
-            return max(1, (end - start).days + 1)
-        except Exception:
+            return int(raw)
+        except (TypeError, ValueError):
             return 1
 
     # ── 处置动作 ──────────────────────────────────────────────
@@ -1304,9 +1310,9 @@ class SeedSourceGuard(_PluginBase):
     def _handle_no_seed(self, path: str, days: int, handle: bool) -> Optional[Dict[str, Any]]:
         """处置达到天数的孤儿源文件。"""
         action = self._no_seed_action
-        text = f"孤儿源文件 {path}（连续 {days} 天无做种任务）"
+        text = f"孤儿源文件 {path}（连续 {days} 次扫描仍无做种任务）"
         if action == "notify" or not handle:
-            logger.warning(f"检测到孤儿源文件：{path}，连续 {days} 天")
+            logger.warning(f"检测到孤儿源文件：{path}，连续 {days} 次扫描")
             return {"time": datetime.now().strftime("%m-%d %H:%M"), "text": f"检测到 {text}"}
         if not self._allow_delete:
             logger.warning(f"孤儿源文件 {path} 已达标但未开启删除开关，跳过处置")
@@ -1343,9 +1349,9 @@ class SeedSourceGuard(_PluginBase):
         name = item.get("name", "")
         dl = item.get("dl", "")
         hash_value = item.get("hash", "")
-        text = f"无效做种 {dl}：{name}（连续 {days} 天文件丢失/报错）"
+        text = f"无效做种 {dl}：{name}（连续 {days} 次扫描仍文件丢失/报错）"
         if action == "notify" or not handle:
-            logger.warning(f"检测到无效做种：{dl} / {name}，连续 {days} 天")
+            logger.warning(f"检测到无效做种：{dl} / {name}，连续 {days} 次扫描")
             return {"time": datetime.now().strftime("%m-%d %H:%M"), "text": f"检测到 {text}"}
         if not self._allow_delete:
             logger.warning(f"无效做种 {dl} / {name} 已达标但未开启删除开关，跳过处置")
@@ -1382,9 +1388,9 @@ class SeedSourceGuard(_PluginBase):
         name = item.get("name", "")
         hash_value = item.get("hash", "")
         root = item.get("root", "")
-        text = f"红种做种 {dl}：{name}（连续 {days} 天 tracker 通告失败）"
+        text = f"红种做种 {dl}：{name}（连续 {days} 次扫描 tracker 仍通告失败）"
         if action != "delete" or not handle:
-            logger.warning(f"检测到红种做种：{dl} / {name}，连续 {days} 天")
+            logger.warning(f"检测到红种做种：{dl} / {name}，连续 {days} 次扫描")
             return {"time": datetime.now().strftime("%m-%d %H:%M"), "text": f"检测到 {text}"}
         if not self._allow_delete:
             logger.warning(f"红种做种 {dl} / {name} 已达标但未开启删除开关，跳过处置")
