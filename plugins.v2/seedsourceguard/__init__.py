@@ -9,7 +9,7 @@
 三类异常均按"连续 N 天"宽限期追踪，达标后按配置的动作处理（仅通知 / 移动 / 删除），
 支持 qBittorrent、Transmission、rTorrent 等所有 MoviePilot 已配置的下载器实例。
 安全设计：下载器连接失败时本轮直接跳过对应下载器，绝不把任何文件误判为孤儿；
-红种达 50% 阈值时判定站点/网络级故障，自动保护不处置。
+红种占做种数达 80% 阈值时判定站点/网络级故障，自动保护不处置。
 """
 
 from datetime import datetime, timedelta
@@ -32,7 +32,7 @@ class SeedSourceGuard(_PluginBase):
     plugin_desc = ("检测本地源文件是否有下载器在做种、下载器是否存在文件丢失的无效做种或"
                    "tracker 全部失败的做种任务；连续N天异常可通知或按策略处置，杜绝无效做种与孤儿文件。")
     plugin_icon = "seedguard.png"
-    plugin_version = "1.1.2"
+    plugin_version = "1.1.3"
     plugin_label = "下载管理"
     plugin_author = "local"
     plugin_config_prefix = "seedsourceguard_"
@@ -57,7 +57,7 @@ class SeedSourceGuard(_PluginBase):
     _allow_delete: bool = False
 
     # 红种做种保护：单下载器红种占做种候选数比例达标时视为站点/网络故障，本轮只通知不处置
-    _RED_PROTECT_RATIO: float = 0.5
+    _RED_PROTECT_RATIO: float = 0.8
     # qBittorrent 需逐任务查询 tracker 状态，任务数超过该上限时跳过红种检测
     _QB_TRACKER_QUERY_LIMIT: int = 500
 
@@ -389,7 +389,7 @@ class SeedSourceGuard(_PluginBase):
                                             "text": ("红种判定：做种任务的全部 tracker 连续通告失败。"
                                                      "删除种子时自动判断：该源文件仍被其它正常任务覆盖则只删种子保留文件；"
                                                      "无任何其它正常辅种时删除种子并连同源文件一起删除。"
-                                                     "单下载器红种占做种数 50% 以上时触发站点/网络级故障保护，本轮只通知不处置。"),
+                                                     "单下载器红种占做种数 80% 以上时触发站点/网络级故障保护，本轮只通知不处置。"),
                                         },
                                     }
                                 ],
@@ -436,7 +436,7 @@ class SeedSourceGuard(_PluginBase):
                             "type": "warning",
                             "variant": "tonal",
                             "text": ("安全规则：下载器连接失败或取不到任务列表时，本轮自动跳过该下载器，"
-                                     "绝不会把任何文件判为孤儿；红种达 50% 阈值时自动保护不处置。"
+                                     "绝不会把任何文件判为孤儿；红种占做种数达 80% 阈值时自动保护不处置。"
                                      "删除/移动类处置要求：连续 N 次扫描仍异常（按实际扫描轮次累计，关机/停用期不计数） + 本页开关已打开。"),
                         },
                     },
@@ -548,7 +548,7 @@ class SeedSourceGuard(_PluginBase):
             },
             {
                 "key": "red",
-                "title": "红种做种（tracker 全部通告失败，已达 50% 阈值时自动保护）",
+                "title": "红种做种（tracker 全部通告失败，占做种数 80% 以上时自动保护）",
                 "color": "deep-purple-darken-2",
                 "empty": "未发现红种做种任务",
                 "items": red,
@@ -980,16 +980,18 @@ class SeedSourceGuard(_PluginBase):
                 qbc = getattr(instance, "qbc", None)
                 if qbc is None:
                     continue
-                try:
-                    for task in candidates:
-                        hash_value = task.get("hash", "")
-                        if not hash_value:
-                            continue
+                for task in candidates:
+                    hash_value = task.get("hash", "")
+                    if not hash_value:
+                        continue
+                    try:
                         trackers = qbc.torrents_trackers(torrent_hash=hash_value) or []
-                        if self._torrent_red(task, trackers):
-                            red.append(self._red_item(task, dl_name))
-                except Exception as err:
-                    logger.error(f"下载器 {dl_name} 查询 tracker 状态出错：{err}")
+                    except Exception as err:
+                        # 单任务查询失败不影响其余任务的红种检测
+                        logger.debug(f"下载器 {dl_name} 查询 tracker 状态失败 {hash_value}：{err}")
+                        continue
+                    if self._torrent_red(task, trackers):
+                        red.append(self._red_item(task, dl_name))
                 continue
             # Transmission / 其它：优先使用任务自带 trackerStats
             for task in candidates:
@@ -1253,10 +1255,22 @@ class SeedSourceGuard(_PluginBase):
                          "本轮不处置，仅通知"),
             })
         red_map_active = {k: v for k, v in red_map.items() if k not in protected}
+        # 正常辅种覆盖判定集合：排除本轮无效/红种任务根路径后，仅“正常任务”可覆盖源文件
+        bad_roots = set()
+        for item in list(invalid_map.values()) + list(red_map.values()):
+            root_v = (item.get("root") or "").rstrip("/")
+            if root_v:
+                bad_roots.add(root_v)
+        healthy_roots = []
+        for dl_name, tasks in (task_index or {}).items():
+            for task in tasks:
+                root_v = (task.get("root") or "").rstrip("/")
+                if root_v and root_v not in bad_roots:
+                    healthy_roots.append(root_v)
         stale_red = self._bump_days(days_data, "red", red_map_active, today)
         for key, days in stale_red.items():
             item = red_map_active.get(key) or {}
-            handled = self._handle_red(item, days, handle, task_index)
+            handled = self._handle_red(item, days, handle, healthy_roots)
             if handled:
                 handled_list.append(handled)
                 days_data.pop(key, None)
@@ -1303,7 +1317,7 @@ class SeedSourceGuard(_PluginBase):
                             hold_count: Dict[str, int]) -> Dict[str, str]:
         """按下载器判定是否触发站点/网络级故障保护。
 
-        单下载器红种占该下载器做种候选数比例 >=50% 时，该下载器所有红种
+        单下载器红种占该下载器做种候选数比例 >=80% 时，该下载器所有红种
         本轮不处置（不计天数），仅返回保护说明。
         """
         protected: Dict[str, str] = {}
@@ -1427,13 +1441,14 @@ class SeedSourceGuard(_PluginBase):
         return None
 
     def _handle_red(self, item: Dict[str, Any], days: int,
-                    handle: bool, task_index: Optional[Dict[str, list]] = None,
+                    handle: bool,
+                    healthy_roots: Optional[List[str]] = None,
                     ) -> Optional[Dict[str, Any]]:
         """处置达到天数的红种做种任务。
 
         删除种子时联动判定源文件归属：该源文件仍被其它正常任务覆盖则仅删任务
         保留文件；无任何其它正常做种任务覆盖时删除任务并连同源文件一起删除。
-        正常任务指未进入无效/红种清单且文件完好的任务。
+        healthy_roots 由结算阶段传入，已排除本轮红种/无效任务的根路径。
         """
         action = self._red_action
         dl = item.get("dl", "")
@@ -1450,19 +1465,10 @@ class SeedSourceGuard(_PluginBase):
                     "text": f"达标未处置 {text}"}
         if not hash_value:
             return None
-        # 计算“其它正常任务”的根路径集合，判定源文件是否仍被覆盖
+        # 源文件是否仍被其它正常做种任务覆盖：正常任务集合由结算阶段计算并传入
         delete_file = True
-        if task_index:
-            roots = []
-            for dl_name, tasks in task_index.items():
-                for task in tasks:
-                    if str(task.get("hash", "")) == str(hash_value):
-                        continue
-                    root_v = task.get("root", "")
-                    if root_v:
-                        roots.append(root_v.rstrip("/"))
-            if root and root.rstrip("/") in roots:
-                delete_file = False
+        if healthy_roots and root and root.rstrip("/") in healthy_roots:
+            delete_file = False
         try:
             services = self._downloader_helper.get_services(name_filters=[dl])
             instance = getattr(services.get(dl), "instance", None) if services else None
