@@ -32,7 +32,7 @@ class SeedSourceGuard(_PluginBase):
     plugin_desc = ("检测本地源文件是否有下载器在做种、下载器是否存在文件丢失的无效做种或"
                    "tracker 全部失败的做种任务；连续N天异常可通知或按策略处置，杜绝无效做种与孤儿文件。")
     plugin_icon = "seedguard.png"
-    plugin_version = "1.1.1"
+    plugin_version = "1.1.2"
     plugin_label = "下载管理"
     plugin_author = "local"
     plugin_config_prefix = "seedsourceguard_"
@@ -42,8 +42,10 @@ class SeedSourceGuard(_PluginBase):
     # 状态字段默认值
     _enabled: bool = False
     _notify: bool = True
+    _scan_times: int = 2
+    _clean_days: int = 7
     _cron: str = "15 3,15 * * *"
-    _days: int = 14
+    _days: int = 14  # 内部计数阈值 = 每日扫描次数 × 清理宽限天数，按实际扫描轮次累计
     _scan_dirs: List[str] = []
     _exclude_keys: List[str] = []
     _downloaders: List[str] = []
@@ -54,8 +56,7 @@ class SeedSourceGuard(_PluginBase):
     _move_path: str = ""
     _allow_delete: bool = False
 
-    # 红种做种保护：单下载器红种数达到下限且占比达标时视为站点/网络故障，本轮只通知不处置
-    _RED_PROTECT_MIN: int = 5
+    # 红种做种保护：单下载器红种占做种候选数比例达标时视为站点/网络故障，本轮只通知不处置
     _RED_PROTECT_RATIO: float = 0.5
     # qBittorrent 需逐任务查询 tracker 状态，任务数超过该上限时跳过红种检测
     _QB_TRACKER_QUERY_LIMIT: int = 500
@@ -85,10 +86,21 @@ class SeedSourceGuard(_PluginBase):
             return
         self._enabled = bool(config.get("enabled"))
         self._notify = bool(config.get("notify", True))
-        self._cron = str(config.get("cron") or "15 3,15 * * *")
-        self._days = int(config.get("days") or 14)
-        if self._days < 1:
-            self._days = 1
+        # 扫描频率与清理宽限分开配置：每日扫描次数决定 cron，宽限天数 × 每日次数 = 扫描轮次阈值
+        scan_times = int(config.get("scan_times") or 0)
+        clean_days = int(config.get("clean_days") or 0)
+        if scan_times >= 1 and clean_days >= 1:
+            self._scan_times = min(scan_times, 6)
+            self._clean_days = clean_days
+        else:
+            # 旧配置迁移：从 cron 反推每日次数，天数 = 原轮次阈值 ÷ 每日次数
+            old_cron = str(config.get("cron") or "")
+            old_days = int(config.get("days") or 0)
+            times = self._times_from_cron(old_cron)
+            self._scan_times = max(1, min(times, 6))
+            self._clean_days = max(1, (old_days or 14) // self._scan_times)
+        self._cron = self._build_cron(self._scan_times)
+        self._days = self._scan_times * self._clean_days
         self._max_depth = int(config.get("max_depth") or 3)
         if self._max_depth < 1:
             self._max_depth = 1
@@ -100,6 +112,23 @@ class SeedSourceGuard(_PluginBase):
         self._red_action = str(config.get("red_action") or "delete")
         self._move_path = str(config.get("move_path") or "").strip()
         self._allow_delete = bool(config.get("allow_delete"))
+
+    @staticmethod
+    def _build_cron(times: int) -> str:
+        """根据每日扫描次数生成 cron（分钟固定 15 分）。"""
+        hours = {1: "3", 2: "3,15", 3: "3,11,19", 4: "3,9,15,21",
+                 5: "3,7,11,15,19", 6: "3,7,11,15,19,23"}.get(int(times), "3,15")
+        return f"15 {hours} * * *"
+
+    @staticmethod
+    def _times_from_cron(cron: str) -> int:
+        """从 cron 的小时字段反推每日扫描次数。"""
+        try:
+            hour_part = str(cron or "").split()[1]
+            count = len([h for h in hour_part.split(",") if h.strip()])
+            return max(1, count) if count else 1
+        except Exception:
+            return 1
 
     # ── 基础接口 ──────────────────────────────────────────────
 
@@ -173,11 +202,11 @@ class SeedSourceGuard(_PluginBase):
                                     {
                                         "component": "VTextField",
                                         "props": {
-                                            "model": "days",
-                                            "label": "连续扫描次数阈值",
+                                            "model": "clean_days",
+                                            "label": "清理宽限天数",
                                             "type": "number",
-                                            "hint": ("连续 N 次实际扫描仍异常才触发处置；按扫描轮次累计，"
-                                                     "关机/停用期不计数。每日扫描 2 次，默认 14 次 ≈ 7 天"),
+                                            "hint": ("连续 N 天仍异常才触发处置；内部按实际扫描轮次累计"
+                                                     "（N × 每日扫描次数），关机/停用期不计数"),
                                         },
                                     }
                                 ],
@@ -189,20 +218,42 @@ class SeedSourceGuard(_PluginBase):
                         "content": [
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 6},
+                                "props": {"cols": 12, "md": 4},
                                 "content": [
                                     {
-                                        "component": "VCronField",
+                                        "component": "VSelect",
                                         "props": {
-                                            "model": "cron",
-                                            "label": "检测周期",
+                                            "model": "scan_times",
+                                            "label": "每日扫描次数",
+                                            "items": [
+                                                {"title": "每天 1 次", "value": 1},
+                                                {"title": "每天 2 次", "value": 2},
+                                                {"title": "每天 3 次", "value": 3},
+                                                {"title": "每天 4 次", "value": 4},
+                                            ],
                                         },
                                     }
                                 ],
                             },
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 6},
+                                "props": {"cols": 12, "md": 8},
+                                "content": [
+                                    {
+                                        "component": "VAlert",
+                                        "props": {
+                                            "type": "info",
+                                            "variant": "tonal",
+                                            "text": ("扫描时间由每日次数自动生成并均匀分布"
+                                                     "（1 次 03:15；2 次 03:15/15:15；3 次 03/11/19；4 次 03/09/15/21）。"
+                                                     "每轮均为独立全量检测，不读取上次结果。"),
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 8},
                                 "content": [
                                     {
                                         "component": "VTextField",
@@ -338,7 +389,7 @@ class SeedSourceGuard(_PluginBase):
                                             "text": ("红种判定：做种任务的全部 tracker 连续通告失败。"
                                                      "删除种子时自动判断：该源文件仍被其它正常任务覆盖则只删种子保留文件；"
                                                      "无任何其它正常辅种时删除种子并连同源文件一起删除。"
-                                                     "单下载器红种达 5 个且占做种数 50% 以上时触发站点/网络级故障保护，本轮只通知不处置。"),
+                                                     "单下载器红种占做种数 50% 以上时触发站点/网络级故障保护，本轮只通知不处置。"),
                                         },
                                     }
                                 ],
@@ -394,8 +445,8 @@ class SeedSourceGuard(_PluginBase):
         ], {
             "enabled": False,
             "notify": True,
-            "cron": "15 3,15 * * *",
-            "days": 14,
+            "scan_times": 2,
+            "clean_days": 7,
             "scan_dirs": "/nastools/data/downloads/dianying/\n/nastools/data/downloads/tv/",
             "exclude_dirs": "音乐\nmusic\n儿童\n临时下载\ndouyin\n杰伦十代\nflac\nape\nwav",
             "downloaders": "",
@@ -1252,8 +1303,8 @@ class SeedSourceGuard(_PluginBase):
                             hold_count: Dict[str, int]) -> Dict[str, str]:
         """按下载器判定是否触发站点/网络级故障保护。
 
-        单下载器红种数达到下限且占该下载器做种候选数比例 >=50% 时，
-        该下载器所有红种本轮不处置（不计天数），仅返回保护说明。
+        单下载器红种占该下载器做种候选数比例 >=50% 时，该下载器所有红种
+        本轮不处置（不计天数），仅返回保护说明。
         """
         protected: Dict[str, str] = {}
         red_by_dl: Dict[str, List[str]] = {}
@@ -1265,11 +1316,12 @@ class SeedSourceGuard(_PluginBase):
             if total <= 0:
                 total = len(keys)
             count = len(keys)
-            if count >= self._RED_PROTECT_MIN and count / total >= self._RED_PROTECT_RATIO:
+            if total > 0 and count / total >= self._RED_PROTECT_RATIO:
                 for key in keys:
                     protected[key] = f"{count}/{total}"
                 logger.warning(
-                    f"下载器 {dl} 红种 {count}/{total} 达 50% 阈值，判定站点/网络故障，本轮保护不处置"
+                    f"下载器 {dl} 红种 {count}/{total} 达 {int(self._RED_PROTECT_RATIO * 100)}% 阈值，"
+                    "判定站点/网络故障，本轮保护不处置"
                 )
         return protected
 
