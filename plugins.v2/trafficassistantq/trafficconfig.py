@@ -3,7 +3,7 @@ from typing import Dict, List, Optional
 
 from ruamel.yaml import YAML, YAMLError
 
-from app.log import logger
+from app.sdk.logging import logger
 
 
 @dataclass
