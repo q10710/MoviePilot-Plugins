@@ -1,38 +1,52 @@
+import copy
+import hashlib
+import json
 import threading
+import uuid
 from dataclasses import asdict, fields
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Tuple
 
 import pytz
-from app.helper.sites import SitesHelper
+from app.sdk.network import SitesHelper
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from ruamel.yaml import YAMLError
 
-from app.core.config import settings
-from app.core.event import Event, eventmanager
-from app.core.plugin import PluginManager
-from app.db.site_oper import SiteOper
-from app.db.systemconfig_oper import SystemConfigOper
-from app.log import logger
+from app.sdk.config import settings
+from app.sdk.events import Event, eventmanager
+from app.sdk.plugins import PluginManager
+from app.db.oper.site import SiteOper
+from app.db.oper.systemconfig import SystemConfigOper
+from app.sdk.logging import logger
 from app.plugins import _PluginBase
-from app.plugins.trafficassistant.trafficconfig import BaseConfig, TrafficConfig
-from app.scheduler import Scheduler
+from app.sdk.scheduler import update_plugin_job
 from app.schemas import NotificationType
 from app.schemas.types import EventType, SystemConfigKey
 
+from .trafficconfig import BaseConfig, TrafficConfig
+
 lock = threading.Lock()
+
+# 刷流任务身份/运行态字段：最终配置记忆与同步时不会被覆盖
+BRUSH_TASK_IDENTITY_KEYS = ("id", "name", "site_id", "enabled")
+# 最终配置模板持久化数据键
+DATA_KEY_BRUSH_TEMPLATE = "taq_brush_template"
+# 刷流任务指纹快照持久化数据键
+DATA_KEY_BRUSH_SNAPSHOTS = "taq_brush_snapshots"
 
 
 class TrafficAssistantQ(_PluginBase):
+    """站点流量管理Q改版：基于官方站点流量管理，联动站点刷流，分享率低于下限时按最终配置自动新建/同步刷流任务并启动。"""
+
     # 插件名称
-    plugin_name = "站点流量管理（Q魔改版）"
+    plugin_name = "站点流量管理Q改版"
     # 插件描述
-    plugin_desc = "自动管理流量，保障站点分享率。适配 BrushFlow 5.0.0 tasks 结构。"
+    plugin_desc = "自动管理流量，保障站点分享率。低于分享率下限时，按最终配置自动新建或同步该站刷流任务并启动；高于上限自动暂停。最终配置记忆最后一次手动改动的刷流任务规则，任务被全部删除后仍可重建。基于官方 TrafficAssistant v2.0.0 改造。"
     # 插件图标
-    plugin_icon = "trafficassistantq.png"
+    plugin_icon = "https://raw.githubusercontent.com/InfinityPacer/MoviePilot-Plugins/main/icons/trafficassistant.png"
     # 插件版本
-    plugin_version = "1.7.2"
+    plugin_version = "2.0.0"
     # 插件作者
     plugin_author = "Q"
     # 作者主页
@@ -98,7 +112,8 @@ class TrafficAssistantQ(_PluginBase):
         self.__update_config()
 
     def get_state(self) -> bool:
-        return self._traffic_config and self._traffic_config.enabled
+        """返回插件是否已启用，未完成配置时保持布尔类型。"""
+        return bool(self._traffic_config and self._traffic_config.enabled)
 
     @staticmethod
     def get_command() -> List[Dict[str, Any]]:
@@ -106,10 +121,10 @@ class TrafficAssistantQ(_PluginBase):
         定义远程控制命令
         :return: 命令关键字、事件、描述、附带数据
         """
-        pass
+        return []
 
     def get_api(self) -> List[Dict[str, Any]]:
-        pass
+        return []
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
         """
@@ -380,7 +395,7 @@ class TrafficAssistantQ(_PluginBase):
                                         'props': {
                                             'model': 'disable_auto_brush_if_above',
                                             'label': '停止刷流',
-                                            'hint': '分享率大于上限时自动停止刷流功能',
+                                            'hint': '分享率大于上限时自动暂停该站刷流任务（不删除、不改规则）',
                                             'persistent-hint': True
                                         }
                                     }
@@ -439,7 +454,7 @@ class TrafficAssistantQ(_PluginBase):
                                         'props': {
                                             'model': 'enable_auto_brush_if_below',
                                             'label': '开启刷流',
-                                            'hint': '分享率小于等于下限时自动开启刷流功能',
+                                            'hint': '分享率小于等于下限时自动按最终配置新建/同步该站刷流任务并启动',
                                             'persistent-hint': True
                                         }
                                     }
@@ -601,7 +616,7 @@ class TrafficAssistantQ(_PluginBase):
             }
 
     def get_page(self) -> List[dict]:
-        pass
+        return None
 
     def get_service(self) -> List[Dict[str, Any]]:
         """
@@ -620,12 +635,13 @@ class TrafficAssistantQ(_PluginBase):
 
         if self._traffic_config.enabled and self._traffic_config.cron:
             return [{
-                "id": "TrafficAssistant",
-                "name": "站点流量管理服务",
+                "id": "TrafficAssistantQ",
+                "name": "站点流量管理Q改版服务",
                 "trigger": CronTrigger.from_crontab(self._traffic_config.cron),
                 "func": self.traffic,
                 "kwargs": {}
             }]
+        return []
 
     def stop_service(self):
         """
@@ -691,14 +707,19 @@ class TrafficAssistantQ(_PluginBase):
         """根据提供的站点统计信息自动管理各站点的流量"""
         results = {}
         self._plugin_reload_if_need = False
+        brush_plugin_id = traffic_config.brush_plugin
+        # 先核对刷流任务是否有新的手动变动，刷新“最终配置”模板记忆
+        self.__refresh_brush_template(plugin_id=brush_plugin_id)
         for site_id, site in traffic_config.site_infos.items():
             site_name = site.name
             logger.info(f"正在准备对站点 {site_name} 进行流量管理")
             results[site_name] = self.__manage_site_traffic(traffic_config=traffic_config, site_id=site_id,
                                                             site_name=site_name, site_statistics=site_statistics)
         if self._plugin_reload_if_need:
-            self.__reload_plugin(plugin_id=traffic_config.brush_plugin)
+            self.__reload_plugin(plugin_id=brush_plugin_id)
             self._plugin_reload_if_need = False
+            # 固化快照基线，避免插件自身写入被误判为用户改动
+            self.__persist_brush_baseline(plugin_id=brush_plugin_id)
         return results
 
     def __manage_site_traffic(self, traffic_config: TrafficConfig, site_id: int, site_name: str,
@@ -832,13 +853,32 @@ class TrafficAssistantQ(_PluginBase):
         return action_performed, action_msg
 
     def __update_brush_sites(self, site_id: int, enable: bool, plugin_id: str) -> [bool, str]:
-        """更新或配置刷流插件站点（适配 BrushFlow 5.0.0 tasks 结构，自动创建缺失任务）"""
+        """按刷流插件配置契约更新目标站点的自动刷流状态。
+        低于下限(enable=True)：无任务则按最终配置新建并启动，有任务则同步为最终配置后启动；
+        高于上限(enable=False)：只停用已有任务，不删除任务、不改动规则。"""
         plugin_config = self.get_config(plugin_id=plugin_id)
         if not plugin_config:
             action_msg = "刷流站点：获取插件配置失败"
             logger.warning(action_msg)
             return False, action_msg
 
+        tasks = plugin_config.get("tasks")
+        if isinstance(tasks, list):
+            config_needs_update, actions = self.__update_brush_tasks(
+                plugin_config=plugin_config,
+                site_id=site_id,
+                enable=enable,
+            )
+            if config_needs_update:
+                self.update_config(config=plugin_config, plugin_id=plugin_id)
+                logger.info("已写入刷流插件配置")
+            return config_needs_update, "，".join(actions)
+
+        # 旧版 brushsites 列表模型：仅维护站点列表与全局开关，不做自动创建
+        return self.__update_brush_legacy(plugin_config=plugin_config, site_id=site_id, enable=enable)
+
+    def __update_brush_legacy(self, plugin_config: dict, site_id: int, enable: bool) -> Tuple[bool, str]:
+        """兼容旧版 brushsites 列表模型：仅维护站点列表与全局开关，不做自动创建"""
         actions = []
         config_needs_update = False
         plugin_enabled = plugin_config.get("enabled", False)
@@ -850,434 +890,201 @@ class TrafficAssistantQ(_PluginBase):
             actions.append(action_msg)
             config_needs_update = True
 
-        # BrushFlow 5.0.0 使用 tasks 数组结构，每个 task 有 site_id 和 enabled 字段
-        tasks = plugin_config.get("tasks", [])
-        if not tasks:
-            tasks = []
-
-        # 查找匹配 site_id 的 task
-        task_updated = False
-        rss_support = False
-
-        # 优先使用同站点已有任务的完整配置（手动调整过的）
-        if site_id is not None:
-            for task in tasks:
-                if task.get("site_id") == site_id:
-                    return {
-                        "downloader": task.get("downloader", ""),
-                        "save_path": task.get("save_path", ""),
-                        "cron": task.get("cron", ""),
-                        "active_time_range": task.get("active_time_range", ""),
-                        "disksize": task.get("disksize"),
-                        "maxupspeed": task.get("maxupspeed"),
-                        "maxdlspeed": task.get("maxdlspeed"),
-                        "maxdlcount": task.get("maxdlcount"),
-                        "freeleech": task.get("freeleech", "free"),
-                        "hr": task.get("hr", "yes"),
-                        "include": task.get("include"),
-                        "exclude": task.get("exclude"),
-                        "size": task.get("size"),
-                        "seeder": task.get("seeder"),
-                        "timezone_offset": task.get("timezone_offset", 0.0),
-                        "pubtime": task.get("pubtime"),
-                        "seed_time": task.get("seed_time"),
-                        "hr_seed_time": task.get("hr_seed_time"),
-                        "seed_ratio": task.get("seed_ratio"),
-                        "seed_size": task.get("seed_size"),
-                        "download_time": task.get("download_time"),
-                        "seed_avgspeed": task.get("seed_avgspeed"),
-                        "seed_inactivetime": task.get("seed_inactivetime"),
-                        "delete_size_range": task.get("delete_size_range"),
-                        "up_speed": task.get("up_speed"),
-                        "dl_speed": task.get("dl_speed"),
-                        "auto_archive_days": task.get("auto_archive_days"),
-                        "delete_except_tags": task.get("delete_except_tags"),
-                        "except_subscribe": task.get("except_subscribe", False),
-                        "proxy_delete": task.get("proxy_delete", False),
-                        "del_no_free": task.get("del_no_free", False),
-                        "qb_category": task.get("qb_category"),
-                        "site_hr_active": task.get("site_hr_active", False),
-                        "site_skip_tips": task.get("site_skip_tips", False),
-                        "rss_support": task.get("rss_support", False),
-                    }
-
-        for task in tasks:
-            if task.get("site_id") == site_id:
-                task_updated = True
-                current_enabled = task.get("enabled", False)
-                if enable and not current_enabled:
-                    task["enabled"] = True
-                    task_updated = True
-                    action_msg = f"刷流站点：已启用站点 {site_id} 的刷流任务"
-                    logger.info(action_msg)
-                    actions.append(action_msg)
-                    config_needs_update = True
-                elif not enable and current_enabled:
-                    task["enabled"] = False
-                    task_updated = True
-                    action_msg = f"刷流站点：已停用站点 {site_id} 的刷流任务"
-                    logger.info(action_msg)
-                    actions.append(action_msg)
-                    config_needs_update = True
-                # 启用时自动修复配置不完整的 task（仅补全空字段，已有值的字段不覆盖）
-                if enable and task.get("enabled"):
-                    template = self.__get_brush_template_config(tasks, site_id)
-                    fixed_fields = []
-                    if not task.get("downloader"):
-                        downloader_name = template.get("downloader", "")
-                        if downloader_name:
-                            task["downloader"] = downloader_name
-                            fixed_fields.append(f"下载器→{downloader_name}")
-                            config_needs_update = True
-                    if not task.get("save_path"):
-                        save_path = template.get("save_path", "")
-                        if save_path:
-                            task["save_path"] = save_path
-                            fixed_fields.append(f"保存路径→{save_path}")
-                            config_needs_update = True
-                    if not task.get("cron") and not task.get("active_time_range"):
-                        template = self.__get_brush_template_config(tasks, site_id)
-                        if template.get("cron") or template.get("active_time_range"):
-                            task["cron"] = template.get("cron", "")
-                            task["active_time_range"] = template.get("active_time_range", "")
-                            fixed_fields.append("时间配置已补全")
-                            config_needs_update = True
-                    if task.get("except_subscribe") is True:
-                        task["except_subscribe"] = False
-                        fixed_fields.append("排除订阅→关闭")
-                        config_needs_update = True
-                    if fixed_fields:
-                        action_msg = f"刷流站点：已修复站点 {site_id} 的刷流任务配置（{', '.join(fixed_fields)}）"
-                        logger.info(action_msg)
-                        actions.append(action_msg)
-                break
-
-        # 未找到匹配 task 且需要启用刷流时，自动创建新 task
-        if not task_updated and enable:
-            site_name = self.__get_site_name_by_id(site_id)
-            if not site_name:
-                action_msg = f"刷流站点：站点 {site_id} 不存在，无法创建刷流任务"
-                logger.warning(action_msg)
-                actions.append(action_msg)
-            else:
-                import uuid
-                # 优先使用同站点已有任务的完整配置，没有则从所有任务中提取模板
-                template = self.__get_brush_template_config(tasks, site_id)
-                new_task = {
-                    "id": uuid.uuid4().hex,
-                    "name": site_name,
-                    "enabled": True,
-                    "notify": False,
-                    "site_id": site_id,
-                    "downloader": template["downloader"],
-                    "brush_interval": 10,
-                    "check_interval": 5,
-                    "cron": template["cron"],
-                    "active_time_range": template["active_time_range"],
-                    "disksize": template["disksize"],
-                    "maxupspeed": template["maxupspeed"],
-                    "maxdlspeed": template["maxdlspeed"],
-                    "maxdlcount": template["maxdlcount"],
-                    "freeleech": template["freeleech"],
-                    "hr": template["hr"],
-                    "include": template["include"],
-                    "exclude": template["exclude"],
-                    "size": template["size"],
-                    "seeder": template["seeder"],
-                    "timezone_offset": template["timezone_offset"],
-                    "pubtime": template["pubtime"],
-                    "seed_time": template["seed_time"],
-                    "hr_seed_time": template["hr_seed_time"],
-                    "seed_ratio": template["seed_ratio"],
-                    "seed_size": template["seed_size"],
-                    "download_time": template["download_time"],
-                    "seed_avgspeed": template["seed_avgspeed"],
-                    "seed_inactivetime": template["seed_inactivetime"],
-                    "delete_size_range": template["delete_size_range"],
-                    "up_speed": template["up_speed"],
-                    "dl_speed": template["dl_speed"],
-                    "auto_archive_days": template["auto_archive_days"],
-                    "save_path": template["save_path"],
-                    "delete_except_tags": template["delete_except_tags"],
-                    "except_subscribe": template["except_subscribe"],
-                    "proxy_delete": template["proxy_delete"],
-                    "del_no_free": template["del_no_free"],
-                    "qb_category": template["qb_category"],
-                    "site_hr_active": template["site_hr_active"],
-                    "site_skip_tips": template["site_skip_tips"],
-                    "rss_support": template["rss_support"],
-                }
-                tasks.append(new_task)
-                task_updated = True
-                config_needs_update = True
-                action_msg = f"刷流站点：已为站点 {site_name}({site_id}) 创建并启用刷流任务"
-                logger.info(action_msg)
-                actions.append(action_msg)
-
-        if not task_updated:
-            action_msg = "刷流站点：无需调整"
-            actions.append(action_msg)
+        brush_sites = plugin_config.get("brushsites", [])
+        action_performed, action_msg = self.__update_site_list(site_id=site_id, site_list=brush_sites,
+                                                               remove=not enable,
+                                                               description="刷流")
+        logger.info(action_msg)
+        actions.append(action_msg)
+        if action_performed:
+            plugin_config["brushsites"] = brush_sites
+            config_needs_update = True
 
         if config_needs_update:
-            plugin_config["tasks"] = tasks
             self.update_config(config=plugin_config, plugin_id=plugin_id)
 
         return config_needs_update, "，".join(actions)
 
+    def __update_brush_tasks(self, plugin_config: dict, site_id: int, enable: bool) -> Tuple[bool, List[str]]:
+        """tasks 模型：按最终配置新建/同步任务并启停目标站点的全部刷流任务"""
+        actions = []
+        config_needs_update = False
+        tasks = plugin_config.get("tasks") or []
+        matching_tasks = [
+            task for task in tasks
+            if isinstance(task, dict) and task.get("site_id") == site_id
+        ]
+
+        if enable:
+            template = self.__get_brush_template()
+            if not template:
+                if matching_tasks:
+                    # 理论上有任务即有模板，此处兜底：仅启动不覆盖，避免误伤
+                    actions.append(f"刷流任务：站点 {site_id} 已有任务但无最终配置模板，仅启动不覆盖配置")
+                    for task in matching_tasks:
+                        if not bool(task.get("enabled", True)):
+                            task["enabled"] = True
+                            config_needs_update = True
+                else:
+                    return False, "刷流任务：无可用最终配置模板，无法自动创建（请先在站点刷流中建立一个任务作为最终配置基线）"
+            else:
+                if matching_tasks:
+                    task = matching_tasks[0]
+                    changed = self.__apply_brush_template(task=task, template=template)
+                    if not bool(task.get("enabled", True)):
+                        task["enabled"] = True
+                        changed = True
+                    action_msg = ("刷流任务：已按最终配置同步并启用"
+                                  if changed else "刷流任务：已启用（配置与最终配置一致）")
+                    actions.append(f"{action_msg}「{task.get('name') or site_id}」")
+                    config_needs_update = config_needs_update or changed
+                else:
+                    task = self.__build_brush_task(template=template, site_id=site_id)
+                    tasks.append(task)
+                    actions.append(f"刷流任务：已按最终配置新建并启用「{task.get('name')}」")
+                    config_needs_update = True
+
+            if not plugin_config.get("enabled", False):
+                plugin_config["enabled"] = True
+                actions.append("刷流插件：已启用")
+                config_needs_update = True
+        else:
+            for task in matching_tasks:
+                if bool(task.get("enabled", True)):
+                    task["enabled"] = False
+                    config_needs_update = True
+                    actions.append(f"刷流任务：已暂停「{task.get('name') or site_id}」")
+            if not actions:
+                actions.append("刷流任务：无需调整")
+
+        for action_msg in actions:
+            logger.info(action_msg)
+        return config_needs_update, actions
+
+    def __get_brush_template(self) -> dict:
+        """读取持久化的最终配置模板数据（含 config 规则与来源信息）"""
+        template = self.get_data(DATA_KEY_BRUSH_TEMPLATE) or {}
+        if not isinstance(template, dict) or not template.get("config"):
+            return {}
+        return template
+
+    def __refresh_brush_template(self, plugin_id: str):
+        """核对刷流任务相对上次基线是否有变动，将最后一个被改动/新增的任务固化为最终配置模板。
+        插件自身写入的任务已通过基线快照隔离，不会被误判为用户改动；任务被全部删除时保留模板记忆。"""
+        if not plugin_id:
+            return
+        try:
+            plugin_config = self.get_config(plugin_id=plugin_id)
+        except Exception as e:
+            logger.warning(f"读取刷流插件配置失败，跳过最终配置模板刷新：{e}")
+            return
+        if not plugin_config:
+            return
+
+        tasks = plugin_config.get("tasks")
+        if not isinstance(tasks, list):
+            return
+
+        old_snapshots = self.get_data(DATA_KEY_BRUSH_SNAPSHOTS) or {}
+        if not isinstance(old_snapshots, dict):
+            old_snapshots = {}
+        old_template = self.get_data(DATA_KEY_BRUSH_TEMPLATE) or {}
+        if not isinstance(old_template, dict):
+            old_template = {}
+
+        fingerprints = {}
+        changed_task = None
+        for task in tasks:
+            if not isinstance(task, dict) or not task.get("id"):
+                continue
+            task_id = task["id"]
+            fingerprints[task_id] = self.__brush_task_fingerprint(task)
+            # 顺序遍历后保留的即为“最后”一个发生变动的任务
+            if old_snapshots.get(task_id) != fingerprints[task_id]:
+                changed_task = task
+
+        removed_count = len(set(old_snapshots.keys()) - set(fingerprints.keys()))
+        template_changed = False
+        if changed_task is not None:
+            old_template = self.__make_brush_template(changed_task)
+            template_changed = True
+            logger.info(f"检测到刷流任务「{changed_task.get('name') or changed_task.get('id')}」"
+                        f"配置变动，已更新最终配置模板")
+
+        if removed_count:
+            logger.info(f"检测到 {removed_count} 个刷流任务被删除，最终配置模板记忆已保留")
+
+        snapshots_changed = (set(old_snapshots.keys()) != set(fingerprints.keys())) or any(
+            old_snapshots.get(key) != fp for key, fp in fingerprints.items())
+        if template_changed or snapshots_changed:
+            if template_changed:
+                self.save_data(DATA_KEY_BRUSH_TEMPLATE, old_template)
+                logger.info("最终配置模板已持久化记忆")
+            self.save_data(DATA_KEY_BRUSH_SNAPSHOTS, fingerprints)
+
+    def __persist_brush_baseline(self, plugin_id: str):
+        """把刷流插件当前全部任务规则固化为指纹快照，避免插件自身写入被误判为用户改动"""
+        if not plugin_id:
+            return
+        plugin_config = self.get_config(plugin_id=plugin_id) or {}
+        tasks = plugin_config.get("tasks")
+        if not isinstance(tasks, list):
+            return
+        fingerprints = {}
+        for task in tasks:
+            if isinstance(task, dict) and task.get("id"):
+                fingerprints[task["id"]] = self.__brush_task_fingerprint(task)
+        self.save_data(DATA_KEY_BRUSH_SNAPSHOTS, fingerprints)
+        logger.info("刷流任务快照基线已更新")
+
+    @staticmethod
+    def __brush_task_fingerprint(task: dict) -> str:
+        """计算刷流任务的规则指纹：忽略身份字段与启停状态，只对规则字段取哈希"""
+        rule = {key: value for key, value in task.items() if key not in BRUSH_TASK_IDENTITY_KEYS}
+        dump = json.dumps(rule, ensure_ascii=False, sort_keys=True, default=str)
+        return hashlib.sha256(dump.encode("utf-8")).hexdigest()
+
+    def __make_brush_template(self, task: dict) -> dict:
+        """把指定任务的全量规则固化为最终配置模板（剔除身份与启停字段，另存来源信息）"""
+        rule = {key: copy.deepcopy(value) for key, value in task.items() if key not in BRUSH_TASK_IDENTITY_KEYS}
+        return {
+            "config": rule,
+            "source_task_id": task.get("id"),
+            "source_site_id": task.get("site_id"),
+            "source_task_name": task.get("name"),
+            "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+    def __apply_brush_template(self, task: dict, template: dict) -> bool:
+        """把最终配置规则同步到目标任务，不覆盖身份字段与启停状态；返回是否存在字段变化"""
+        rule = (template or {}).get("config") or {}
+        changed = False
+        for key, value in rule.items():
+            if key in BRUSH_TASK_IDENTITY_KEYS:
+                continue
+            if key not in task or task.get(key) != value:
+                task[key] = copy.deepcopy(value)
+                changed = True
+        return changed
+
+    def __build_brush_task(self, template: dict, site_id: int) -> dict:
+        """按最终配置规则生成指定站点的新刷流任务（任务ID/站点/名称单独赋值并默认启用）"""
+        rule = copy.deepcopy((template or {}).get("config") or {})
+        rule["id"] = uuid.uuid4().hex
+        rule["site_id"] = site_id
+        rule["name"] = f"{self.__get_site_name_by_id(site_id=site_id) or site_id}刷流"
+        rule["enabled"] = True
+        return rule
+
     def __get_site_name_by_id(self, site_id: int) -> str:
         """根据站点 ID 获取站点名称"""
-        site_info = self.siteoper.get(site_id)
-        if site_info:
-            return site_info.name
-        return None
-
-    def __get_brush_downloader(self, tasks: list) -> str:
-        """智能选择刷流下载器：优先使用已有刷流任务的下载器，否则选第一个 qbittorrent 下载器"""
-        # 从已有 task 中获取下载器
-        rss_support = False
-
-        # 优先使用同站点已有任务的完整配置（手动调整过的）
-        if site_id is not None:
-            for task in tasks:
-                if task.get("site_id") == site_id:
-                    return {
-                        "downloader": task.get("downloader", ""),
-                        "save_path": task.get("save_path", ""),
-                        "cron": task.get("cron", ""),
-                        "active_time_range": task.get("active_time_range", ""),
-                        "disksize": task.get("disksize"),
-                        "maxupspeed": task.get("maxupspeed"),
-                        "maxdlspeed": task.get("maxdlspeed"),
-                        "maxdlcount": task.get("maxdlcount"),
-                        "freeleech": task.get("freeleech", "free"),
-                        "hr": task.get("hr", "yes"),
-                        "include": task.get("include"),
-                        "exclude": task.get("exclude"),
-                        "size": task.get("size"),
-                        "seeder": task.get("seeder"),
-                        "timezone_offset": task.get("timezone_offset", 0.0),
-                        "pubtime": task.get("pubtime"),
-                        "seed_time": task.get("seed_time"),
-                        "hr_seed_time": task.get("hr_seed_time"),
-                        "seed_ratio": task.get("seed_ratio"),
-                        "seed_size": task.get("seed_size"),
-                        "download_time": task.get("download_time"),
-                        "seed_avgspeed": task.get("seed_avgspeed"),
-                        "seed_inactivetime": task.get("seed_inactivetime"),
-                        "delete_size_range": task.get("delete_size_range"),
-                        "up_speed": task.get("up_speed"),
-                        "dl_speed": task.get("dl_speed"),
-                        "auto_archive_days": task.get("auto_archive_days"),
-                        "delete_except_tags": task.get("delete_except_tags"),
-                        "except_subscribe": task.get("except_subscribe", False),
-                        "proxy_delete": task.get("proxy_delete", False),
-                        "del_no_free": task.get("del_no_free", False),
-                        "qb_category": task.get("qb_category"),
-                        "site_hr_active": task.get("site_hr_active", False),
-                        "site_skip_tips": task.get("site_skip_tips", False),
-                        "rss_support": task.get("rss_support", False),
-                    }
-
-        for task in tasks:
-            downloader = task.get("downloader", "")
-            if downloader:
-                return downloader
-        # 回退：优先选 qbittorrent 类型的下载器，否则选第一个启用的
-        from app.helper.downloader import DownloaderHelper
-        downloader_configs = DownloaderHelper().get_configs()
-        if downloader_configs:
-            for name, cfg in downloader_configs.items():
-                if cfg.type == "qbittorrent":
-                    return name
-            first_name = next(iter(downloader_configs.keys()), "")
-            if first_name:
-                return first_name
+        try:
+            site_info = self.siteoper.get(site_id)
+            if site_info:
+                return site_info.name
+        except Exception as e:
+            logger.warning(f"获取站点 {site_id} 名称失败：{e}")
         return ""
-
-    def __get_brush_template_config(self, tasks: list, site_id: int = None) -> dict:
-        """从已有刷流任务中提取可复用的配置模板。
-        优先使用同站点已有任务的完整配置（手动调整过的），
-        没有同站点任务时从所有任务中取最后一个有值的字段作为默认值。"""
-        downloader = ""
-        save_path = ""
-        cron = ""
-        active_time_range = ""
-        disksize = None
-        maxupspeed = None
-        maxdlspeed = None
-        maxdlcount = None
-        freeleech = "free"
-        hr = "yes"
-        include = None
-        exclude = None
-        size = None
-        seeder = None
-        timezone_offset = 0.0
-        pubtime = None
-        seed_time = None
-        hr_seed_time = None
-        seed_ratio = None
-        seed_size = None
-        download_time = None
-        seed_avgspeed = None
-        seed_inactivetime = None
-        delete_size_range = None
-        up_speed = None
-        dl_speed = None
-        auto_archive_days = None
-        delete_except_tags = None
-        except_subscribe = False
-        proxy_delete = False
-        del_no_free = False
-        qb_category = None
-        site_hr_active = False
-        site_skip_tips = False
-        rss_support = False
-
-        rss_support = False
-
-        # 优先使用同站点已有任务的完整配置（手动调整过的）
-        if site_id is not None:
-            for task in tasks:
-                if task.get("site_id") == site_id:
-                    return {
-                        "downloader": task.get("downloader", ""),
-                        "save_path": task.get("save_path", ""),
-                        "cron": task.get("cron", ""),
-                        "active_time_range": task.get("active_time_range", ""),
-                        "disksize": task.get("disksize"),
-                        "maxupspeed": task.get("maxupspeed"),
-                        "maxdlspeed": task.get("maxdlspeed"),
-                        "maxdlcount": task.get("maxdlcount"),
-                        "freeleech": task.get("freeleech", "free"),
-                        "hr": task.get("hr", "yes"),
-                        "include": task.get("include"),
-                        "exclude": task.get("exclude"),
-                        "size": task.get("size"),
-                        "seeder": task.get("seeder"),
-                        "timezone_offset": task.get("timezone_offset", 0.0),
-                        "pubtime": task.get("pubtime"),
-                        "seed_time": task.get("seed_time"),
-                        "hr_seed_time": task.get("hr_seed_time"),
-                        "seed_ratio": task.get("seed_ratio"),
-                        "seed_size": task.get("seed_size"),
-                        "download_time": task.get("download_time"),
-                        "seed_avgspeed": task.get("seed_avgspeed"),
-                        "seed_inactivetime": task.get("seed_inactivetime"),
-                        "delete_size_range": task.get("delete_size_range"),
-                        "up_speed": task.get("up_speed"),
-                        "dl_speed": task.get("dl_speed"),
-                        "auto_archive_days": task.get("auto_archive_days"),
-                        "delete_except_tags": task.get("delete_except_tags"),
-                        "except_subscribe": task.get("except_subscribe", False),
-                        "proxy_delete": task.get("proxy_delete", False),
-                        "del_no_free": task.get("del_no_free", False),
-                        "qb_category": task.get("qb_category"),
-                        "site_hr_active": task.get("site_hr_active", False),
-                        "site_skip_tips": task.get("site_skip_tips", False),
-                        "rss_support": task.get("rss_support", False),
-                    }
-
-        for task in tasks:
-            if task.get("downloader"):
-                downloader = task["downloader"]
-            if task.get("save_path"):
-                save_path = task["save_path"]
-            if task.get("cron") or task.get("active_time_range"):
-                cron = task.get("cron", "")
-                active_time_range = task.get("active_time_range", "")
-            if task.get("disksize") is not None:
-                disksize = task["disksize"]
-            if task.get("maxupspeed") is not None:
-                maxupspeed = task["maxupspeed"]
-            if task.get("maxdlspeed") is not None:
-                maxdlspeed = task["maxdlspeed"]
-            if task.get("maxdlcount") is not None:
-                maxdlcount = task["maxdlcount"]
-            if task.get("seeder") is not None:
-                seeder = task["seeder"]
-            if task.get("pubtime") is not None:
-                pubtime = task["pubtime"]
-            if task.get("seed_time") is not None:
-                seed_time = task["seed_time"]
-            if task.get("hr_seed_time") is not None:
-                hr_seed_time = task["hr_seed_time"]
-            if task.get("seed_ratio") is not None:
-                seed_ratio = task["seed_ratio"]
-            if task.get("seed_size") is not None:
-                seed_size = task["seed_size"]
-            if task.get("download_time") is not None:
-                download_time = task["download_time"]
-            if task.get("seed_avgspeed") is not None:
-                seed_avgspeed = task["seed_avgspeed"]
-            if task.get("seed_inactivetime") is not None:
-                seed_inactivetime = task["seed_inactivetime"]
-            if task.get("delete_size_range") is not None:
-                delete_size_range = task["delete_size_range"]
-            if task.get("up_speed") is not None:
-                up_speed = task["up_speed"]
-            if task.get("dl_speed") is not None:
-                dl_speed = task["dl_speed"]
-            if task.get("auto_archive_days") is not None:
-                auto_archive_days = task["auto_archive_days"]
-            if task.get("delete_except_tags") is not None:
-                delete_except_tags = task["delete_except_tags"]
-            if task.get("except_subscribe") is not None:
-                except_subscribe = task["except_subscribe"]
-            if task.get("proxy_delete"):
-                proxy_delete = True
-            if task.get("del_no_free"):
-                del_no_free = True
-            if task.get("qb_category") is not None:
-                qb_category = task["qb_category"]
-            if task.get("site_hr_active"):
-                site_hr_active = True
-            if task.get("site_skip_tips"):
-                site_skip_tips = True
-            if task.get("rss_support"):
-                rss_support = True
-
-        # 如果 downloader 仍为空，回退到系统下载器
-        if not downloader:
-            downloader = self.__get_brush_downloader(tasks)
-
-        return {
-            "downloader": downloader,
-            "save_path": save_path,
-            "cron": cron,
-            "active_time_range": active_time_range,
-            "disksize": disksize,
-            "maxupspeed": maxupspeed,
-            "maxdlspeed": maxdlspeed,
-            "maxdlcount": maxdlcount,
-            "freeleech": freeleech,
-            "hr": hr,
-            "include": include,
-            "exclude": exclude,
-            "size": size,
-            "seeder": seeder,
-            "timezone_offset": timezone_offset,
-            "pubtime": pubtime,
-            "seed_time": seed_time,
-            "hr_seed_time": hr_seed_time,
-            "seed_ratio": seed_ratio,
-            "seed_size": seed_size,
-            "download_time": download_time,
-            "seed_avgspeed": seed_avgspeed,
-            "seed_inactivetime": seed_inactivetime,
-            "delete_size_range": delete_size_range,
-            "up_speed": up_speed,
-            "dl_speed": dl_speed,
-            "auto_archive_days": auto_archive_days,
-            "delete_except_tags": delete_except_tags,
-            "except_subscribe": except_subscribe,
-            "proxy_delete": proxy_delete,
-            "del_no_free": del_no_free,
-            "qb_category": qb_category,
-            "site_hr_active": site_hr_active,
-            "site_skip_tips": site_skip_tips,
-            "rss_support": rss_support,
-        }
 
     def __reload_plugin(self, plugin_id: str):
         logger.info(f"准备热加载插件: {plugin_id}")
@@ -1292,7 +1099,7 @@ class TrafficAssistantQ(_PluginBase):
 
         # 注册插件服务
         try:
-            Scheduler().update_plugin_job(plugin_id)
+            update_plugin_job(plugin_id)
             logger.info(f"成功热加载插件到插件服务: {plugin_id}")
         except Exception as e:
             logger.error(f"失败热加载插件到插件服务: {plugin_id}. 错误信息: {e}")
@@ -1363,7 +1170,7 @@ class TrafficAssistantQ(_PluginBase):
     def __send_message(self, title: str, message: str):
         """发送消息"""
         if self._traffic_config.notify:
-            self.post_message(mtype=NotificationType.Plugin, title=f"【{title}（Q魔改版）】", text=message)
+            self.post_message(mtype=NotificationType.Plugin, title=f"【{title}】", text=message)
 
     def __validate_config(self, traffic_config: TrafficConfig, force: bool = False, check_plugin_installed: bool = True) \
             -> (bool, str):
@@ -1476,7 +1283,7 @@ class TrafficAssistantQ(_PluginBase):
                 config["enabled"] = False
                 config["onlyonce"] = False
                 self.__log_and_notify_error(
-                    f"配置异常，已停用站点流量管理（Q魔改版），原因：{error}" if error else "配置异常，已停用站点流量管理（Q魔改版），请检查")
+                    f"配置异常，已停用站点流量管理，原因：{error}" if error else "配置异常，已停用站点流量管理，请检查")
             self.update_config(config)
 
     def __update_config(self):
@@ -1494,7 +1301,7 @@ class TrafficAssistantQ(_PluginBase):
         记录错误日志并发送系统通知
         """
         logger.error(message)
-        self.systemmessage.put(message, title="站点流量管理（Q魔改版）")
+        self.systemmessage.put(message, title="站点流量管理")
 
     def __get_site_options(self):
         """获取当前可选的站点"""
@@ -1508,7 +1315,7 @@ class TrafficAssistantQ(_PluginBase):
         running_plugins = self.pluginmanager.get_running_plugin_ids()
 
         # 需要检查的插件名称
-        filter_plugins = {"BrushFlow"}
+        filter_plugins = {"BrushFlow", "BrushFlowLowFreq"}
 
         # 获取本地插件列表
         local_plugins = self.pluginmanager.get_local_plugins()
@@ -1537,7 +1344,8 @@ class TrafficAssistantQ(_PluginBase):
         """
         plugin_names = {
             "SiteStatistic": "站点数据统计",
-            "BrushFlow": "站点刷流"
+            "BrushFlow": "站点刷流",
+            "BrushFlowLowFreq": "站点刷流（低频版）"
         }
 
         plugin_name = plugin_names.get(plugin_id, "未知插件")
