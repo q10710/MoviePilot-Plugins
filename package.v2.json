@@ -3,11 +3,12 @@
     "id": "BestVersionGuard",
     "name": "洗版守护",
     "description": "定时检查电视剧订阅：未完结的误标洗版自动取消，恢复普通订阅继续追更。修复 fixed_ids 重复跳过问题。",
-    "version": "2.4.5",
-    "version_name": "2.4.5",
+    "version": "2.4.6",
+    "version_name": "2.4.6",
     "author": "local",
     "level": 1,
     "history": {
+      "2.4.6": "新增插件图标（GitHub icons 直链）",
       "2.4.5": "本地插件源恢复后重新发布；内部版本号与包版本对齐，触发系统重新安装",
       "2.4.4": "已完结洗版订阅自动设置 best_version_full=1，只下载整季合集不再逐集散装",
       "2.4.3": "扩大检查范围至所有非S状态订阅（R/P/N），修复 P 状态洗版订阅被遗漏的问题",
@@ -19,7 +20,7 @@
       "2.1.0": "增加通知功能",
       "2.0.0": "初始版本：定时检查并取消未完结订阅的洗版标记"
     },
-    "plugin_icon": "bestversionguard.png",
+    "plugin_icon": "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/bestversionguard.png",
     "labels": [
       "订阅"
     ]
