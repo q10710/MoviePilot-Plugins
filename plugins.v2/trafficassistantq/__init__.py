@@ -44,9 +44,9 @@ class TrafficAssistantQ(_PluginBase):
     # 插件描述
     plugin_desc = "自动管理流量，保障站点分享率。低于分享率下限时，按最终配置自动新建或同步该站刷流任务并启动；高于上限自动暂停。最终配置记忆最后一次手动改动的刷流任务规则，任务被全部删除后仍可重建。基于官方 TrafficAssistant v2.0.0 改造。"
     # 插件图标
-    plugin_icon = "https://raw.githubusercontent.com/InfinityPacer/MoviePilot-Plugins/main/icons/trafficassistant.png"
+    plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/trafficassistantq.png"
     # 插件版本
-    plugin_version = "2.0.0"
+    plugin_version = "2.0.1"
     # 插件作者
     plugin_author = "Q"
     # 作者主页
