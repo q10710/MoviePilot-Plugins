@@ -29,11 +29,12 @@
     "name": "硬链接检查",
     "description": "扫描下载目录和媒体库目录中的孤立硬链接文件，连续3天孤立自动删除。",
     "labels": "文件管理",
-    "version": "3.1.1",
-    "icon": "linkchecker.png",
+    "version": "3.1.2",
+    "icon": "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/linkchecker.png",
     "author": "local",
     "level": 1,
     "history": {
+      "v3.1.2": "新增插件图标（GitHub icons 直链）",
       "v3.1.1": "本地插件源恢复后重新发布，触发系统重新安装",
       "v3.1.0": "按天计数，连续3天孤立自动删除，每次实时扫描不依赖历史"
     }
