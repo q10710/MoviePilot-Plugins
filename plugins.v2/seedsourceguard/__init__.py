@@ -32,7 +32,7 @@ class SeedSourceGuard(_PluginBase):
     plugin_desc = ("检测本地源文件是否有下载器在做种、下载器是否存在文件丢失的无效做种或"
                    "tracker 全部失败的做种任务；连续N天异常可通知或按策略处置，杜绝无效做种与孤儿文件。")
     plugin_icon = "seedguard.png"
-    plugin_version = "1.1.3"
+    plugin_version = "1.1.4"
     plugin_label = "下载管理"
     plugin_author = "local"
     plugin_config_prefix = "seedsourceguard_"
@@ -1513,24 +1513,28 @@ class SeedSourceGuard(_PluginBase):
         invalid = report.get("invalid") or []
         red = report.get("red") or []
         unavailable = report.get("unavailable") or []
+        # 单项超过 5 个只报汇总计数，避免消息过长；少量时逐条列出
         if no_seed:
             lines.append(f"孤儿源文件 {len(no_seed)} 个（无做种任务）")
-            for item in no_seed[:8]:
-                lines.append(f"  - {item.get('path', '')}")
-            if len(no_seed) > 8:
-                lines.append(f"  ...等 {len(no_seed)} 个")
+            if len(no_seed) <= 5:
+                for item in no_seed:
+                    lines.append(f"  - {item.get('path', '')}")
+            else:
+                lines.append("  - 数量较多，不逐条推送，请到插件页查看明细")
         if invalid:
             lines.append(f"无效做种任务 {len(invalid)} 个（文件丢失/报错）")
-            for item in invalid[:8]:
-                lines.append(f"  - [{item.get('dl', '')}] {item.get('name', '')}")
-            if len(invalid) > 8:
-                lines.append(f"  ...等 {len(invalid)} 个")
+            if len(invalid) <= 5:
+                for item in invalid:
+                    lines.append(f"  - [{item.get('dl', '')}] {item.get('name', '')}")
+            else:
+                lines.append("  - 数量较多，不逐条推送，请到插件页查看明细")
         if red:
             lines.append(f"红种做种任务 {len(red)} 个（tracker 全部通告失败）")
-            for item in red[:8]:
-                lines.append(f"  - [{item.get('dl', '')}] {item.get('name', '')}")
-            if len(red) > 8:
-                lines.append(f"  ...等 {len(red)} 个")
+            if len(red) <= 5:
+                for item in red:
+                    lines.append(f"  - [{item.get('dl', '')}] {item.get('name', '')}")
+            else:
+                lines.append("  - 数量较多，不逐条推送，请到插件页查看明细")
         if unavailable:
             lines.append(f"下载器异常 {len(unavailable)} 个（已跳过，未做任何处置）")
             for item in unavailable[:5]:
@@ -1539,7 +1543,7 @@ class SeedSourceGuard(_PluginBase):
             done = [h for h in handled_list if str(h.get("text", "")).startswith(("已", "达标未"))]
             if done:
                 lines.append(f"处置动作：{len(done)} 项")
-                for h in done[-5:]:
+                for h in done[-3:]:
                     lines.append(f"  - {h.get('text', '')[:100]}")
         if not lines:
             lines.append("本轮检测正常，无孤儿文件、无无效做种、无红种做种、下载器全部在线。")
