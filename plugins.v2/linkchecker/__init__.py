@@ -26,8 +26,8 @@ class LinkChecker(_PluginBase):
 
     plugin_name = "硬链接检查"
     plugin_desc = "扫描下载目录和媒体库目录中的孤立硬链接文件，连续3天孤立自动删除。"
-    plugin_icon = "linkchecker.png"
-    plugin_version = "3.1.1"
+    plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/linkchecker.png"
+    plugin_version = "3.1.2"
     plugin_label = "文件管理"
     plugin_author = "local"
     plugin_config_prefix = "linkchecker_"
