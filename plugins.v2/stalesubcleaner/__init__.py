@@ -23,8 +23,8 @@ class StaleSubCleaner(_PluginBase):
 
     plugin_name = "过期订阅清理"
     plugin_desc = "检查电视剧订阅，超过指定天数未下载新剧集则自动取消订阅。"
-    plugin_icon = "stalesubcleaner.png"
-    plugin_version = "1.1.1"
+    plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/stalesubcleaner.png"
+    plugin_version = "1.1.2"
     plugin_label = "订阅"
     plugin_author = "local"
     plugin_config_prefix = "stalesubcleaner_"
