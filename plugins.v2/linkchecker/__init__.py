@@ -27,7 +27,7 @@ class LinkChecker(_PluginBase):
     plugin_name = "硬链接检查"
     plugin_desc = "扫描下载目录和媒体库目录中的孤立硬链接文件，连续3天孤立自动删除。"
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/linkchecker.png"
-    plugin_version = "3.1.2"
+    plugin_version = "3.1.3"
     plugin_label = "文件管理"
     plugin_author = "local"
     plugin_config_prefix = "linkchecker_"
@@ -36,10 +36,17 @@ class LinkChecker(_PluginBase):
 
     _VIDEO_EXTS = {".mkv", ".mp4", ".ts", ".avi", ".m2ts", ".mov", ".wmv", ".flv", ".webm", ".m4v"}
 
+    # 常见收容目录名：路径中任意一层目录名命中即跳过扫描。
+    # 收容目录里的种子通常 links=1、且媒体库侧没有对应 inode，天然符合「孤立」判定，
+    # 但它是有意保留做种的，不能当残留清理；按目录名兜底可让不同环境都自动兼容。
+    _RELOCATE_DIR_NAMES = {"hr", "h&r", "relocate", "reloc", "收容"}
+
     _enabled = False
     _download_dirs: List[str] = []
     _library_dirs: List[str] = []
     _ignore_dirs: List[str] = []
+    _exclude_dirs: List[str] = []
+    _relocate_dirs: List[str] = []
     _cron: str = ""
     _auto_delete: bool = False
     _delete_threshold: int = 3
@@ -61,6 +68,8 @@ class LinkChecker(_PluginBase):
         self._download_dirs = []
         self._library_dirs = []
         self._ignore_dirs = []
+        self._exclude_dirs = []
+        self._relocate_dirs = []
         self._cron = ""
         self._auto_delete = False
         self._delete_threshold = 3
@@ -75,16 +84,20 @@ class LinkChecker(_PluginBase):
         raw_dl = config.get("download_dirs") or ""
         raw_lib = config.get("library_dirs") or ""
         raw_ignore = config.get("ignore_dirs") or ""
+        raw_exclude = config.get("exclude_dirs") or ""
         self._download_dirs = [d.strip() for d in raw_dl.split("\n") if d.strip()]
         self._library_dirs = [d.strip() for d in raw_lib.split("\n") if d.strip()]
         self._ignore_dirs = [d.strip() for d in raw_ignore.split("\n") if d.strip()]
+        self._exclude_dirs = [d.strip() for d in raw_exclude.split("\n") if d.strip()]
+        self._relocate_dirs = self._collect_relocate_dirs()
         self._cron = config.get("cron") or ""
         self._auto_delete = bool(config.get("auto_delete"))
         self._delete_threshold = int(config.get("delete_threshold") or 3)
         self._notify = bool(config.get("notify"))
         logger.info(
             f"初始化完成, enabled={self._enabled}, cron={self._cron}, "
-            f"auto_delete={self._auto_delete}, threshold={self._delete_threshold}"
+            f"auto_delete={self._auto_delete}, threshold={self._delete_threshold}, "
+            f"额外排除={len(self._exclude_dirs)} 项, 收容目录={self._relocate_dirs or '（按目录名兜底）'}"
         )
         if self._enabled and self._cron:
             self._schedule_service()
@@ -197,6 +210,25 @@ class LinkChecker(_PluginBase):
                             {
                                 "component": "VTextField",
                                 "props": {
+                                    "model": "exclude_dirs",
+                                    "label": "额外排除目录（每行一个，路径片段匹配）",
+                                    "placeholder": "/downloads/收容/",
+                                    "hint": (
+                                        "收容目录（保种目录）会自动排除：既按目录名 hr / h&r / relocate / 收容 兜底，"
+                                        "也会自动读取订阅助手插件里配置的收容目录；其它需要保护的目录可在此追加"
+                                    ),
+                                    "persistent-hint": True,
+                                },
+                            }
+                        ],
+                    },
+                    {
+                        "component": "VCol",
+                        "props": {"cols": 12},
+                        "content": [
+                            {
+                                "component": "VTextField",
+                                "props": {
                                     "model": "cron",
                                     "label": "定时扫描 Cron（留空不启用）",
                                     "placeholder": "0 4 * * *",
@@ -249,6 +281,7 @@ class LinkChecker(_PluginBase):
             "download_dirs": "",
             "library_dirs": "",
             "ignore_dirs": "",
+            "exclude_dirs": "",
             "cron": "",
             "auto_delete": False,
             "delete_threshold": 3,
@@ -626,14 +659,42 @@ class LinkChecker(_PluginBase):
 
     # ── 内部方法 ──────────────────────────────────────────────
 
+    def _collect_relocate_dirs(self) -> List[str]:
+        """从其它插件的配置里读取收容目录（订阅助手Q / 官方订阅助手），用于自动排除。
+
+        收容目录中的种子在媒体库侧没有对应 inode，天然符合「孤立」判定，但它是有意保种的内容。
+        未安装或未配置时返回空列表，不影响原有行为；读取失败只记日志。
+        """
+        dirs: List[str] = []
+        try:
+            from app.db.oper.systemconfig import SystemConfigOper
+
+            oper = SystemConfigOper()
+            for plugin_id in ("SubscribeAssistantEnhancedQ", "SubscribeAssistantEnhanced"):
+                try:
+                    cfg = oper.get(f"plugin.{plugin_id}")
+                except Exception:
+                    continue
+                if not isinstance(cfg, dict):
+                    continue
+                relocate_dir = str(cfg.get("relocate_dir") or "").strip()
+                if relocate_dir and relocate_dir not in dirs:
+                    dirs.append(relocate_dir)
+        except Exception as err:
+            logger.debug(f"读取收容目录配置失败（扫描时会按目录名兜底排除）：{err}")
+        return dirs
+
     def _is_ignored(self, filepath: str) -> bool:
-        """判断文件路径是否在忽略列表中。"""
-        if not self._ignore_dirs:
-            return False
-        for ignore in self._ignore_dirs:
-            if ignore in filepath:
+        """判断文件路径是否需要跳过。
+
+        依次检查：忽略目录、额外排除目录、收容目录（来自订阅助手配置），
+        最后按目录名兜底排除常见收容目录（hr / h&r / relocate / 收容 等）。
+        """
+        for ignore in list(self._ignore_dirs) + list(self._exclude_dirs) + list(self._relocate_dirs):
+            if ignore and ignore in filepath:
                 return True
-        return False
+        parts = {part.strip().lower() for part in Path(filepath).parts}
+        return bool(parts & self._RELOCATE_DIR_NAMES)
 
     def _scan_dirs(self, dirs: List[str]) -> List[Dict[str, Any]]:
         """扫描目录，返回孤立文件列表。"""
