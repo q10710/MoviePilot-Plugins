@@ -73,11 +73,12 @@
     "name": "做种守卫",
     "description": "检测本地源文件是否有下载器在做种、下载器是否存在文件丢失的无效做种或tracker 全部失败的做种任务；连续N天异常可通知或按策略处置，杜绝无效做种与孤儿文件。",
     "labels": "下载管理",
-    "version": "1.1.6",
+    "version": "1.1.7",
     "icon": "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/seedsourceguard.png",
     "author": "local",
     "level": 1,
     "history": {
+      "v1.1.7": "重新应用 Transmission 红种识别修复（此前 1.1.6 的文件被外部改回未修复版本）；实测 tr 3815 个红种可正常识别。",
       "v1.1.6": "修复 Transmission 红种识别失效：transmission-rpc 的 trackerStats 暴露 snake_case 字段（last_announce_succeeded / last_announce_time / last_announce_result），旧实现只按 camelCase 读取，导致 tr 红种永远识别不到；现两种命名自动兼容。",
       "v1.1.5": "新增插件图标（GitHub icons 直链）",
       "v1.0.0": "初始版本：支持全部 MoviePilot 下载器实例，检测孤儿源文件（无做种任务）与无效做种（文件丢失/报错），连续N天达标后按策略处置；下载器不可达时自动跳过并通知，绝不误删",
