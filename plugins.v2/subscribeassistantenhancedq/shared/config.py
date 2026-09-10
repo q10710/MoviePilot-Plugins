@@ -327,6 +327,11 @@ class PluginConfig:
         return self.get_str("site_hr_hours", "")
 
     @property
+    def hr_auto_scan(self) -> bool:
+        """每天自动抓取站点 H&R 时长并合并进兜底配置（抓取失败不影响其它功能）。"""
+        return self.get_bool("hr_auto_scan", True)
+
+    @property
     def subscription_cleanup_history_type(self) -> str:
         """订阅清理整理记录范围：no/all/movie/tv，命中后才允许执行破坏性清理事务。"""
         val = self.get_str("subscription_cleanup_history_type", "no")
