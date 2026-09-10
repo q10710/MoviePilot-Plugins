@@ -67,7 +67,7 @@ class HitAndRunQ(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/hitandrunq.png"
     # 插件版本
-    plugin_version = "2.2.2"
+    plugin_version = "2.2.3"
     # 插件作者
     plugin_author = "Q"
     # 作者主页
@@ -2011,6 +2011,15 @@ class HitAndRunQ(_PluginBase):
         site_config = self.__get_site_config(site_name=torrent_task.site_name)
         additional_seed_time = site_config.additional_seed_time or 0
 
+        # 站点配置可能在任务创建后被修改（例如补充「站点H&R时长」），每轮同步为最新站点值，
+        # 避免任务一直沿用创建时的历史快照，导致达标判定偏严或偏松
+        if site_config.hr_duration and site_config.hr_duration != torrent_task.hr_duration:
+            logger.info(f"站点 {torrent_task.site_name}，{torrent_task.identifier} "
+                        f"更新所需做种时间："
+                        f"{FormatHelper.format_hour(torrent_task.hr_duration or 0, 'hour')} → "
+                        f"{FormatHelper.format_hour(site_config.hr_duration, 'hour')} 小时")
+            torrent_task.hr_duration = site_config.hr_duration
+
         # 更新种子状态和记录日志
         meets_requirements = self.__meets_hr_requirements(
             torrent_task=torrent_task,
@@ -2051,7 +2060,9 @@ class HitAndRunQ(_PluginBase):
         """
         site_config = self.__get_site_config(site_name=torrent_task.site_name)
         additional_seed_time = site_config.additional_seed_time or 0
-        required_seeding_time = (torrent_task.hr_duration + additional_seed_time)
+        # 与达标判定保持一致：站点配置值优先，缺失时回退任务记录里的历史值
+        required_seeding_time = ((site_config.hr_duration or torrent_task.hr_duration or 0)
+                                 + additional_seed_time)
 
         logger.info(
             f"站点： {torrent_task.site_name}，"
