@@ -610,6 +610,15 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
             "kwargs": {"hours": cfg.meta_check_interval_hours},
         })
         service_schedules[service_id] = f"{cfg.meta_check_interval_hours}h"
+        if cfg.hr_auto_scan:
+            service_id = f"{name}_hr_scan"
+            services.append({
+                "id": service_id,
+                "name": "H&R时长自动刷新",
+                "trigger": CronTrigger.from_crontab("30 5 * * *"),
+                "func": self.run_hr_hours_scan,
+            })
+            service_schedules[service_id] = "cron(30 5 * * *)"
         if cfg.pending_download_enabled or cfg.download_monitor_enabled:
             service_id = f"{name}_download"
             services.append({
@@ -1341,7 +1350,12 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
 
     @eventmanager.register(EventType.PluginAction)
     def on_plugin_action(self, event):
-        """插件命令 → /subscribe_toggle 切换订阅状态。"""
+        """插件命令 → /subscribe_toggle 切换订阅状态、/sub_hr_scan 立即刷新站点 H&R 时长。"""
+        action = (getattr(event, "event_data", None) or {}).get("action") if event else None
+        if action == "hr_scan":
+            self.post_message(title="订阅助手Q改版", text="开始刷新站点 H&R 时长 ...")
+            self.run_hr_hours_scan()
+            return
         if self._event_proxy:
             self._event_proxy.on_plugin_action(event)
 
@@ -1355,14 +1369,23 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
 
     @staticmethod
     def get_command() -> List[Dict[str, Any]]:
-        """注册 /subscribe_toggle 远程命令：切换订阅启用/禁用状态。"""
-        return [{
-            "cmd": "/subscribe_toggle",
-            "event": EventType.PluginAction,
-            "desc": "切换订阅状态",
-            "category": "订阅",
-            "data": {"action": "subscribe_toggle"},
-        }]
+        """注册远程命令：切换订阅状态、立即刷新站点 H&R 时长。"""
+        return [
+            {
+                "cmd": "/subscribe_toggle",
+                "event": EventType.PluginAction,
+                "desc": "切换订阅状态",
+                "category": "订阅",
+                "data": {"action": "subscribe_toggle"},
+            },
+            {
+                "cmd": "/sub_hr_scan",
+                "event": EventType.PluginAction,
+                "desc": "立即刷新站点H&R时长",
+                "category": "订阅",
+                "data": {"action": "hr_scan"},
+            },
+        ]
 
     def get_api(self) -> List[Dict[str, Any]]:
         """暴露只读概览接口：返回各业务域启用状态与待定/监控计数。"""
@@ -1614,6 +1637,61 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
         if service and service.instance:
             logger.info(f"删除种子：从下载器 {downloader} 删除种子 {torrent_hash}（含源文件，不可逆）")
             service.instance.delete_torrents(delete_file=True, ids=torrent_hash)
+
+    def _config_payload(self) -> dict:
+        """构造当前完整配置字典（用于写回插件配置）。"""
+        if not self._config:
+            return {}
+        return {key: getattr(self._config, key) for key in self._config.declared_keys()}
+
+    @staticmethod
+    def _parse_site_hours_text(text) -> Dict[str, float]:
+        """解析「站点名:小时」文本为字典。"""
+        result: Dict[str, float] = {}
+        for item in str(text or "").replace("；", ",").replace(";", ",").replace("\n", ",").split(","):
+            item = item.strip()
+            if not item or ":" not in item:
+                continue
+            name, _, value = item.rpartition(":")
+            try:
+                result[name.strip()] = float(value.strip())
+            except Exception:
+                continue
+        return result
+
+    def run_hr_hours_scan(self):
+        """每天自动抓取站点 H&R 时长并合并进「站点H&R时长」兜底配置。
+
+        合并规则：抓到的值大于等于旧值时更新；比旧值更小时保留旧值并记日志，
+        避免抓取误差导致到期提前，造成 H&R 违约。
+        """
+        if not self._config or not getattr(self._config, "hr_auto_scan", True):
+            return
+        try:
+            from .shared.hr_hours import SiteHrHoursScanner
+
+            found = SiteHrHoursScanner().scan()
+        except Exception as err:
+            logger.error(f"站点 H&R 时长自动刷新失败：{err}")
+            return
+        if not found:
+            logger.info("站点 H&R 时长自动刷新：本轮未抓到任何站点时长")
+            return
+        current = self._parse_site_hours_text(getattr(self._config, "site_hr_hours", ""))
+        updated = dict(current)
+        kept = []
+        for name, hours in found.items():
+            old = current.get(name)
+            if old and hours < old:
+                kept.append(f"{name}(保留 {old:g}，抓到 {hours:g})")
+                continue
+            updated[name] = hours
+        merged = ",".join(f"{name}:{hours:g}" for name, hours in updated.items())
+        payload = self._config_payload()
+        payload["site_hr_hours"] = merged
+        self.update_config(payload)
+        logger.info(f"站点 H&R 时长自动刷新：抓到 {len(found)} 个站点，写入兜底配置 {len(updated)} 个"
+                    f"{('；保留旧值 ' + '、'.join(kept)) if kept else ''}")
 
     def _hr_site_names(self) -> set:
         """从配置的站点 H&R 时长文本中解析出 H&R 站点名单。"""
