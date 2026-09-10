@@ -21,7 +21,11 @@ DOWNLOAD_QUEUE_STATES = {
 
 # 严格完成判定用的上传类状态集合：qb 只有在下载真正完成后才会进入这些状态，
 # 用于区分「已完成做种」与「部分下载但边下边传」的种子。
-QB_FINISHED_STATES = {state.lower() for state in QB_COMPLETE_STATES}
+# 排除 checkingUP：校验中可能发现数据缺失而回退下载，保守起见不按已完成处理。
+QB_FINISHED_STATES = {state.lower() for state in QB_COMPLETE_STATES} - {"checkingup"}
+
+# qb 校验/移动类状态：即使进度已到 100% 也先按未完成处理，等状态稳定后再判
+QB_VERIFYING_STATES = {"checkingup", "checkingdl", "checkingresume", "moving"}
 
 
 @dataclass
@@ -68,8 +72,19 @@ class TorrentAdapter:
         downloaded = _as_int(_get_attr(torrent, "downloaded", default=0))
         seeding_time = _qb_seeding_time(torrent)
         progress = _progress_fraction(downloaded, target_size or total_size)
-        finished = (progress >= 0.999
-                    or str(state or "").strip().lower() in QB_FINISHED_STATES)
+        completion_on = _as_int(_get_attr(torrent, "completion_on", default=0))
+        amount_left = _as_int(_get_attr(torrent, "amount_left", default=0))
+        state_key = str(state or "").strip().lower()
+        if state_key in QB_VERIFYING_STATES:
+            # 校验/移动中：数据可能被判定缺失而回退下载，保守按未完成处理（下一轮状态变化后再判）
+            finished = False
+        else:
+            finished = (
+                progress >= 0.999
+                or state_key in QB_FINISHED_STATES
+                # 与主程序口径对齐：qb 的 completion_on>0 且已无剩余数据才算真正完成
+                or (completion_on > 0 and amount_left <= 0)
+            )
         completed, completion_time = _completion_status(
             state=state,
             seeding_time=seeding_time,
@@ -174,7 +189,10 @@ class TorrentAdapter:
 
     @staticmethod
     def is_completed(info: TorrentInfo) -> tuple[bool, float]:
-        """判断种子是否已完成下载，返回 (completed, completion_time)。"""
+        """判断种子是否已完成下载，返回 (completed, completion_time)。
+
+        注意：这里是宽松判定（做种时间>0 也算完成）。收容链路与下载监控请使用 info.finished（严格）。
+        """
         return info.completed, info.completion_time
 
     @staticmethod
@@ -207,7 +225,8 @@ def _is_qb_complete_state(torrent, state: str) -> bool:
             return True
     except Exception:
         pass
-    return str(state or "") in QB_COMPLETE_STATES
+    # 兜底比较统一转小写：qb 实际返回 camelCase，小写比较避免状态大小写差异导致漏判
+    return str(state or "").strip().lower() in {item.lower() for item in QB_COMPLETE_STATES}
 
 
 def _qb_seeding_time(torrent) -> int:
