@@ -5,8 +5,8 @@
 DEFAULT_TRACKER_RESPONSE = """torrent not registered with this tracker
 torrent banned"""
 
-# 自动删种默认跳过 H&R 标签，避免误删需要长期做种的任务。
-DEFAULT_DELETE_EXCLUDE_TAGS = "H&R"
+# 默认不启用排除标签：H&R 的处理方式改由「超时处理模式」决定（收容 / 排除标签二选一）。
+DEFAULT_DELETE_EXCLUDE_TAGS = ""
 
 # 默认收容目录：超时未完成的订阅种子移入这里，该目录不参与媒体库整理。
 DEFAULT_RELOCATE_DIR = "/nastools/data/downloads/hr"
@@ -285,15 +285,30 @@ class PluginConfig:
         return self.get_bool("relocate_enabled", True)
 
     @property
+    def hr_mode(self) -> str:
+        """超时处理模式（二选一）：relocate=收容，H&R 种子超时转入收容目录保种；
+
+        exclude=排除标签，带排除标签的种子跳过处理（既不删除也不收容）。两者互斥。
+        """
+        value = self.get_str("hr_mode", "relocate")
+        return value if value in ("relocate", "exclude") else "relocate"
+
+    @property
     def relocate_dir(self) -> str:
         """收容目录：超时未完成的种子移动到这里，该目录不参与媒体库整理。"""
         return self.get_non_empty_str("relocate_dir", DEFAULT_RELOCATE_DIR)
 
     @property
     def relocate_after_hours(self) -> float:
-        """收容门槛（小时）：下载超过该时长仍未完成即转入收容目录，默认 6 小时。"""
-        value = self.get_float("relocate_after_hours", 6)
-        return value if value > 0 else 6.0
+        """收容门槛（小时）：留空时自动跟随「下载超时时间」，填写则按填写值覆盖。
+
+        与下载超时判定联动，避免出现「超时窗口 6 小时、收容门槛却写 2 小时」这类配置漂移。
+        """
+        configured = self.get_float("relocate_after_hours", 0)
+        if configured and configured > 0:
+            return configured
+        minutes = self.get_int("download_timeout_minutes", 120) or 120
+        return max(minutes, 1) / 60
 
     @property
     def relocate_delete_files(self) -> bool:
