@@ -19,6 +19,10 @@ DOWNLOAD_QUEUE_STATES = {
     "download_pending",
 }
 
+# 严格完成判定用的上传类状态集合：qb 只有在下载真正完成后才会进入这些状态，
+# 用于区分「已完成做种」与「部分下载但边下边传」的种子。
+QB_FINISHED_STATES = {state.lower() for state in QB_COMPLETE_STATES}
+
 
 @dataclass
 class TorrentInfo:
@@ -42,6 +46,8 @@ class TorrentInfo:
     tracker: str = ""
     tracker_responses: list = field(default_factory=list)
     completed: bool = False
+    # 严格完成标志：进度到 100% 或下载器明确完成态；completed 仍是宽松判定（做种时间>0 也视为完成）
+    finished: bool = False
     completion_time: float = 0.0
 
     @property
@@ -62,6 +68,8 @@ class TorrentAdapter:
         downloaded = _as_int(_get_attr(torrent, "downloaded", default=0))
         seeding_time = _qb_seeding_time(torrent)
         progress = _progress_fraction(downloaded, target_size or total_size)
+        finished = (progress >= 0.999
+                    or str(state or "").strip().lower() in QB_FINISHED_STATES)
         completed, completion_time = _completion_status(
             state=state,
             seeding_time=seeding_time,
@@ -90,6 +98,7 @@ class TorrentAdapter:
             tracker=_get_attr(torrent, "tracker", default=""),
             tracker_responses=_get_qb_tracker_responses(torrent),
             completed=completed,
+            finished=finished,
             completion_time=completion_time,
         )
 
@@ -111,6 +120,8 @@ class TorrentAdapter:
         seeding_time = int(_get_attr(torrent, "seconds_seeding", "secondsSeeding", default=0) or 0)
         state = _get_attr(torrent, "status", default="")
         progress = _progress_fraction(downloaded, target_size or total_size)
+        left = _get_attr(torrent, "left_until_done", "leftUntilDone", default=None)
+        finished = (float(left) <= 0 if isinstance(left, (int, float)) else progress >= 0.999)
         completed, completion_time = _completion_status(
             state=state,
             seeding_time=seeding_time,
@@ -143,6 +154,7 @@ class TorrentAdapter:
             tracker=_get_tr_tracker(torrent),
             tracker_responses=_get_tr_tracker_responses(torrent),
             completed=completed,
+            finished=finished,
             completion_time=completion_time,
         )
 
