@@ -105,7 +105,7 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/subscribeassistantenhancedq.png"
     # 插件版本
-    plugin_version = "0.9.2"
+    plugin_version = "0.9.3"
     _site_cache_candidate_helper_warned = False
     # 插件作者
     plugin_author = "Q"
@@ -1475,6 +1475,8 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
                              f"｜站点 {record.get('site_name') or '-'}"
                              f"｜下载器 {record.get('downloader') or '-'}"
                              f"｜收容 {record.get('relocated_at') or '-'}"
+                             f"｜完成 {record.get('completed_at') or '未完成（完成后按 H&R 时长起算）'}"
+                             f"｜需做种 {record.get('hr_hours') or '-'} 小时"
                              f"｜到期 {record.get('deadline') or '-'}"),
                 },
             })
@@ -1994,8 +1996,10 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
         # 下载监控记录不含站点信息，缺失时用下载历史的站点名补齐，否则站点 H&R 时长无法参与到期计算
         site_name = str(record.get("site_name") or "").strip() or self._site_name_from_history(torrent_hash)
         site_id = record.get("site") or self._site_id_from_name(site_name)
-        deadline = (now + datetime.timedelta(hours=self._relocate_hours(
-            site_name, site_id=site_id, torrent_task=record))).strftime("%Y-%m-%d %H:%M:%S")
+        # 收容时先固化站点 H&R 时长：未完成时按进入收容时刻给出预估到期，
+        # 下载完成后到期清理会改用「完成时间 + 该时长」重新计算
+        hr_hours = self._relocate_hours(site_name, site_id=site_id, torrent_task=record)
+        deadline = (now + datetime.timedelta(hours=hr_hours)).strftime("%Y-%m-%d %H:%M:%S")
         entry = {
             "hash": torrent_hash,
             "downloader": downloader,
@@ -2004,6 +2008,7 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
             "site_id": site_id,
             "subscribe_id": getattr(subscribe, "id", None),
             "relocated_at": now.strftime("%Y-%m-%d %H:%M:%S"),
+            "hr_hours": hr_hours,
             "deadline": deadline,
             "delete_files": bool(getattr(cfg, "relocate_delete_files", True)),
         }
@@ -2065,11 +2070,87 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
         downloader, _ = self._locate_torrent_downloader(torrent_hash, preferred=preferred)
         return downloader
 
-    def _relocate_expired(self):
-        """收容到期清理：到期后在种子实际所在的下载器上删除任务（按配置决定是否删文件）。
+    # 收容种子长期未完成的提醒阈值（天）：站点 H&R 从下载完成才起算，未完成不删除，只提醒一次/天
+    RELOCATE_INCOMPLETE_ALERT_DAYS = 14
 
+    @staticmethod
+    def _parse_datetime_text(value) -> Optional[datetime.datetime]:
+        """解析「YYYY-MM-DD HH:MM:SS」时间文本；无法解析返回 None。"""
+        try:
+            return datetime.datetime.strptime(str(value), "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return None
+
+    @staticmethod
+    def _torrent_completion_time(raw) -> Optional[datetime.datetime]:
+        """从下载器原始种子对象解析完成时间：qb 取 completion_on，tr 取 done_date；取不到返回 None。"""
+        def attr(name, default=None):
+            if isinstance(raw, dict):
+                return raw.get(name, default)
+            return getattr(raw, name, default)
+
+        try:
+            ts = float(attr("completion_on") or 0)
+        except Exception:
+            ts = 0.0
+        if ts <= 0:
+            done = attr("done_date") or attr("doneDate")
+            if isinstance(done, datetime.datetime):
+                ts = done.timestamp()
+            elif isinstance(done, (int, float)):
+                ts = float(done)
+        if ts <= 0:
+            return None
+        try:
+            return datetime.datetime.fromtimestamp(ts)
+        except Exception:
+            return None
+
+    def _relocate_completion_state(self, downloader: str,
+                                   torrent_hash: str) -> Tuple[bool, bool, Optional[datetime.datetime]]:
+        """读取收容种子状态，返回 (是否取到种子, 是否已完成, 完成时间)。
+
+        站点 H&R 从「下载完成」才开始考察：未完成时不能删除收容种子，否则会白等甚至违约；
+        完成时间用于把到期点改成「下载完成时间 + 站点 H&R 时长」。
+        """
+        if not self._downloader_helper or not downloader or not torrent_hash:
+            return False, False, None
+        try:
+            service = self._downloader_helper.get_service(name=downloader)
+            instance = getattr(service, "instance", None) if service else None
+            if not instance:
+                return False, False, None
+            torrents, error = instance.get_torrents(ids=torrent_hash)
+            if error or not torrents:
+                return False, False, None
+            from .download.torrent import TorrentAdapter
+            raw = torrents[0]
+            info = TorrentAdapter.get_info(raw, service.type)
+            return True, bool(info.completed), self._torrent_completion_time(raw)
+        except Exception as err:
+            logger.debug(f"订阅收容：读取种子完成状态失败 {torrent_hash}（{downloader}）：{err}")
+            return False, False, None
+
+    def _relocate_deadline(self, record: dict,
+                           completed_at: Optional[datetime.datetime]) -> Optional[datetime.datetime]:
+        """计算到期时间：优先「下载完成时间 + 站点 H&R 时长」，缺少完成时间时回退记录里的到期值。"""
+        try:
+            hours = float(record.get("hr_hours") or 0)
+        except Exception:
+            hours = 0.0
+        # 完成时间优先取下载器当前值，取不到再用之前观察到并写入记录的值
+        base = completed_at or self._parse_datetime_text(record.get("completed_at"))
+        if base and hours > 0:
+            return base + datetime.timedelta(hours=hours)
+        return self._parse_datetime_text(record.get("deadline"))
+
+    def _relocate_expired(self):
+        """收容到期清理：种子下载完成后做满站点 H&R 时长，才在实际所在下载器删除任务。
+
+        站点 H&R 以「下载完成」为起算点，所以未完成的收容种子本轮不删除（只在长期未完成时提醒）；
+        完成后按「完成时间 + 站点 H&R 时长」计算到期点，缺完成时间时回退收容时的预估到期值。
         种子可能因「自动转移做种」被搬到其它下载器，所以每轮先跨下载器定位当前位置并更新记录，
-        到期时在实际所在下载器删除；所有下载器都找不到时视为已不存在，移出收容记录。
+        所有下载器都找不到时视为已不存在，移出收容记录。
         整轮读-改-写用收容锁串行化，避免与超时收容入口并发覆盖收容记录。
         """
         if not self._downloader_helper:
@@ -2086,11 +2167,7 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
                 if not downloader:
                     # 未到期时可能是下载器临时不可用，先保留；到期后仍找不到才移出记录，
                     # 且只有「遍历全部下载器都无报错」才认定种子已不存在，否则保留等下一轮
-                    try:
-                        deadline_missing = datetime.datetime.strptime(
-                            str(record.get("deadline")), "%Y-%m-%d %H:%M:%S")
-                    except Exception:
-                        deadline_missing = None
+                    deadline_missing = self._parse_datetime_text(record.get("deadline"))
                     if deadline_missing and now >= deadline_missing:
                         if conclusive:
                             logger.info(f"订阅收容：{record.get('title') or torrent_hash} "
@@ -2107,11 +2184,40 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
                     record["downloader"] = downloader
                     records[torrent_hash] = record
                     changed = True
-                try:
-                    deadline = datetime.datetime.strptime(str(record.get("deadline")), "%Y-%m-%d %H:%M:%S")
-                except Exception:
-                    deadline = None
-                if not deadline or now < deadline:
+                present, completed, completed_at = self._relocate_completion_state(downloader, torrent_hash)
+                if not present:
+                    # 本轮取不到种子状态（下载器瞬断等），保留记录等下一轮
+                    continue
+                if not completed:
+                    # 站点 H&R 从下载完成才开始考察：未完成不删除，仅在长期未完成时按天提醒一次
+                    relocated_at = self._parse_datetime_text(record.get("relocated_at"))
+                    waited_days = (now - relocated_at).days if relocated_at else 0
+                    if waited_days >= self.RELOCATE_INCOMPLETE_ALERT_DAYS:
+                        today = now.strftime("%Y-%m-%d")
+                        if record.get("last_incomplete_alert") != today:
+                            record["last_incomplete_alert"] = today
+                            records[torrent_hash] = record
+                            changed = True
+                            logger.warning(
+                                f"订阅收容：{record.get('title') or torrent_hash} 转入收容目录已 "
+                                f"{waited_days} 天仍未下载完成，站点 H&R 尚未开始考察，本轮不删除")
+                    continue
+                if completed_at:
+                    completed_text = completed_at.strftime("%Y-%m-%d %H:%M:%S")
+                    if record.get("completed_at") != completed_text:
+                        record["completed_at"] = completed_text
+                        records[torrent_hash] = record
+                        changed = True
+                deadline = self._relocate_deadline(record, completed_at)
+                if not deadline:
+                    continue
+                deadline_text = deadline.strftime("%Y-%m-%d %H:%M:%S")
+                if record.get("deadline") != deadline_text:
+                    # 以完成时间为基准刷新到期点，收容清单页展示同一口径
+                    record["deadline"] = deadline_text
+                    records[torrent_hash] = record
+                    changed = True
+                if now < deadline:
                     continue
                 service = self._downloader_helper.get_service(name=downloader)
                 instance = getattr(service, "instance", None) if service else None
@@ -2124,14 +2230,16 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
                     logger.error(f"订阅收容：到期删除 {torrent_hash} 失败（{downloader}）：{err}")
                     continue
                 logger.info(f"订阅收容到期：已在 {downloader} 删除 {record.get('title') or torrent_hash}"
-                            f"（收容于 {record.get('relocated_at')}，到期 {record.get('deadline')}）")
+                            f"（收容于 {record.get('relocated_at')}，"
+                            f"完成于 {record.get('completed_at') or '-'}，到期 {deadline_text}）")
                 if getattr(self._config, "notify", True):
                     try:
                         self.post_message(
                             title="【订阅收容到期】",
                             text=(f"已删除收容种子：{record.get('title') or torrent_hash}"
                                   f"（站点 {record.get('site_name') or '-'}，"
-                                  f"收容于 {record.get('relocated_at')}）"),
+                                  f"完成于 {record.get('completed_at') or '-'}，"
+                                  f"已做满 {record.get('hr_hours') or '-'} 小时）"),
                         )
                     except Exception as err:
                         logger.debug(f"订阅收容：到期通知发送失败：{err}")
