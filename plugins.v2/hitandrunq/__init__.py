@@ -66,7 +66,7 @@ class HitAndRunQ(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/hitandrunq.png"
     # 插件版本
-    plugin_version = "2.1.1"
+    plugin_version = "2.1.2"
     # 插件作者
     plugin_author = "Q"
     # 作者主页
@@ -1105,7 +1105,12 @@ class HitAndRunQ(_PluginBase):
                     presence.setdefault(torrent_hash, name)
                 logger.info(f"下载器 {name} 共有 {len(seeding_dict)} 个种子参与H&R检查")
 
-            # 检查种子标签变更情况（qBittorrent tags / Transmission labels 均支持）
+            # 先识别下载器之间的转移做种并标记确实被删除的种子（同时为转移后的种子补写H&R标签）
+            self.__sync_presence_and_transfer(torrent_tasks=torrent_tasks,
+                                              presence=presence,
+                                              unavailable_downloaders=unavailable_downloaders)
+
+            # 再检查种子标签变更情况（qBittorrent tags / Transmission labels 均支持）
             for name, context in contexts.items():
                 if name not in seeding_by_downloader:
                     continue
@@ -1120,11 +1125,6 @@ class HitAndRunQ(_PluginBase):
                 return
 
             logger.info(f"共有 {len(torrent_check_hashes)} 个任务正在H&R，开始检查任务状态")
-
-            # 识别下载器之间的转移做种，并标记确实被删除的种子
-            self.__sync_presence_and_transfer(torrent_tasks=torrent_tasks,
-                                              presence=presence,
-                                              unavailable_downloaders=unavailable_downloaders)
 
             # 先更新H&R任务的最新状态，上下传，分享率，做种时间等（跨下载器累计）
             self.__update_torrent_tasks_state(torrent_tasks=torrent_tasks,
@@ -1381,6 +1381,10 @@ class HitAndRunQ(_PluginBase):
         torrent_task.uploaded_offset = (torrent_task.uploaded_offset or 0.0) + provided_uploaded
         torrent_task.downloaded_offset = (torrent_task.downloaded_offset or 0.0) + provided_downloaded
         torrent_task.downloader = target_downloader
+
+        # 目标下载器若没有 H&R 标签则补写，避免下一轮标签同步把仍在跟踪的任务移出管理
+        if torrent_task.hit_and_run and torrent_task.hr_status != HNRStatus.COMPLIANT:
+            self.__update_hit_and_run_tag(torrent_task=torrent_task, add=True)
 
         logger.info(f"站点 {torrent_task.site_name}，H&R种子任务转移到下载器 {target_downloader}："
                     f"{torrent_task.identifier}，此前累计做种 "
