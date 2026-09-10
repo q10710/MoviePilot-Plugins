@@ -105,7 +105,7 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/subscribeassistantenhancedq.png"
     # 插件版本
-    plugin_version = "0.9.1"
+    plugin_version = "0.9.2"
     _site_cache_candidate_helper_warned = False
     # 插件作者
     plugin_author = "Q"
@@ -688,6 +688,7 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
             self._notify_subscribe("订阅助手数据重置前已恢复订阅状态", text=summary)
         else:
             logger.info("重置任务：数据清空前未发现需要恢复的订阅状态")
+        relocate_count = len(self.get_data("relocate_records") or {})
         for key in [
             "subscribes",
             "torrents",
@@ -698,9 +699,14 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
             "volatility",
             "site_evidence",
             "subscription_cleanup_histories",
+            "relocate_records",
+            "relocate_retain_notify",
         ]:
             self.save_data(key, {})
-        logger.info("重置任务：已清空全部插件任务数据（订阅、下载任务、完成前观察记录、放行令牌、完成快照、删除指纹、集数变化记录、站点证据、订阅清理记录）")
+        logger.info("重置任务：已清空全部插件任务数据（订阅、下载任务、完成前观察记录、放行令牌、完成快照、删除指纹、集数变化记录、站点证据、订阅清理记录、收容记录）")
+        if relocate_count:
+            logger.warning(f"重置任务：同时清空了 {relocate_count} 条收容记录，"
+                           f"收容目录中的种子不再自动到期删除，需要时请手动处理")
 
     def _run_backfill_now(self):
         """对现有分集洗版订阅执行一次下载事实回填，并推送扫描结果汇总。"""
@@ -1853,6 +1859,7 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
 
         与低进度超时不同，这里按绝对时长判定，慢速但持续下载的 H&R 种子同样会被收容；
         普通种子不在此处理，仍由低进度超时逻辑决定删除。收容失败只保留种子，下一轮继续尝试。
+        已进入人工保护期（连续低进度保留）的种子本轮跳过，避免与低进度巡检的通知承诺冲突。
         收容成功后的善后（清任务、清待定、防重指纹、延迟补搜、通知）复用 TorrentCleanup。
         """
         cfg = self._config
@@ -1871,57 +1878,74 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
         torrents = self._task_manager.read("torrents") or {}
         if not torrents:
             return
-        records = self.get_data("relocate_records") or {}
+        monitor = self._modules.get("download_monitor")
+        with self._relocate_lock:
+            records = dict(self.get_data("relocate_records") or {})
         threshold_seconds = threshold_hours * 3600
         now_ts = time.time()
         pending = 0
         overdue = 0
         hr_overdue = 0
+        skipped = 0
+        triggered_subscribe_ids: set = set()
         for torrent_hash, task in list(torrents.items()):
-            if torrent_hash in records:
-                continue
-            downloader = task.get("downloader")
-            if not torrent_hash or not downloader:
-                continue
-            service = self._downloader_helper.get_service(name=downloader)
-            instance = getattr(service, "instance", None) if service else None
-            if not instance:
-                continue
             try:
+                if torrent_hash in records:
+                    continue
+                downloader = task.get("downloader")
+                if not torrent_hash or not downloader:
+                    skipped += 1
+                    continue
+                service = self._downloader_helper.get_service(name=downloader)
+                instance = getattr(service, "instance", None) if service else None
+                if not instance:
+                    skipped += 1
+                    continue
                 torrents_now, error = instance.get_torrents(ids=torrent_hash)
+                if error or not torrents_now:
+                    # 下载器瞬断或种子已不在，交给低进度/缺失判定处理，避免误判
+                    skipped += 1
+                    continue
+                from .download.torrent import TorrentAdapter
+                info = TorrentAdapter.get_info(torrents_now[0], service.type)
+                if info.completed:
+                    continue
+                pending += 1
+                # 优先使用下载器中的真实添加时间，避免插件记录时间偏晚导致门槛变松
+                started = float(getattr(info, "add_on", 0) or 0) or float(task.get("time") or 0)
+                if not started or now_ts - started < threshold_seconds:
+                    continue
+                overdue += 1
+                subscribe = self._subscribe_oper.get(task.get("subscribe_id")) if (
+                    self._subscribe_oper and task.get("subscribe_id")) else None
+                if subscribe is None:
+                    skipped += 1
+                    continue
+                if monitor and monitor.is_timeout_protected(subscribe.id, torrent_hash, task):
+                    detail(f"订阅收容：{task.get('title') or torrent_hash} 处于连续低进度保护期，本轮跳过收容")
+                    continue
+                if not self._is_hr_release(downloader, torrent_hash, task, subscribe):
+                    continue
+                hr_overdue += 1
+                elapsed_hours = (now_ts - started) / 3600
+                logger.info(f"订阅收容：{task.get('title') or torrent_hash} 已下载 {elapsed_hours:.1f} 小时仍未完成"
+                            f"（门槛 {threshold_hours:g} 小时），执行 H&R 收容")
+                # 同一订阅同一轮只让首个种子触发补搜，避免同一订阅重复搜索
+                search_enabled = subscribe.id not in triggered_subscribe_ids
+                triggered_subscribe_ids.add(subscribe.id)
+                cleanup.handle_torrent_deleted(
+                    subscribe, torrent_hash, reason="timeout",
+                    reason_detail=f"下载已超过 {threshold_hours:g} 小时仍未完成",
+                    downloader=downloader, delete_from_downloader=True,
+                    search_enabled=search_enabled)
             except Exception as err:
-                logger.debug(f"订阅收容：读取种子失败 {torrent_hash}（{downloader}）：{err}")
-                continue
-            if error or not torrents_now:
-                # 下载器瞬断或种子已不在，交给低进度/缺失判定处理，避免误判
-                continue
-            from .download.torrent import TorrentAdapter
-            info = TorrentAdapter.get_info(torrents_now[0], service.type)
-            if info.completed:
-                continue
-            pending += 1
-            # 优先使用下载器中的真实添加时间，避免插件记录时间偏晚导致门槛变松
-            started = float(getattr(info, "add_on", 0) or 0) or float(task.get("time") or 0)
-            if not started or now_ts - started < threshold_seconds:
-                continue
-            overdue += 1
-            subscribe = self._subscribe_oper.get(task.get("subscribe_id")) if (
-                self._subscribe_oper and task.get("subscribe_id")) else None
-            if subscribe is None:
-                continue
-            if not self._is_hr_release(downloader, torrent_hash, task, subscribe):
-                continue
-            hr_overdue += 1
-            elapsed_hours = (now_ts - started) / 3600
-            logger.info(f"订阅收容：{task.get('title') or torrent_hash} 已下载 {elapsed_hours:.1f} 小时仍未完成"
-                        f"（门槛 {threshold_hours:g} 小时），执行 H&R 收容")
-            cleanup.handle_torrent_deleted(
-                subscribe, torrent_hash, reason="timeout",
-                reason_detail=f"下载已超过 {threshold_hours:g} 小时仍未完成",
-                downloader=downloader, delete_from_downloader=True)
+                logger.error(f"订阅收容：处理 {torrent_hash} 时异常：{err}", exc_info=True)
         if pending:
             detail(f"订阅收容：本轮检查 {pending} 个未完成下载任务，超过门槛 {overdue} 个，"
                    f"其中 H&R 种子 {hr_overdue} 个（门槛 {threshold_hours:g} 小时）")
+        if skipped:
+            detail(f"订阅收容：本轮跳过 {skipped} 个无法判定的下载任务（缺下载器或订阅、"
+                   f"下载器不可用、种子已不在）")
 
     def _relocate_downloader_torrent(self, downloader, torrent_hash, subscribe=None,
                                      torrent_task=None) -> str:
@@ -1991,14 +2015,16 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
                     f"已转入收容目录 {relocate_dir}，站点 {site_name or '-'}，到期 {deadline}")
         return RELOCATE_RELOCATED
 
-    def _find_torrent_downloader(self, torrent_hash: str, preferred: Optional[str] = None) -> Optional[str]:
-        """定位种子的当前所在下载器：优先给定下载器，其次遍历全部已配置下载器。
+    def _locate_torrent_downloader(self, torrent_hash: str,
+                                   preferred: Optional[str] = None) -> Tuple[Optional[str], bool]:
+        """定位种子所在的下载器，返回 (下载器名, 结论是否确定)。
 
-        用于应对 H&R 种子下载完成后被「自动转移做种」搬到别的下载器（原任务已被删除）的情况：
-        到期删除时必须在实际所在的下载器上操作，否则会出现「到期删不掉」。
+        结论确定=True：已遍历全部已配置下载器且没有任何一个报错，可据此认定种子确实不存在；
+        有下载器报错或不可用时为 False（不可判定），调用方应保留记录等下一轮重试，
+        避免把「下载器瞬断」当成「种子已被删除」。
         """
         if not self._downloader_helper or not torrent_hash:
-            return None
+            return None, False
         candidates: List[str] = []
         if preferred:
             candidates.append(str(preferred))
@@ -2010,19 +2036,34 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
         for name in services.keys():
             if name not in candidates:
                 candidates.append(name)
+        conclusive = bool(services)
         for name in candidates:
             try:
                 service = self._downloader_helper.get_service(name=name)
                 instance = getattr(service, "instance", None) if service else None
                 if not instance:
+                    conclusive = False
                     continue
                 torrents, error = instance.get_torrents(ids=torrent_hash)
-                if torrents and not error:
-                    return name
+                if error:
+                    conclusive = False
+                    continue
+                if torrents:
+                    return name, True
             except Exception as err:
                 logger.debug(f"订阅收容：查询下载器 {name} 中的种子失败 {torrent_hash}：{err}")
+                conclusive = False
                 continue
-        return None
+        return None, conclusive
+
+    def _find_torrent_downloader(self, torrent_hash: str, preferred: Optional[str] = None) -> Optional[str]:
+        """定位种子的当前所在下载器：优先给定下载器，其次遍历全部已配置下载器。
+
+        用于应对 H&R 种子下载完成后被「自动转移做种」搬到别的下载器（原任务已被删除）的情况：
+        到期删除时必须在实际所在的下载器上操作，否则会出现「到期删不掉」。
+        """
+        downloader, _ = self._locate_torrent_downloader(torrent_hash, preferred=preferred)
+        return downloader
 
     def _relocate_expired(self):
         """收容到期清理：到期后在种子实际所在的下载器上删除任务（按配置决定是否删文件）。
@@ -2040,19 +2081,25 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
             now = datetime.datetime.now()
             changed = False
             for torrent_hash, record in list(records.items()):
-                downloader = self._find_torrent_downloader(torrent_hash, preferred=record.get("downloader"))
+                downloader, conclusive = self._locate_torrent_downloader(
+                    torrent_hash, preferred=record.get("downloader"))
                 if not downloader:
-                    # 未到期时可能是下载器临时不可用，先保留；到期后仍找不到才移出记录
+                    # 未到期时可能是下载器临时不可用，先保留；到期后仍找不到才移出记录，
+                    # 且只有「遍历全部下载器都无报错」才认定种子已不存在，否则保留等下一轮
                     try:
                         deadline_missing = datetime.datetime.strptime(
                             str(record.get("deadline")), "%Y-%m-%d %H:%M:%S")
                     except Exception:
                         deadline_missing = None
                     if deadline_missing and now >= deadline_missing:
-                        logger.info(f"订阅收容：{record.get('title') or torrent_hash} "
-                                    f"已不在任何下载器，移出收容记录")
-                        records.pop(torrent_hash, None)
-                        changed = True
+                        if conclusive:
+                            logger.info(f"订阅收容：{record.get('title') or torrent_hash} "
+                                        f"已不在任何下载器，移出收容记录")
+                            records.pop(torrent_hash, None)
+                            changed = True
+                        else:
+                            logger.warning(f"订阅收容：{record.get('title') or torrent_hash} 已到期但"
+                                           f"下载器状态不可判定，保留收容记录等下一轮重试")
                     continue
                 if downloader != record.get("downloader"):
                     logger.info(f"订阅收容：{record.get('title') or torrent_hash} 已转移到下载器 "
