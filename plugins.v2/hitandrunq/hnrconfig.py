@@ -70,6 +70,10 @@ class HNRConfig(BaseConfig):
     relocate_after_hours: Optional[float] = 6
     relocate_tag: Optional[str] = "订阅收容"
     relocate_delete_files: Optional[bool] = True
+    # 站点 H&R 时长（站点名:小时，多个用逗号或换行分隔）；填了即覆盖该站的做种时长
+    site_hr_hours: Optional[str] = None
+    # 每天自动抓取站点 H&R 页面并合并进上面的站点时长配置
+    hr_auto_scan: Optional[bool] = True
     hit_and_run_tag: Optional[str] = None  # 种子标签
     auto_cleanup_days: float = 7  # 自动清理已删除或满足H&R要求的任务
     enable_site_config: Optional[bool] = False  # 启用站点独立配置
@@ -204,12 +208,34 @@ class HNRConfig(BaseConfig):
 
     def get_site_config(self, site_name: str) -> SiteConfig:
         """
-        根据站点名称返回合并后的配置
+        根据站点名称返回合并后的配置：站点独立配置 → 「站点H&R时长」文本框覆盖 → 全局默认
         """
         site_config = self.site_configs.get(site_name)
-        if site_config:
-            return site_config
-        else:
+        if not site_config:
             # 使用 __fields__ 获取所有字段并从实例中获取对应值
             base_config_attrs = {field: getattr(self, field) for field in self.__fields__}
-            return SiteConfig(**base_config_attrs, site_name=site_name)
+            site_config = SiteConfig(**base_config_attrs, site_name=site_name)
+        hours = self.get_simple_hr_hours(site_name)
+        if hours:
+            # 文本框给出的是该站完整做种时长，不再叠加附加做种时间
+            site_config.hr_duration = hours
+            site_config.additional_seed_time = 0.0
+        return site_config
+
+    def get_simple_hr_hours(self, site_name: Optional[str]) -> Optional[float]:
+        """从「站点H&R时长」文本配置中取出指定站点的做种时长（小时）。"""
+        if not site_name or not self.site_hr_hours:
+            return None
+        text = str(self.site_hr_hours).replace("；", ",").replace(";", ",").replace("\n", ",")
+        for item in text.split(","):
+            item = item.strip()
+            if not item or ":" not in item:
+                continue
+            name, _, value = item.rpartition(":")
+            if name.strip() != str(site_name).strip():
+                continue
+            try:
+                return float(value.strip())
+            except Exception:
+                return None
+        return None
