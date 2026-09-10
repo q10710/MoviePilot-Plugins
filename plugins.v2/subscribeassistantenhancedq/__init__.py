@@ -105,7 +105,7 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/subscribeassistantenhancedq.png"
     # 插件版本
-    plugin_version = "0.9.4"
+    plugin_version = "0.9.5"
     _site_cache_candidate_helper_warned = False
     # 插件作者
     plugin_author = "Q"
@@ -1910,7 +1910,8 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
                     continue
                 from .download.torrent import TorrentAdapter
                 info = TorrentAdapter.get_info(torrents_now[0], service.type)
-                if info.completed:
+                # 严格完成判定：部分下载但仍在上传的种子不能算完成，否则会漏掉本该收容的 H&R 种子
+                if self._torrent_is_completed(torrents_now[0], service.type):
                     continue
                 pending += 1
                 # 优先使用下载器中的真实添加时间，避免插件记录时间偏晚导致门槛变松
@@ -2103,6 +2104,39 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
         except Exception:
             return None
 
+    @staticmethod
+    def _torrent_is_completed(raw, dl_type: str) -> bool:
+        """严格判断种子是否真正下载完成：以进度/剩余量为准，避免把「边下边做种」误判为完成。
+
+        收容到期与收容入口都以「下载完成」为界，用共享适配器的宽松判定（做种时间>0 即视为完成）
+        会把部分下载却已在上传的种子算作完成，因此在收容链路里单独做严格判定：
+        qbittorrent 看 progress(0-1) 或完成后的上传类状态；Transmission 看 left(=0) 或 progress(0-100)。
+        """
+        def attr(name, default=None):
+            if isinstance(raw, dict):
+                return raw.get(name, default)
+            return getattr(raw, name, default)
+
+        if dl_type == "qbittorrent":
+            try:
+                progress = float(attr("progress") or 0)
+            except Exception:
+                progress = 0.0
+            if progress >= 0.999:
+                return True
+            state = str(attr("state") or "").lower()
+            return state in {"uploading", "stalledup", "forcedup", "queuedup", "checkingup", "pausedup"}
+        left = attr("left_until_done", None)
+        if left is None:
+            left = attr("leftUntilDone", None)
+        if isinstance(left, (int, float)):
+            return float(left) <= 0
+        try:
+            progress = float(attr("progress") or 0)
+        except Exception:
+            progress = 0.0
+        return progress >= 99.9
+
     def _relocate_completion_state(self, downloader: str,
                                    torrent_hash: str) -> Tuple[bool, bool, Optional[datetime.datetime]]:
         """读取收容种子状态，返回 (是否取到种子, 是否已完成, 完成时间)。
@@ -2120,10 +2154,8 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
             torrents, error = instance.get_torrents(ids=torrent_hash)
             if error or not torrents:
                 return False, False, None
-            from .download.torrent import TorrentAdapter
             raw = torrents[0]
-            info = TorrentAdapter.get_info(raw, service.type)
-            return True, bool(info.completed), self._torrent_completion_time(raw)
+            return True, self._torrent_is_completed(raw, service.type), self._torrent_completion_time(raw)
         except Exception as err:
             logger.debug(f"订阅收容：读取种子完成状态失败 {torrent_hash}（{downloader}）：{err}")
             return False, False, None
