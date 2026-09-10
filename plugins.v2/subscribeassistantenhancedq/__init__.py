@@ -318,7 +318,11 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
         tracker_keywords = [k.strip() for k in (cfg.default_tracker_response or "").splitlines() if k.strip()]
         if not cfg.tracker_response_listen:
             tracker_keywords = []
-        exclude_tags = [t.strip() for t in (cfg.delete_exclude_tags or "").replace("&", ",").split(",") if t.strip()]
+        # 超时处理模式二选一：收容模式下排除标签不生效（否则 H&R 种子会被整段跳过，无法收容）
+        exclude_tags = []
+        if cfg.hr_mode != "relocate":
+            exclude_tags = [t.strip() for t in (cfg.delete_exclude_tags or "").replace("&", ",").split(",")
+                            if t.strip()]
         download_monitor = DownloadMonitor(
             tm.read, tm.update,
             timeout_minutes=cfg.download_timeout_minutes,
@@ -946,6 +950,7 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
         tasks.append(("站点证据采样", self.run_site_evidence_scan))
         if self._config.download_monitor_enabled:
             tasks.append(("删除记录清理", self.run_deletes_cleanup))
+        tasks.append(("收容到期清理", self._relocate_expired))
         tasks.append(("完成快照清理", self.run_completion_snapshot_cleanup))
         tasks.append(("订阅清理事务清理", self.run_subscription_cleanup_expired))
 
@@ -1401,7 +1406,7 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
     @staticmethod
     def get_render_mode() -> Tuple[str, str]:
         """使用 vuetify JSON 表单渲染配置页（Q 版不依赖 Vue 构建产物，便于直接发布使用）。"""
-        return "vuetify", ""
+        return "vuetify", None
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
         """返回宿主配置接口需要的表单结构和默认模型，Vue Config 使用默认模型初始化。"""
@@ -1409,8 +1414,34 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
         return build_form()
 
     def get_page(self) -> Optional[List[dict]]:
-        """不提供详情页：框架按 has_page=False 处理，运行概况由 summary API 提供。"""
-        pass
+        """返回收容清单：展示当前收容中的 H&R 种子及其到期时间。"""
+        records = self.get_data("relocate_records") or {}
+        if not records:
+            return [{
+                "component": "VAlert",
+                "props": {"type": "info", "variant": "tonal",
+                          "text": "当前没有收容中的 H&R 种子"},
+            }]
+        rows: List[dict] = [{
+            "component": "VAlert",
+            "props": {"type": "success", "variant": "tonal",
+                      "text": (f"当前收容中 {len(records)} 个 H&R 种子"
+                               f"（保存在收容目录继续做种，到期后自动删除任务）")},
+        }]
+        for torrent_hash, record in list(records.items()):
+            rows.append({
+                "component": "VAlert",
+                "props": {
+                    "type": "warning",
+                    "variant": "tonal",
+                    "text": (f"{record.get('title') or torrent_hash}"
+                             f"｜站点 {record.get('site_name') or '-'}"
+                             f"｜下载器 {record.get('downloader') or '-'}"
+                             f"｜收容 {record.get('relocated_at') or '-'}"
+                             f"｜到期 {record.get('deadline') or '-'}"),
+                },
+            })
+        return rows
 
     def _tmdb_episodes(self, tmdbid: int, season: int, episode_group: str = None):
         """查询 TMDB 季内集信息供完成证据流水线构建 SeasonScope；不可用时返回空列表。"""
@@ -1584,26 +1615,154 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
             logger.info(f"删除种子：从下载器 {downloader} 删除种子 {torrent_hash}（含源文件，不可逆）")
             service.instance.delete_torrents(delete_file=True, ids=torrent_hash)
 
-    def _relocate_hours(self, site_name) -> float:
-        """计算站点 H&R 时长（小时）：站点配置优先，缺省使用默认值。"""
-        cfg = self._config
-        hours = None
-        if site_name:
-            text = str(getattr(cfg, "site_hr_hours", "") or "")
-            for item in text.replace("；", ",").replace(";", ",").replace("\n", ",").split(","):
-                item = item.strip()
-                if not item or ":" not in item:
-                    continue
-                name, _, value = item.rpartition(":")
-                if name.strip() == str(site_name).strip():
+    def _hr_site_names(self) -> set:
+        """从配置的站点 H&R 时长文本中解析出 H&R 站点名单。"""
+        names = set()
+        text = str(getattr(self._config, "site_hr_hours", "") or "")
+        for item in text.replace("；", ",").replace(";", ",").replace("\n", ",").split(","):
+            item = item.strip()
+            if not item or ":" not in item:
+                continue
+            name, _, _ = item.rpartition(":")
+            if name.strip():
+                names.add(name.strip())
+        return names
+
+    def _is_hr_release(self, downloader, torrent_hash, torrent_task=None, subscribe=None) -> bool:
+        """判断种子是否属于 H&R：站点命中配置的 H&R 站点名单，或种子带 H&R 标签。
+
+        站点名单为主判据（下载器标签在运行中可能丢失，仅作兜底），避免把普通种子也收容。
+        """
+        # 主判据：下载器上的 H&R 标签（按用户要求以标签为主）
+        try:
+            service = self._downloader_helper.get_service(name=downloader) if self._downloader_helper else None
+            instance = getattr(service, "instance", None) if service else None
+            if instance:
+                torrents, error = instance.get_torrents(ids=torrent_hash)
+                if torrents and not error:
+                    tags = self._torrent_tags(torrents[0])
+                    if any(str(tag).strip().upper() in ("H&R", "HR") for tag in tags):
+                        return True
+        except Exception as err:
+            logger.debug(f"订阅收容：读取种子标签失败 {torrent_hash}：{err}")
+        # 兜底：站点命中配置的 H&R 站点名单（标签可能在运行中丢失）
+        site_name = str((torrent_task or {}).get("site_name") or "").strip()
+        if not site_name:
+            site_name = self._site_name_from_history(torrent_hash)
+        if site_name and site_name in self._hr_site_names():
+            return True
+        return False
+
+    def _site_name_from_history(self, torrent_hash: str) -> str:
+        """从下载历史中取种子所属站点名（下载监控任务记录本身不含站点信息）。"""
+        try:
+            record = self._downloadhistory_oper.get_by_hash(torrent_hash) if self._downloadhistory_oper else None
+            if record:
+                return str(getattr(record, "torrent_site", "") or "").strip()
+        except Exception as err:
+            logger.debug(f"订阅收容：读取下载历史站点失败 {torrent_hash}：{err}")
+        return ""
+
+    @staticmethod
+    def _torrent_tags(torrent) -> list:
+        """读取 qBittorrent 标签或 Transmission labels。"""
+        if isinstance(torrent, dict):
+            raw = torrent.get("tags") or ""
+            return [tag.strip() for tag in str(raw).split(",") if tag.strip()]
+        labels = getattr(torrent, "labels", None) or []
+        return [str(tag).strip() for tag in labels if str(tag).strip()]
+
+    @staticmethod
+    def _parse_hr_hours_from_text(text) -> Optional[float]:
+        """从文本中解析 H&R 时长（小时），兼容中文与英文常见写法。"""
+        if not text:
+            return None
+        content = str(text)
+        patterns = (
+            r"做种(?:时间|时长)[^\d]{0,12}(\d+(?:\.\d+)?)\s*(?:小时|hours?|h)",
+            r"H&?R[^\d]{0,24}(\d+(?:\.\d+)?)\s*(?:小时|hours?|h)",
+            r"(\d+(?:\.\d+)?)\s*(?:小时|hours?|h)[^\n]{0,24}(?:做种|H&?R)",
+        )
+        for pattern in patterns:
+            match = re.search(pattern, content, re.IGNORECASE)
+            if not match:
+                continue
+            try:
+                value = float(match.group(1))
+            except Exception:
+                continue
+            if 1 <= value <= 24 * 30:
+                return value
+        return None
+
+    def _fetch_site_hr_hours(self, site_id) -> Optional[float]:
+        """尝试从站点 H&R 页面自动读取要求的做种时长（小时）；失败返回 None。
+
+        使用站点域名与已保存 Cookie 请求常见 H&R 页面（NexusPHP 系 myhr.php / hr.php），
+        命中后按文本解析；站点结构不匹配时返回 None，由调用方回退到配置或默认值。
+        """
+        if not site_id:
+            return None
+        try:
+            from app.sdk.network import RequestUtils, SitesHelper
+
+            indexers = SitesHelper().get_indexers() or []
+            site = next((item for item in indexers if str(item.get("id")) == str(site_id)), None)
+            if not site:
+                return None
+            domain = str(site.get("domain") or "").strip()
+            cookie = str(site.get("cookie") or "").strip()
+            if not domain or not cookie:
+                return None
+            headers = {"Cookie": cookie}
+            ua = site.get("ua")
+            for path in ("/myhr.php", "/hr.php", "/myhr.php?type=1"):
+                for scheme in ("https", "http"):
+                    url = f"{scheme}://{domain}{path}"
                     try:
-                        hours = float(value.strip())
+                        res = RequestUtils(headers=headers, ua=ua, timeout=15).get_res(url)
                     except Exception:
-                        hours = None
-                    break
-        if not hours:
-            hours = float(getattr(cfg, "default_hr_hours", 168) or 168)
-        return hours
+                        continue
+                    if not res or res.status_code != 200:
+                        continue
+                    hours = self._parse_hr_hours_from_text(res.text)
+                    if hours:
+                        logger.info(f"订阅收容：站点 {site.get('name')} 自动读取 H&R 时长 {hours} 小时")
+                        return hours
+        except Exception as err:
+            logger.debug(f"订阅收容：站点 H&R 时长自动读取失败（site={site_id}）：{err}")
+        return None
+
+    def _relocate_hours(self, site_name, site_id=None, torrent_task=None) -> float:
+        """计算 H&R 时长（小时），四级回退：站点页面自动读取 → 种子文本提取 → 站点配置 → 默认值。"""
+        hours = self._fetch_site_hr_hours(site_id)
+        if hours:
+            return hours
+        record = torrent_task or {}
+        hours = self._parse_hr_hours_from_text(
+            f"{record.get('title') or ''} {record.get('description') or ''}"
+        )
+        if hours:
+            logger.info(f"订阅收容：从种子文本读取 H&R 时长 {hours} 小时（{site_name or '-'}）")
+            return hours
+        logger.info(f"订阅收容：站点 {site_name or '-'} 页面与种子文本均未取到 H&R 时长，回退配置/默认值")
+        text = str(getattr(self._config, "site_hr_hours", "") or "")
+        for item in text.replace("；", ",").replace(";", ",").replace("\n", ",").split(","):
+            item = item.strip()
+            if not item or ":" not in item:
+                continue
+            name, _, value = item.rpartition(":")
+            if site_name and name.strip() == str(site_name).strip():
+                try:
+                    configured = float(value.strip())
+                except Exception:
+                    configured = None
+                if configured:
+                    logger.info(f"订阅收容：站点 {site_name} 使用配置的 H&R 时长 {configured:g} 小时")
+                    return configured
+        fallback = float(getattr(self._config, "default_hr_hours", 168) or 168)
+        logger.info(f"订阅收容：站点 {site_name or '-'} 未取到 H&R 时长，使用默认 {fallback} 小时")
+        return fallback
 
     def _relocate_downloader_torrent(self, downloader, torrent_hash, subscribe=None,
                                      torrent_task=None) -> bool:
@@ -1615,9 +1774,22 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
         cfg = self._config
         if not cfg or not getattr(cfg, "relocate_enabled", False):
             return False
+        if getattr(cfg, "hr_mode", "relocate") != "relocate":
+            logger.info("订阅收容：当前为排除标签模式，不执行收容")
+            return False
+        # 仅 H&R 种子走收容：普通种子维持原有超时删除逻辑，不占用收容目录
+        if not self._is_hr_release(downloader, torrent_hash, torrent_task, subscribe):
+            logger.info(f"订阅收容：{torrent_hash} 非 H&R 种子，交回原超时删除逻辑")
+            return False
         relocate_dir = str(getattr(cfg, "relocate_dir", "") or "").strip()
         if not relocate_dir or not self._downloader_helper or not downloader or not torrent_hash:
             return False
+        # 确保收容目录存在，否则下载器侧移动会失败
+        try:
+            import os
+            os.makedirs(relocate_dir, exist_ok=True)
+        except Exception as err:
+            logger.warning(f"订阅收容：创建收容目录 {relocate_dir} 失败：{err}")
         service = self._downloader_helper.get_service(name=downloader)
         instance = getattr(service, "instance", None) if service else None
         if not instance:
@@ -1639,9 +1811,11 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
             "downloader": downloader,
             "title": record.get("title") or "",
             "site_name": site_name,
+            "site_id": record.get("site"),
             "subscribe_id": getattr(subscribe, "id", None),
             "relocated_at": now.strftime("%Y-%m-%d %H:%M:%S"),
-            "deadline": (now + datetime.timedelta(hours=self._relocate_hours(site_name))).strftime(
+            "deadline": (now + datetime.timedelta(hours=self._relocate_hours(
+                site_name, site_id=record.get("site"), torrent_task=record))).strftime(
                 "%Y-%m-%d %H:%M:%S"),
             "delete_files": bool(getattr(cfg, "relocate_delete_files", True)),
         }
@@ -1650,21 +1824,78 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
                     f"已转入收容目录 {relocate_dir}，到期 {records[torrent_hash]['deadline']}")
         return True
 
+    def _find_torrent_downloader(self, torrent_hash: str, preferred: Optional[str] = None) -> Optional[str]:
+        """定位种子的当前所在下载器：优先给定下载器，其次遍历全部已配置下载器。
+
+        用于应对 H&R 种子下载完成后被「自动转移做种」搬到别的下载器（原任务已被删除）的情况：
+        到期删除时必须在实际所在的下载器上操作，否则会出现「到期删不掉」。
+        """
+        if not self._downloader_helper or not torrent_hash:
+            return None
+        candidates: List[str] = []
+        if preferred:
+            candidates.append(str(preferred))
+        try:
+            services = self._downloader_helper.get_services() or {}
+        except Exception as err:
+            logger.debug(f"订阅收容：获取下载器列表失败：{err}")
+            services = {}
+        for name in services.keys():
+            if name not in candidates:
+                candidates.append(name)
+        for name in candidates:
+            try:
+                service = self._downloader_helper.get_service(name=name)
+                instance = getattr(service, "instance", None) if service else None
+                if not instance:
+                    continue
+                torrents, error = instance.get_torrents(ids=torrent_hash)
+                if torrents and not error:
+                    return name
+            except Exception as err:
+                logger.debug(f"订阅收容：查询下载器 {name} 中的种子失败 {torrent_hash}：{err}")
+                continue
+        return None
+
     def _relocate_expired(self):
-        """收容到期清理：收容种子达到站点 H&R 时长后删除任务（按配置决定是否删文件）。"""
+        """收容到期清理：到期后在种子实际所在的下载器上删除任务（按配置决定是否删文件）。
+
+        种子可能因「自动转移做种」被搬到其它下载器，所以每轮先跨下载器定位当前位置并更新记录，
+        到期时在实际所在下载器删除；所有下载器都找不到时视为已不存在，移出收容记录。
+        """
         records = self.get_data("relocate_records") or {}
         if not records or not self._downloader_helper:
             return
         now = datetime.datetime.now()
         changed = False
         for torrent_hash, record in list(records.items()):
+            downloader = self._find_torrent_downloader(torrent_hash, preferred=record.get("downloader"))
+            if not downloader:
+                # 未到期时可能是下载器临时不可用，先保留；到期后仍找不到才移出记录
+                try:
+                    deadline_missing = datetime.datetime.strptime(
+                        str(record.get("deadline")), "%Y-%m-%d %H:%M:%S")
+                except Exception:
+                    deadline_missing = None
+                if deadline_missing and now >= deadline_missing:
+                    logger.info(f"订阅收容：{record.get('title') or torrent_hash} "
+                                f"已不在任何下载器，移出收容记录")
+                    records.pop(torrent_hash, None)
+                    changed = True
+                continue
+            if downloader != record.get("downloader"):
+                logger.info(f"订阅收容：{record.get('title') or torrent_hash} 已转移到下载器 "
+                            f"{downloader}，更新收容记录")
+                record["downloader"] = downloader
+                records[torrent_hash] = record
+                changed = True
             try:
                 deadline = datetime.datetime.strptime(str(record.get("deadline")), "%Y-%m-%d %H:%M:%S")
             except Exception:
                 deadline = None
             if not deadline or now < deadline:
                 continue
-            service = self._downloader_helper.get_service(name=record.get("downloader"))
+            service = self._downloader_helper.get_service(name=downloader)
             instance = getattr(service, "instance", None) if service else None
             if not instance:
                 continue
@@ -1672,10 +1903,20 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
                 instance.delete_torrents(ids=torrent_hash,
                                          delete_file=bool(record.get("delete_files", True)))
             except Exception as err:
-                logger.error(f"订阅收容：到期删除 {torrent_hash} 失败：{err}")
+                logger.error(f"订阅收容：到期删除 {torrent_hash} 失败（{downloader}）：{err}")
                 continue
-            logger.info(f"订阅收容到期：已删除 {record.get('title') or torrent_hash}"
+            logger.info(f"订阅收容到期：已在 {downloader} 删除 {record.get('title') or torrent_hash}"
                         f"（收容于 {record.get('relocated_at')}，到期 {record.get('deadline')}）")
+            if getattr(self._config, "notify", True):
+                try:
+                    self.post_message(
+                        title="【订阅收容到期】",
+                        text=(f"已删除收容种子：{record.get('title') or torrent_hash}"
+                              f"（站点 {record.get('site_name') or '-'}，"
+                              f"收容于 {record.get('relocated_at')}）"),
+                    )
+                except Exception as err:
+                    logger.debug(f"订阅收容：到期通知发送失败：{err}")
             records.pop(torrent_hash, None)
             changed = True
         if changed:
