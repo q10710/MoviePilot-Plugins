@@ -114,5 +114,17 @@
     "history": {
       "v1.0.0": "初始版本：对比媒体库快照识别被删除的电影/电视剧，连续缺失达到宽限天数（默认 3 天）且对应订阅仍存在、期间无新下载记录时，按配置处置订阅；首次运行只建立基线，媒体服务器读取失败时整轮中止，避免误判。"
     }
+  },
+  "SubscribeAssistantEnhancedQ": {
+    "name": "订阅助手Q改版",
+    "description": "基于订阅助手（增强版）改造：订阅下载超时的种子不再直接删除，改为移入独立收容目录保留做种，按站点 H&R 时长到期后清理；其余订阅全生命周期能力保持一致。",
+    "labels": "订阅",
+    "version": "0.8.0",
+    "icon": "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/subscribeassistantenhancedq.png",
+    "author": "Q",
+    "level": 1,
+    "history": {
+      "v0.8.0": "订阅助手 Q 改版（基于官方 v0.7.7 改造）：① 超时删种改为超时收容——下载超时仍未完成的订阅种子不再删除，改为把保存目录移到收容目录（默认 /nastools/data/downloads/hr，不参与媒体库整理）保留做种，同时照常触发订阅补搜去下其它资源；② 新增收容到期清理——按站点 H&R 时长（站点可单独配置，缺省 168 小时）到期后删除任务，可选是否连文件一起删；③ 配置页改为 vuetify JSON 表单，不依赖 Vue 构建产物，便于直接发布给别人安装使用。"
+    }
   }
 }
