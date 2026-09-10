@@ -786,6 +786,12 @@ class DownloadMonitor:
         """连续低进度统计窗口：至少 24 小时，或超时窗口乘保护次数。"""
         return max(24 * 3600, self._timeout_seconds * max(int(self._retry_limit or 1), 1))
 
+    def is_timeout_protected(self, subscribe_id: int, torrent_hash: str, torrent_task: dict) -> bool:
+        """对外暴露人工保护期判断：处于保护期的种子不应被其它入口（如绝对时长收容）再次处理。"""
+        if not torrent_task:
+            return False
+        return self._is_timeout_ignore_active(subscribe_id, torrent_hash, torrent_task)
+
     def _is_timeout_ignore_active(self, subscribe_id: int, torrent_hash: str, torrent_task: dict) -> bool:
         """读取人工保护期：同一 hash 在 ignore_until 前不再重复计数或处理。"""
         sid = str(subscribe_id)
