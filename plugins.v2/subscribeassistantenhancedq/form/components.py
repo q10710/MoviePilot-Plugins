@@ -104,6 +104,9 @@ def field_for(model: str, label: str, default: Any, hint: str = "", md: int = 6)
             {"title": "收容（H&R 种子超时转入收容目录保种）", "value": "relocate"},
             {"title": "排除标签（带排除标签的种子跳过处理）", "value": "exclude"},
         ], hint, 4)
+    if model == "default_tracker_response":
+        # 每行一个关键字，用多行文本框避免长列表被单行输入框截断
+        return textarea_field(model, label, hint, 12, rows=4)
     if isinstance(default, bool):
         return switch_col(model, label, hint, md)
     if isinstance(default, str):
