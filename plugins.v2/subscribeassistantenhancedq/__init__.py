@@ -105,7 +105,7 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/subscribeassistantenhancedq.png"
     # 插件版本
-    plugin_version = "0.9.3"
+    plugin_version = "0.9.4"
     _site_cache_candidate_helper_warned = False
     # 插件作者
     plugin_author = "Q"
@@ -2070,9 +2070,6 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
         downloader, _ = self._locate_torrent_downloader(torrent_hash, preferred=preferred)
         return downloader
 
-    # 收容种子长期未完成的提醒阈值（天）：站点 H&R 从下载完成才起算，未完成不删除，只提醒一次/天
-    RELOCATE_INCOMPLETE_ALERT_DAYS = 14
-
     @staticmethod
     def _parse_datetime_text(value) -> Optional[datetime.datetime]:
         """解析「YYYY-MM-DD HH:MM:SS」时间文本；无法解析返回 None。"""
@@ -2147,7 +2144,8 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
     def _relocate_expired(self):
         """收容到期清理：种子下载完成后做满站点 H&R 时长，才在实际所在下载器删除任务。
 
-        站点 H&R 以「下载完成」为起算点，所以未完成的收容种子本轮不删除（只在长期未完成时提醒）；
+        站点 H&R 以「下载完成」为起算点，所以未完成的收容种子不按时间删；
+        超过「未完成清理天数」仍未下载完成时，按「站点不计 H&R」删除任务与文件（0 表示不清理）。
         完成后按「完成时间 + 站点 H&R 时长」计算到期点，缺完成时间时回退收容时的预估到期值。
         种子可能因「自动转移做种」被搬到其它下载器，所以每轮先跨下载器定位当前位置并更新记录，
         所有下载器都找不到时视为已不存在，移出收容记录。
@@ -2189,18 +2187,37 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
                     # 本轮取不到种子状态（下载器瞬断等），保留记录等下一轮
                     continue
                 if not completed:
-                    # 站点 H&R 从下载完成才开始考察：未完成不删除，仅在长期未完成时按天提醒一次
+                    # 站点 H&R 从下载完成才开始考察，一直下不完的种子不会进入考察，
+                    # 因此超过「未完成清理天数」后按「站点不计 H&R」删除任务与文件；未到阈值只跳过
+                    limit_days = int(getattr(self._config, "relocate_incomplete_days", 0) or 0)
                     relocated_at = self._parse_datetime_text(record.get("relocated_at"))
                     waited_days = (now - relocated_at).days if relocated_at else 0
-                    if waited_days >= self.RELOCATE_INCOMPLETE_ALERT_DAYS:
-                        today = now.strftime("%Y-%m-%d")
-                        if record.get("last_incomplete_alert") != today:
-                            record["last_incomplete_alert"] = today
-                            records[torrent_hash] = record
-                            changed = True
-                            logger.warning(
-                                f"订阅收容：{record.get('title') or torrent_hash} 转入收容目录已 "
-                                f"{waited_days} 天仍未下载完成，站点 H&R 尚未开始考察，本轮不删除")
+                    if limit_days <= 0 or waited_days < limit_days:
+                        continue
+                    service = self._downloader_helper.get_service(name=downloader)
+                    instance = getattr(service, "instance", None) if service else None
+                    if not instance:
+                        continue
+                    try:
+                        instance.delete_torrents(ids=torrent_hash, delete_file=True)
+                    except Exception as err:
+                        logger.error(f"订阅收容：未完成清理删除 {torrent_hash} 失败（{downloader}）：{err}")
+                        continue
+                    logger.info(f"订阅收容未完成清理：已在 {downloader} 删除 "
+                                f"{record.get('title') or torrent_hash}"
+                                f"（收容于 {record.get('relocated_at')}，已 {waited_days} 天未完成）")
+                    if getattr(self._config, "notify", True):
+                        try:
+                            self.post_message(
+                                title="【订阅收容未完成清理】",
+                                text=(f"收容后 {waited_days} 天仍未下载完成，按「站点不计 H&R」清理："
+                                      f"{record.get('title') or torrent_hash}"
+                                      f"（站点 {record.get('site_name') or '-'}，任务与文件已删除）"),
+                            )
+                        except Exception as err:
+                            logger.debug(f"订阅收容：未完成清理通知发送失败：{err}")
+                    records.pop(torrent_hash, None)
+                    changed = True
                     continue
                 if completed_at:
                     completed_text = completed_at.strftime("%Y-%m-%d %H:%M:%S")
