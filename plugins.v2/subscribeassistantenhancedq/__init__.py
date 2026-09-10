@@ -105,7 +105,7 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/subscribeassistantenhancedq.png"
     # 插件版本
-    plugin_version = "0.9.0"
+    plugin_version = "0.9.1"
     _site_cache_candidate_helper_warned = False
     # 插件作者
     plugin_author = "Q"
@@ -1875,6 +1875,8 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
         threshold_seconds = threshold_hours * 3600
         now_ts = time.time()
         pending = 0
+        overdue = 0
+        hr_overdue = 0
         for torrent_hash, task in list(torrents.items()):
             if torrent_hash in records:
                 continue
@@ -1902,12 +1904,14 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
             started = float(getattr(info, "add_on", 0) or 0) or float(task.get("time") or 0)
             if not started or now_ts - started < threshold_seconds:
                 continue
+            overdue += 1
             subscribe = self._subscribe_oper.get(task.get("subscribe_id")) if (
                 self._subscribe_oper and task.get("subscribe_id")) else None
             if subscribe is None:
                 continue
             if not self._is_hr_release(downloader, torrent_hash, task, subscribe):
                 continue
+            hr_overdue += 1
             elapsed_hours = (now_ts - started) / 3600
             logger.info(f"订阅收容：{task.get('title') or torrent_hash} 已下载 {elapsed_hours:.1f} 小时仍未完成"
                         f"（门槛 {threshold_hours:g} 小时），执行 H&R 收容")
@@ -1916,7 +1920,8 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
                 reason_detail=f"下载已超过 {threshold_hours:g} 小时仍未完成",
                 downloader=downloader, delete_from_downloader=True)
         if pending:
-            detail(f"订阅收容：本轮检查 {pending} 个未完成下载任务，收容门槛 {threshold_hours:g} 小时")
+            detail(f"订阅收容：本轮检查 {pending} 个未完成下载任务，超过门槛 {overdue} 个，"
+                   f"其中 H&R 种子 {hr_overdue} 个（门槛 {threshold_hours:g} 小时）")
 
     def _relocate_downloader_torrent(self, downloader, torrent_hash, subscribe=None,
                                      torrent_task=None) -> str:
