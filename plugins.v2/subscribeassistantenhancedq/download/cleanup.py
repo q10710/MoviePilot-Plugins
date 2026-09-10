@@ -24,6 +24,8 @@ class TorrentCleanup:
 
     # 收容失败通知的限频窗口：同一 hash 在该秒数内只提醒一次
     RETAIN_NOTIFY_INTERVAL_SECONDS = 6 * 3600
+    # 收容失败通知记录的保留窗口：写入时顺带清理更早的旧键，避免数据无限增长
+    RETAIN_NOTIFY_RETENTION_SECONDS = 7 * 24 * 3600
 
     def __init__(self, priority_manager: PriorityManagerProtocol,
                  clear_download_pending_fn: Callable,
@@ -70,29 +72,19 @@ class TorrentCleanup:
             f"（reason={reason}, delete_from_downloader={delete_from_downloader}）"
         )
 
-        # 1. 清 torrents 任务前归档删除指纹，供 ResourceSelection 防止坏种立即重选。
+        # 1. 读取删除前任务记录，并先尝试收容再决定删除：
+        #    H&R 种子收容失败（retained）时直接保留返回，不写删除指纹、不回滚订阅缺失状态，
+        #    避免种子仍在下载做种时订阅误判为缺集而重复补搜。
         torrent_task = self._read_torrent_task(torrent_hash)
-        if self._deletes and torrent_task:
-            detail(f"种子删除处理：已记录种子 {torrent_hash}，避免后续被重新选中")
-            self._deletes.save(torrent_task, reason=reason)
+        outcome = ""
+        if (delete_from_downloader and downloader and torrent_hash
+                and reason == "timeout" and self._relocate_torrent):
+            outcome = self._relocate_torrent(downloader, torrent_hash, subscribe, torrent_task) or ""
+        if outcome == RELOCATE_RELOCATED:
+            relocated = True
+        elif outcome == RELOCATE_RETAINED:
+            retained = True
 
-        # 删种后先恢复下载事实，再交给主程序按当前合同刷新订阅进度。
-        self._restore_subscribe_missing_state(subscribe, torrent_task)
-
-        # 2. 下载器主动删除场景处理种子；用户手动删除场景种子已不存在。
-        #    Q 版改造：超时（timeout）不再直接删除，优先收容到独立目录保留做种；
-        #    H&R 种子在收容链路失败时只保留不删除，普通种子仍回退到原删除逻辑。
-        if delete_from_downloader and downloader and torrent_hash:
-            outcome = ""
-            if reason == "timeout" and self._relocate_torrent:
-                outcome = self._relocate_torrent(downloader, torrent_hash, subscribe, torrent_task) or ""
-            if outcome == RELOCATE_RETAINED:
-                retained = True
-            elif outcome != RELOCATE_RELOCATED and self._delete_torrent:
-                self._delete_torrent(downloader, torrent_hash)
-
-        # 2b. 收容失败但种子被保留时，不做清任务/回滚/补搜等善后：种子仍在下载，
-        #     下一轮巡检会再次尝试收容；此时清任务会让订阅误以为该种子已消失并重复补搜。
         if retained:
             detail(f"种子删除处理：{torrent_hash} 为 H&R 种子但收容未成功，"
                    f"本轮保留种子并等待下一轮重试")
@@ -105,7 +97,22 @@ class TorrentCleanup:
                 )
             return
 
-        # 3. 洗版按 enclosure 归属回滚，隔离并行洗版；旧数据无归属时退回整体基线。
+        # 2. 清 torrents 任务前归档删除指纹，供 ResourceSelection 防止坏种立即重选。
+        if self._deletes and torrent_task:
+            detail(f"种子删除处理：已记录种子 {torrent_hash}，避免后续被重新选中")
+            self._deletes.save(torrent_task, reason=reason)
+
+        # 删种后先恢复下载事实，再交给主程序按当前合同刷新订阅进度。
+        self._restore_subscribe_missing_state(subscribe, torrent_task)
+
+        # 3. 下载器主动删除场景处理种子；用户手动删除场景种子已不存在。
+        #    Q 版改造：超时（timeout）不再直接删除，优先收容到独立目录保留做种，
+        #    已收容的种子留在收容目录继续做种，只有未收容的普通种子才按原逻辑删除。
+        if (delete_from_downloader and downloader and torrent_hash
+                and not relocated and self._delete_torrent):
+            self._delete_torrent(downloader, torrent_hash)
+
+        # 4. 洗版按 enclosure 归属回滚，隔离并行洗版；旧数据无归属时退回整体基线。
         if subscribe.best_version:
             enclosure = (torrent_task or {}).get("enclosure")
             if enclosure:
@@ -115,12 +122,12 @@ class TorrentCleanup:
                 detail(f"种子删除处理：{format_subscribe(subscribe)} 无法确认对应集数，恢复整体洗版优先级")
                 self._priority.rollback(subscribe, baseline=None)
 
-        # 4. 清理种子任务与下载待定，避免订阅长期保持下载中。
+        # 5. 清理种子任务与下载待定，避免订阅长期保持下载中。
         self._clean_torrent_task(torrent_hash)
         self._clean_subscribe_torrent_task(sid, torrent_hash)
         self._clear_pending(sid, torrent_hash)
 
-        # 5. 按配置触发补搜，避免删种后长期缺集。
+        # 6. 按配置触发补搜，避免删种后长期缺集。
         search_delay_seconds = None
         if search_enabled and self._search and subscribe:
             search_delay_seconds = self._search(subscribe)
@@ -177,6 +184,14 @@ class TorrentCleanup:
 
         def updater(data: dict) -> dict:
             data = dict(data or {})
+            # 顺带清掉超过保留窗口的旧键，避免此数据随种子数量长期膨胀
+            for key, value in list(data.items()):
+                try:
+                    expired = now - float(value or 0) > self.RETAIN_NOTIFY_RETENTION_SECONDS
+                except Exception:
+                    expired = True
+                if expired:
+                    data.pop(key, None)
             data[torrent_hash] = now
             return data
 
