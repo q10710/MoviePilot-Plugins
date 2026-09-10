@@ -347,6 +347,9 @@ MULTI_ITEMS = {
 # 插件 README（底部「详细说明」指引指向插件市场仓库内的独立文档）
 README_URL = ("https://github.com/InfinityPacer/MoviePilot-Plugins/"
               "blob/main/plugins.v3/subscribeassistantenhanced/README.md")
+# 本插件改造功能说明（H&R 超时收容 / 到期与未完成清理）
+RELOCATE_DOC_URL = ("https://github.com/q10710/MoviePilot-Plugins/"
+                    "blob/main/plugins.v2/subscribeassistantenhancedq/docs/relocate.md")
 # Tab 内字段默认列宽：md=4 即一行三列
 FIELD_MD = 4
 
@@ -400,8 +403,12 @@ def _footer() -> list:
     return [
         alert_row("success", text="注意：详细使用说明与配置释义请参考：", content=[
             {"component": "a",
+             "props": {"href": RELOCATE_DOC_URL, "target": "_blank"},
+             "content": [{"component": "u", "text": "H&R 收容说明"}]},
+            {"component": "span", "text": " ｜ "},
+            {"component": "a",
              "props": {"href": README_URL, "target": "_blank"},
-             "content": [{"component": "u", "text": "README"}]},
+             "content": [{"component": "u", "text": "官方 README"}]},
         ], margin_top="12px"),
         alert_row("info", text="注意：本插件仅支持 TMDB 数据源，订阅状态相关说明请查阅 ", content=[
             {"component": "a",
