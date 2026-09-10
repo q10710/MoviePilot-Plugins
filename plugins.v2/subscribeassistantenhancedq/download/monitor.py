@@ -214,7 +214,7 @@ class DownloadMonitor:
             if info:
                 visible_count += 1
                 self._reset_missing(torrent_hash)
-                if info.completed:
+                if info.finished:
                     logger.info(
                         f"下载监控：种子 {self._format_torrent_desc(torrent_hash, task)} 已完成，"
                         f"{self._format_task_subscribe_label(task)}，"
@@ -546,7 +546,7 @@ class DownloadMonitor:
 
         torrent_task = self._get_torrent_task(torrent_info.hash)
 
-        if torrent_info.completed:
+        if torrent_info.finished:
             return "ok"
 
         if not torrent_task:
