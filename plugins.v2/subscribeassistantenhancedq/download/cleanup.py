@@ -1,4 +1,5 @@
 """种子删除后的统一善后编排。"""
+import time
 from typing import Callable, Optional
 
 from app.chain.subscribe import SubscribeChain
@@ -9,12 +10,20 @@ from ..shared.log import detail
 from ..shared.subscribe import format_subscribe, resolve_subscribe_media_type
 from ..shared.update import update_subscribe
 
+# 收容回调的三态返回值：relocated=已收容；retained=H&R 种子收容失败（保留不删）；skip=未收容，走原删除逻辑
+RELOCATE_RELOCATED = "relocated"
+RELOCATE_RETAINED = "retained"
+RELOCATE_SKIP = "skip"
+
 
 class TorrentCleanup:
     """种子删除统一编排：归档删除指纹 → 删种 → 回滚优先级 → 清任务 → 补搜。
 
     外部副作用通过注入回调执行，避免本模块直接绑定下载器、搜索或文件系统实现。
     """
+
+    # 收容失败通知的限频窗口：同一 hash 在该秒数内只提醒一次
+    RETAIN_NOTIFY_INTERVAL_SECONDS = 6 * 3600
 
     def __init__(self, priority_manager: PriorityManagerProtocol,
                  clear_download_pending_fn: Callable,
@@ -50,10 +59,12 @@ class TorrentCleanup:
 
         delete_from_downloader：仅下载器主动删种（timeout/tracker）为 True；手动删除时种子已不在，
         传 False 跳过删种。删除指纹负责防止同一坏种被立即重选，订阅继续保持可搜索状态。
+        收容回调返回 retained 时只保留种子（H&R 收容失败），不执行删除，等下一轮重试。
         """
         sid = subscribe.id
         # 收容与删除两种结果要给出不同通知文案，避免用户误以为种子被删除
         relocated = False
+        retained = False
         detail(
             f"种子删除处理：{format_subscribe(subscribe)} 开始处理 hash={torrent_hash}"
             f"（reason={reason}, delete_from_downloader={delete_from_downloader}）"
@@ -69,13 +80,30 @@ class TorrentCleanup:
         self._restore_subscribe_missing_state(subscribe, torrent_task)
 
         # 2. 下载器主动删除场景处理种子；用户手动删除场景种子已不存在。
-        #    Q 版改造：超时（timeout）不再直接删除，优先收容到独立目录保留做种，
-        #    收容失败或未启用时才回退到原删除逻辑。
+        #    Q 版改造：超时（timeout）不再直接删除，优先收容到独立目录保留做种；
+        #    H&R 种子在收容链路失败时只保留不删除，普通种子仍回退到原删除逻辑。
         if delete_from_downloader and downloader and torrent_hash:
+            outcome = ""
             if reason == "timeout" and self._relocate_torrent:
-                relocated = bool(self._relocate_torrent(downloader, torrent_hash, subscribe, torrent_task))
-            if not relocated and self._delete_torrent:
+                outcome = self._relocate_torrent(downloader, torrent_hash, subscribe, torrent_task) or ""
+            if outcome == RELOCATE_RETAINED:
+                retained = True
+            elif outcome != RELOCATE_RELOCATED and self._delete_torrent:
                 self._delete_torrent(downloader, torrent_hash)
+
+        # 2b. 收容失败但种子被保留时，不做清任务/回滚/补搜等善后：种子仍在下载，
+        #     下一轮巡检会再次尝试收容；此时清任务会让订阅误以为该种子已消失并重复补搜。
+        if retained:
+            detail(f"种子删除处理：{torrent_hash} 为 H&R 种子但收容未成功，"
+                   f"本轮保留种子并等待下一轮重试")
+            if self._should_notify_retained(torrent_hash):
+                self._notify(
+                    f"{format_subscribe(subscribe)} H&R 种子收容未成功，本轮已保留种子",
+                    "收容目录或下载器暂不可用，种子保留继续做种，下一轮巡检会再次尝试收容",
+                    image=self._subscribe_image(subscribe),
+                    diagnostic=True,
+                )
+            return
 
         # 3. 洗版按 enclosure 归属回滚，隔离并行洗版；旧数据无归属时退回整体基线。
         if subscribe.best_version:
@@ -103,6 +131,7 @@ class TorrentCleanup:
             reason_detail=reason_detail,
             search_delay_seconds=search_delay_seconds,
             relocated=relocated,
+            retained=retained,
         )
 
     def handle_timeout_manual_review(self, subscribe, torrent_hash: str,
@@ -133,6 +162,26 @@ class TorrentCleanup:
         if reason_detail.startswith(prefix):
             return f"{prefix}下载连续超时，{reason_detail[len(prefix):]}"
         return f"下载连续超时，{reason_detail}"
+
+    def _should_notify_retained(self, torrent_hash: str) -> bool:
+        """收容失败通知限频：同一 hash 6 小时内只提醒一次，避免每轮巡检重复推送。"""
+        if not self._read or not self._update or not torrent_hash:
+            return True
+        try:
+            last = float((self._read("relocate_retain_notify") or {}).get(torrent_hash) or 0)
+        except Exception:
+            last = 0
+        now = time.time()
+        if last and now - last < self.RETAIN_NOTIFY_INTERVAL_SECONDS:
+            return False
+
+        def updater(data: dict) -> dict:
+            data = dict(data or {})
+            data[torrent_hash] = now
+            return data
+
+        self._update("relocate_retain_notify", updater)
+        return True
 
     def _read_torrent_task(self, torrent_hash: str) -> Optional[dict]:
         """删除前读取种子任务，供删除指纹归档与按集基线回滚。"""
@@ -188,8 +237,8 @@ class TorrentCleanup:
     def _notify_deleted(self, subscribe, torrent_task: Optional[dict], reason: str,
                         reason_detail: Optional[str] = None,
                         search_delay_seconds: Optional[float] = None,
-                        relocated: bool = False):
-        """发送种子处理通知，标题包含订阅、原因和最终动作（收容 / 删除）。"""
+                        relocated: bool = False, retained: bool = False):
+        """发送种子处理通知，标题包含订阅、原因和最终动作（收容 / 保留 / 删除）。"""
         if not self._notify:
             return
         reason_text = {
@@ -207,7 +256,12 @@ class TorrentCleanup:
         follow_up = None
         if search_delay_seconds is not None:
             follow_up = f"将在 {search_delay_seconds / 60:.2f} 分钟后触发搜索补全"
-        action_text = "已收容（移入收容目录继续做种，到期后自动删除）" if relocated else "已删除"
+        if relocated:
+            action_text = "已收容（移入收容目录继续做种，到期后自动删除）"
+        elif retained:
+            action_text = "已保留（收容未成功，本轮不删除，下一轮继续尝试）"
+        else:
+            action_text = "已删除"
         detail(
             f"种子删除处理：{format_subscribe(subscribe)} 原因={reason_detail or reason_text}，"
             f"处理={action_text}，后续={follow_up or '无'}"
