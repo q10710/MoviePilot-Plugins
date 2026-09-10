@@ -64,6 +64,12 @@ class HNRConfig(BaseConfig):
     auto_monitor: Optional[bool] = False  # 自动监控（实验性功能）
     downloader: Optional[str] = None  # 下载器（旧版单下载器配置，保留用于配置迁移）
     downloaders: List[str] = []  # 下载器列表，支持同时监控多个下载器
+    # 订阅超时收容：下载超时仍未完成的订阅种子移入收容目录，保留做种到站点 H&R 时长后再删除
+    relocate_enabled: Optional[bool] = False
+    relocate_dir: Optional[str] = None
+    relocate_after_hours: Optional[float] = 6
+    relocate_tag: Optional[str] = "订阅收容"
+    relocate_delete_files: Optional[bool] = True
     hit_and_run_tag: Optional[str] = None  # 种子标签
     auto_cleanup_days: float = 7  # 自动清理已删除或满足H&R要求的任务
     enable_site_config: Optional[bool] = False  # 启用站点独立配置
