@@ -97,7 +97,13 @@ def field_for(model: str, label: str, default: Any, hint: str = "", md: int = 6)
     """按默认值类型选择控件：bool→开关、str→文本、其余（int/float）→数值。
 
     必须先判 bool 再判 int——Python 中 ``isinstance(True, int)`` 为真，顺序写反会把开关误渲成数值框。
+    hr_mode 是固定枚举（收容 / 排除标签二选一），单独渲染成下拉，避免自由文本写入运行时无法识别的值。
     """
+    if model == "hr_mode":
+        return select_field(model, label, [
+            {"title": "收容（H&R 种子超时转入收容目录保种）", "value": "relocate"},
+            {"title": "排除标签（带排除标签的种子跳过处理）", "value": "exclude"},
+        ], hint, 4)
     if isinstance(default, bool):
         return switch_col(model, label, hint, md)
     if isinstance(default, str):
