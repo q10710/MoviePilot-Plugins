@@ -52,6 +52,8 @@ class TorrentCleanup:
         传 False 跳过删种。删除指纹负责防止同一坏种被立即重选，订阅继续保持可搜索状态。
         """
         sid = subscribe.id
+        # 收容与删除两种结果要给出不同通知文案，避免用户误以为种子被删除
+        relocated = False
         detail(
             f"种子删除处理：{format_subscribe(subscribe)} 开始处理 hash={torrent_hash}"
             f"（reason={reason}, delete_from_downloader={delete_from_downloader}）"
@@ -70,7 +72,6 @@ class TorrentCleanup:
         #    Q 版改造：超时（timeout）不再直接删除，优先收容到独立目录保留做种，
         #    收容失败或未启用时才回退到原删除逻辑。
         if delete_from_downloader and downloader and torrent_hash:
-            relocated = False
             if reason == "timeout" and self._relocate_torrent:
                 relocated = bool(self._relocate_torrent(downloader, torrent_hash, subscribe, torrent_task))
             if not relocated and self._delete_torrent:
@@ -101,6 +102,7 @@ class TorrentCleanup:
             subscribe, torrent_task, reason,
             reason_detail=reason_detail,
             search_delay_seconds=search_delay_seconds,
+            relocated=relocated,
         )
 
     def handle_timeout_manual_review(self, subscribe, torrent_hash: str,
@@ -185,8 +187,9 @@ class TorrentCleanup:
 
     def _notify_deleted(self, subscribe, torrent_task: Optional[dict], reason: str,
                         reason_detail: Optional[str] = None,
-                        search_delay_seconds: Optional[float] = None):
-        """发送种子删除通知，标题包含订阅、删除原因和最终动作。"""
+                        search_delay_seconds: Optional[float] = None,
+                        relocated: bool = False):
+        """发送种子处理通知，标题包含订阅、原因和最终动作（收容 / 删除）。"""
         if not self._notify:
             return
         reason_text = {
@@ -204,12 +207,13 @@ class TorrentCleanup:
         follow_up = None
         if search_delay_seconds is not None:
             follow_up = f"将在 {search_delay_seconds / 60:.2f} 分钟后触发搜索补全"
+        action_text = "已收容（移入收容目录继续做种，到期后自动删除）" if relocated else "已删除"
         detail(
             f"种子删除处理：{format_subscribe(subscribe)} 原因={reason_detail or reason_text}，"
-            f"处理=已删除，后续={follow_up or '无'}"
+            f"处理={action_text}，后续={follow_up or '无'}"
         )
         self._notify(
-            f"{format_subscribe(subscribe)} {reason_detail or reason_text}，已删除",
+            f"{format_subscribe(subscribe)} {reason_detail or reason_text}，{action_text}",
             "\n".join(detail_parts) if detail_parts else None,
             image=self._subscribe_image(subscribe),
             follow_up=follow_up,
