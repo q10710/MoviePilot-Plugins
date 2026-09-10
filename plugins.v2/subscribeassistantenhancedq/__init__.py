@@ -105,7 +105,7 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/subscribeassistantenhancedq.png"
     # 插件版本
-    plugin_version = "0.9.5"
+    plugin_version = "0.9.6"
     _site_cache_candidate_helper_warned = False
     # 插件作者
     plugin_author = "Q"
@@ -1911,7 +1911,7 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
                 from .download.torrent import TorrentAdapter
                 info = TorrentAdapter.get_info(torrents_now[0], service.type)
                 # 严格完成判定：部分下载但仍在上传的种子不能算完成，否则会漏掉本该收容的 H&R 种子
-                if self._torrent_is_completed(torrents_now[0], service.type):
+                if info.finished:
                     continue
                 pending += 1
                 # 优先使用下载器中的真实添加时间，避免插件记录时间偏晚导致门槛变松
@@ -2021,16 +2021,17 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
                     f"已转入收容目录 {relocate_dir}，站点 {site_name or '-'}，到期 {deadline}")
         return RELOCATE_RELOCATED
 
-    def _locate_torrent_downloader(self, torrent_hash: str,
-                                   preferred: Optional[str] = None) -> Tuple[Optional[str], bool]:
-        """定位种子所在的下载器，返回 (下载器名, 结论是否确定)。
+    def _locate_torrent_downloader(self, torrent_hash: str, preferred: Optional[str] = None) -> Tuple[
+            Optional[str], bool, Optional[Any]]:
+        """定位种子所在的下载器，返回 (下载器名, 结论是否确定, 命中的原始种子对象)。
 
         结论确定=True：已遍历全部已配置下载器且没有任何一个报错，可据此认定种子确实不存在；
         有下载器报错或不可用时为 False（不可判定），调用方应保留记录等下一轮重试，
         避免把「下载器瞬断」当成「种子已被删除」。
+        命中的原始种子对象供调用方复用，避免同一轮对同一 hash 重复查询下载器。
         """
         if not self._downloader_helper or not torrent_hash:
-            return None, False
+            return None, False, None
         candidates: List[str] = []
         if preferred:
             candidates.append(str(preferred))
@@ -2055,12 +2056,12 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
                     conclusive = False
                     continue
                 if torrents:
-                    return name, True
+                    return name, True, torrents[0]
             except Exception as err:
                 logger.debug(f"订阅收容：查询下载器 {name} 中的种子失败 {torrent_hash}：{err}")
                 conclusive = False
                 continue
-        return None, conclusive
+        return None, conclusive, None
 
     def _find_torrent_downloader(self, torrent_hash: str, preferred: Optional[str] = None) -> Optional[str]:
         """定位种子的当前所在下载器：优先给定下载器，其次遍历全部已配置下载器。
@@ -2068,7 +2069,7 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
         用于应对 H&R 种子下载完成后被「自动转移做种」搬到别的下载器（原任务已被删除）的情况：
         到期删除时必须在实际所在的下载器上操作，否则会出现「到期删不掉」。
         """
-        downloader, _ = self._locate_torrent_downloader(torrent_hash, preferred=preferred)
+        downloader, _, _ = self._locate_torrent_downloader(torrent_hash, preferred=preferred)
         return downloader
 
     @staticmethod
@@ -2081,18 +2082,26 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
 
     @staticmethod
     def _torrent_completion_time(raw) -> Optional[datetime.datetime]:
-        """从下载器原始种子对象解析完成时间：qb 取 completion_on，tr 取 done_date；取不到返回 None。"""
+        """从下载器原始种子对象解析完成时间：qb 取 completion_on，tr 取 done_date；取不到返回 None。
+
+        Transmission 的属性在字段未请求时会抛 KeyError，因此逐字段防御式读取。
+        """
         def attr(name, default=None):
             if isinstance(raw, dict):
                 return raw.get(name, default)
-            return getattr(raw, name, default)
+            try:
+                return getattr(raw, name, default)
+            except Exception:
+                return default
 
         try:
             ts = float(attr("completion_on") or 0)
         except Exception:
             ts = 0.0
         if ts <= 0:
-            done = attr("done_date") or attr("doneDate")
+            done = attr("done_date")
+            if done is None:
+                done = attr("doneDate")
             if isinstance(done, datetime.datetime):
                 ts = done.timestamp()
             elif isinstance(done, (int, float)):
@@ -2104,58 +2113,30 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
         except Exception:
             return None
 
-    @staticmethod
-    def _torrent_is_completed(raw, dl_type: str) -> bool:
-        """严格判断种子是否真正下载完成：以进度/剩余量为准，避免把「边下边做种」误判为完成。
-
-        收容到期与收容入口都以「下载完成」为界，用共享适配器的宽松判定（做种时间>0 即视为完成）
-        会把部分下载却已在上传的种子算作完成，因此在收容链路里单独做严格判定：
-        qbittorrent 看 progress(0-1) 或完成后的上传类状态；Transmission 看 left(=0) 或 progress(0-100)。
-        """
-        def attr(name, default=None):
-            if isinstance(raw, dict):
-                return raw.get(name, default)
-            return getattr(raw, name, default)
-
-        if dl_type == "qbittorrent":
-            try:
-                progress = float(attr("progress") or 0)
-            except Exception:
-                progress = 0.0
-            if progress >= 0.999:
-                return True
-            state = str(attr("state") or "").lower()
-            return state in {"uploading", "stalledup", "forcedup", "queuedup", "checkingup", "pausedup"}
-        left = attr("left_until_done", None)
-        if left is None:
-            left = attr("leftUntilDone", None)
-        if isinstance(left, (int, float)):
-            return float(left) <= 0
-        try:
-            progress = float(attr("progress") or 0)
-        except Exception:
-            progress = 0.0
-        return progress >= 99.9
-
-    def _relocate_completion_state(self, downloader: str,
-                                   torrent_hash: str) -> Tuple[bool, bool, Optional[datetime.datetime]]:
+    def _relocate_completion_state(self, downloader: str, torrent_hash: str,
+                                   raw=None) -> Tuple[bool, bool, Optional[datetime.datetime]]:
         """读取收容种子状态，返回 (是否取到种子, 是否已完成, 完成时间)。
 
         站点 H&R 从「下载完成」才开始考察：未完成时不能删除收容种子，否则会白等甚至违约；
         完成时间用于把到期点改成「下载完成时间 + 站点 H&R 时长」。
+        完成判定用 TorrentInfo.finished（严格：进度到 100% 或下载器明确完成态），
+        避免把「部分下载但已在上传」的种子按已完成处理。raw 由调用方传入可省一次下载器查询。
         """
         if not self._downloader_helper or not downloader or not torrent_hash:
             return False, False, None
         try:
             service = self._downloader_helper.get_service(name=downloader)
             instance = getattr(service, "instance", None) if service else None
-            if not instance:
-                return False, False, None
-            torrents, error = instance.get_torrents(ids=torrent_hash)
-            if error or not torrents:
-                return False, False, None
-            raw = torrents[0]
-            return True, self._torrent_is_completed(raw, service.type), self._torrent_completion_time(raw)
+            if raw is None:
+                if not instance:
+                    return False, False, None
+                torrents, error = instance.get_torrents(ids=torrent_hash)
+                if error or not torrents:
+                    return False, False, None
+                raw = torrents[0]
+            from .download.torrent import TorrentAdapter
+            info = TorrentAdapter.get_info(raw, service.type)
+            return True, bool(info.finished), self._torrent_completion_time(raw)
         except Exception as err:
             logger.debug(f"订阅收容：读取种子完成状态失败 {torrent_hash}（{downloader}）：{err}")
             return False, False, None
@@ -2192,7 +2173,7 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
             now = datetime.datetime.now()
             changed = False
             for torrent_hash, record in list(records.items()):
-                downloader, conclusive = self._locate_torrent_downloader(
+                downloader, conclusive, raw = self._locate_torrent_downloader(
                     torrent_hash, preferred=record.get("downloader"))
                 if not downloader:
                     # 未到期时可能是下载器临时不可用，先保留；到期后仍找不到才移出记录，
@@ -2214,7 +2195,8 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
                     record["downloader"] = downloader
                     records[torrent_hash] = record
                     changed = True
-                present, completed, completed_at = self._relocate_completion_state(downloader, torrent_hash)
+                present, completed, completed_at = self._relocate_completion_state(
+                    downloader, torrent_hash, raw=raw)
                 if not present:
                     # 本轮取不到种子状态（下载器瞬断等），保留记录等下一轮
                     continue
@@ -2231,7 +2213,10 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
                     if not instance:
                         continue
                     try:
-                        instance.delete_torrents(ids=torrent_hash, delete_file=True)
+                        # 是否保留文件沿用「到期删除源文件」配置，避免同一插件内两处口径不一致
+                        instance.delete_torrents(
+                            ids=torrent_hash,
+                            delete_file=bool(record.get("delete_files", True)))
                     except Exception as err:
                         logger.error(f"订阅收容：未完成清理删除 {torrent_hash} 失败（{downloader}）：{err}")
                         continue
