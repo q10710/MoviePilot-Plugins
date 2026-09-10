@@ -66,7 +66,7 @@ class HitAndRunQ(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/hitandrunq.png"
     # 插件版本
-    plugin_version = "2.1.2"
+    plugin_version = "2.2.1"
     # 插件作者
     plugin_author = "Q"
     # 作者主页
@@ -86,6 +86,12 @@ class HitAndRunQ(_PluginBase):
     downloader_helper = None
     # H&R助手配置
     _hnr_config = None
+    # 订阅超时收容配置
+    _relocate_enabled: bool = False
+    _relocate_dir: str = ""
+    _relocate_after_hours: float = 6
+    _relocate_tag: str = "订阅收容"
+    _relocate_delete_files: bool = True
     # 定时器
     _scheduler = None
     # 退出事件
@@ -137,6 +143,17 @@ class HitAndRunQ(_PluginBase):
                 self._scheduler.start()
 
         excludes = {"site_config_str", "site_infos"}
+        # 订阅超时收容配置
+        self._relocate_enabled = bool(getattr(self._hnr_config, "relocate_enabled", False))
+        self._relocate_dir = str(getattr(self._hnr_config, "relocate_dir", "") or "").strip()
+        relocate_hours = float(getattr(self._hnr_config, "relocate_after_hours", 6) or 0)
+        self._relocate_after_hours = relocate_hours if relocate_hours > 0 else 6
+        self._relocate_tag = str(getattr(self._hnr_config, "relocate_tag", "") or "订阅收容").strip()
+        self._relocate_delete_files = bool(getattr(self._hnr_config, "relocate_delete_files", True))
+        logger.info(f"{self.plugin_name} 订阅超时收容：enabled={self._relocate_enabled}，"
+                    f"目录={self._relocate_dir or '未配置'}，时长={self._relocate_after_hours}小时，"
+                    f"保护标签={self._relocate_tag}")
+
         config_json = self._hnr_config.model_dump_json(exclude=excludes)
         logger.debug(f"{'已' if self._hnr_config.enable_site_config else '未'}开启站点独立配置，配置信息：{config_json}")
 
@@ -201,6 +218,73 @@ class HitAndRunQ(_PluginBase):
             {
                 'component': 'VForm',
                 'content': [
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 3},
+                                'content': [
+                                    {
+                                        'component': 'VSwitch',
+                                        'props': {
+                                            'model': 'relocate_enabled',
+                                            'label': '订阅超时收容',
+                                            'hint': '下载超过指定时长仍未完成的订阅种子移入收容目录保种，到期后删除',
+                                            'persistent-hint': True
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 3},
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'relocate_after_hours',
+                                            'label': '收容时长（小时）',
+                                            'type': 'number',
+                                            'min': '1',
+                                            'hint': '下载超过该时长仍未完成即转入收容目录',
+                                            'persistent-hint': True
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 3},
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'relocate_dir',
+                                            'label': '收容目录',
+                                            'hint': '不参与媒体库整理，例如 /nastools/data/downloads/hr',
+                                            'persistent-hint': True
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 3},
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'relocate_tag',
+                                            'label': '收容保护标签',
+                                            'hint': '打在收容种子上，需同时加入订阅助手的「排除标签」',
+                                            'persistent-hint': True
+                                        }
+                                    }
+                                ]
+                            },
+                        ]
+                    },
                     {
                         'component': 'VRow',
                         'content': [
@@ -690,6 +774,11 @@ class HitAndRunQ(_PluginBase):
             "onlyonce": False,
             "notify": "always",
             "downloaders": [],
+            "relocate_enabled": False,
+            "relocate_after_hours": 6,
+            "relocate_dir": "/nastools/data/downloads/hr",
+            "relocate_tag": "订阅收容",
+            "relocate_delete_files": True,
             "hit_and_run_tag": "H&R",
             "spider_period": 720,
             "hr_ratio": 99,
@@ -1029,6 +1118,15 @@ class HitAndRunQ(_PluginBase):
                 "kwargs": {"minutes": self._hnr_config.check_period}
             })
 
+            if self._relocate_enabled and self._relocate_dir:
+                services.append({
+                    "id": f"{self.__class__.__name__}Relocate",
+                    "name": f"{self.plugin_name}收容检查",
+                    "trigger": "interval",
+                    "func": self.__relocate_check,
+                    "kwargs": {"minutes": 10}
+                })
+
             if self._hnr_config.auto_monitor:
                 # 每天执行4次，随机在8点~23点之间执行
                 triggers = TimeHelper.random_even_scheduler(num_executions=4,
@@ -1118,6 +1216,17 @@ class HitAndRunQ(_PluginBase):
                                                           torrent_tasks=torrent_tasks,
                                                           histories=histories,
                                                           seeding_torrents_dict=seeding_by_downloader[name])
+
+            # 打标检测：对在管且未满足的 H&R 任务补写 H&R 标签，避免标签丢失导致其它插件误删
+            for torrent_task in list(torrent_tasks.values()):
+                if torrent_task.deleted or not torrent_task.hit_and_run:
+                    continue
+                if torrent_task.hr_status == HNRStatus.COMPLIANT:
+                    continue
+                try:
+                    self.__update_hit_and_run_tag(torrent_task=torrent_task, add=True)
+                except Exception as err:
+                    logger.debug(f"H&R 标签补写失败：{err}")
 
             torrent_check_hashes = list(torrent_tasks.keys())
             if not torrent_tasks or not torrent_check_hashes:
@@ -1324,6 +1433,8 @@ class HitAndRunQ(_PluginBase):
         """
         transferred_tasks: List[TorrentTask] = []
         deleted_tasks: List[TorrentTask] = []
+        notified = self.__get_notified()
+        notified_changed = False
 
         for torrent_hash, torrent_task in torrent_tasks.items():
             # 已标记删除的任务不再重复判定
@@ -1340,6 +1451,10 @@ class HitAndRunQ(_PluginBase):
                     self.__accumulate_transfer(torrent_task=torrent_task,
                                                target_downloader=current_downloader)
                     transferred_tasks.append(torrent_task)
+                # 种子重新出现：清除删除通知去重标记，下次消失时可再次通知
+                if torrent_hash in notified:
+                    notified.pop(torrent_hash, None)
+                    notified_changed = True
                 continue
 
             # 本轮没有下载器包含该种子：若其所属下载器未成功获取，则本轮不做删除判定
@@ -1351,8 +1466,17 @@ class HitAndRunQ(_PluginBase):
             # 所有可用下载器中都不存在该种子，判定为已删除
             torrent_task.deleted = True
             torrent_task.deleted_time = time.time()
-            self.__log_torrent_hr_status(torrent_task=torrent_task, status_description="已删除")
-            deleted_tasks.append(torrent_task)
+            if torrent_hash not in notified:
+                # 只在首次判定删除时记录日志并通知，避免每轮重复推送
+                notified[torrent_hash] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                notified_changed = True
+                self.__log_torrent_hr_status(torrent_task=torrent_task, status_description="已删除")
+                deleted_tasks.append(torrent_task)
+            else:
+                logger.debug(f"H&R 任务 {torrent_task.identifier} 仍处于已删除状态，跳过重复通知")
+
+        if notified_changed:
+            self.__save_notified(notified)
 
         if transferred_tasks:
             self.__log_and_send_torrent_task_update_message(
@@ -1365,6 +1489,17 @@ class HitAndRunQ(_PluginBase):
             # 如果种子H&R状态不是已满足&无限制，则推送警告消息
             warning = True if torrent_task.hr_status not in [HNRStatus.COMPLIANT, HNRStatus.UNRESTRICTED] else False
             self.__send_hr_message(torrent_task=torrent_task, title="【H&R种子任务已删除】", warn=warning)
+
+    def __get_notified(self) -> Dict[str, str]:
+        """读取已发出过通知的任务集合，用于避免重复推送。"""
+        return self.get_data("notified") or {}
+
+    def __save_notified(self, notified: Dict[str, str]) -> None:
+        """保存已通知集合，最多保留最近 500 条。"""
+        if len(notified) > 500:
+            items = sorted(notified.items(), key=lambda item: str(item[1]), reverse=True)[:500]
+            notified = dict(items)
+        self.save_data("notified", notified)
 
     def __accumulate_transfer(self, torrent_task: TorrentTask, target_downloader: str) -> None:
         """
@@ -1389,6 +1524,166 @@ class HitAndRunQ(_PluginBase):
         logger.info(f"站点 {torrent_task.site_name}，H&R种子任务转移到下载器 {target_downloader}："
                     f"{torrent_task.identifier}，此前累计做种 "
                     f"{FormatHelper.format_hour(torrent_task.seeding_time_offset)} 小时")
+
+    # ── 订阅超时收容 ──────────────────────────────────────────
+
+    def __register_relocate(self, torrent_hash: str, downloader: str, torrent_info: Any,
+                            source: str) -> None:
+        """登记订阅下载的种子，用于超时收容与到期删除。"""
+        if not self._relocate_enabled or not torrent_hash or not downloader:
+            return
+        if not source.startswith("Subscribe|"):
+            return
+        records = self.__get_relocate_records()
+        if torrent_hash in records:
+            return
+        records[torrent_hash] = {
+            "hash": torrent_hash,
+            "downloader": downloader,
+            "title": getattr(torrent_info, "title", None) or "",
+            "site": getattr(torrent_info, "site", None),
+            "site_name": getattr(torrent_info, "site_name", None),
+            "added_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "relocated_at": None,
+            "deadline": None,
+            "delete_files": self._relocate_delete_files,
+        }
+        self.__save_relocate_records(records)
+        logger.info(f"订阅收容：登记订阅下载 {records[torrent_hash]['title'] or torrent_hash}"
+                    f"（下载器 {downloader}）")
+        # 订阅下载的种子立即打保护标签，避免被订阅助手的超时删种逻辑误删
+        context = self.__get_context(downloader)
+        if context:
+            self.__ensure_protect_tag(context=context, torrent_hash=torrent_hash,
+                                      title=records[torrent_hash]["title"])
+
+    def __get_relocate_records(self) -> Dict[str, dict]:
+        """读取订阅收容跟踪记录。"""
+        return self.get_data("relocate") or {}
+
+    def __save_relocate_records(self, records: Dict[str, dict]) -> None:
+        """保存订阅收容跟踪记录。"""
+        self.save_data("relocate", records)
+
+    def __relocate_deadline(self, site_name: Optional[str], start_time: datetime) -> datetime:
+        """计算收容种子的到期时间：优先用站点 H&R 时长，缺省用全局 H&R 时长。"""
+        hours = None
+        try:
+            site_config = self.__get_site_config(site_name=site_name) if site_name else None
+            required = getattr(site_config, "hr_seed_time", None) if site_config else None
+            if required:
+                hours = float(required)
+        except Exception:
+            hours = None
+        if not hours:
+            hours = float((self._hnr_config.hr_duration or 0)
+                          + (self._hnr_config.additional_seed_time or 0)) or 168.0
+        return start_time + timedelta(hours=hours)
+
+    def __relocate_check(self) -> None:
+        """定时检查订阅下载：超时未完成移入收容目录，收容到期后删除任务。"""
+        if not self._relocate_enabled or not self._relocate_dir:
+            return
+        records = self.__get_relocate_records()
+        if not records:
+            return
+        contexts = self.__get_contexts()
+        if not contexts:
+            logger.warning("订阅收容检查：没有可用下载器，本轮跳过")
+            return
+        now = datetime.now()
+        changed = False
+        for torrent_hash, record in list(records.items()):
+            downloader = record.get("downloader")
+            context = contexts.get(downloader)
+            if not context:
+                continue
+            try:
+                torrent = context.torrent_helper.get_torrents(torrent_hashes=torrent_hash)
+            except Exception as err:
+                logger.debug(f"订阅收容检查：读取种子失败 {torrent_hash} - {err}")
+                continue
+            if not torrent:
+                logger.info(f"订阅收容检查：种子已不在下载器 {downloader}，移出跟踪 {torrent_hash}")
+                records.pop(torrent_hash, None)
+                changed = True
+                continue
+            info = context.torrent_helper.get_torrent_info(torrent=torrent) or {}
+            total_size = info.get("total_size") or 0
+            downloaded = info.get("downloaded") or 0
+            if total_size and downloaded >= total_size:
+                records.pop(torrent_hash, None)
+                changed = True
+                logger.info(f"订阅收容检查：{record.get('title') or torrent_hash} 已下载完成，移出收容跟踪")
+                continue
+            deadline = self.__parse_time_value(record.get("deadline"))
+            if record.get("relocated_at") and deadline and now >= deadline:
+                try:
+                    context.instance.delete_torrents(ids=torrent_hash,
+                                                     delete_file=bool(record.get("delete_files", True)))
+                except Exception as err:
+                    logger.error(f"订阅收容到期删除失败 {torrent_hash}：{err}")
+                    continue
+                logger.info(f"订阅收容到期：已删除 {record.get('title') or torrent_hash}"
+                            f"（{downloader}，收容于 {record.get('relocated_at')}，"
+                            f"到期 {record.get('deadline')}）")
+                records.pop(torrent_hash, None)
+                changed = True
+                continue
+            if not record.get("relocated_at"):
+                added_at = self.__parse_time_value(record.get("added_at"))
+                if not added_at:
+                    continue
+                elapsed_hours = (now - added_at).total_seconds() / 3600
+                # 每轮补打保护标签（幂等），确保订阅助手始终跳过这些种子
+                self.__ensure_protect_tag(context=context, torrent_hash=torrent_hash,
+                                          title=record.get("title"))
+                if elapsed_hours < self._relocate_after_hours:
+                    continue
+                if context.instance.set_torrent_location(hash_string=torrent_hash,
+                                                         location=self._relocate_dir):
+                    record["relocated_at"] = now.strftime("%Y-%m-%d %H:%M:%S")
+                    record["deadline"] = self.__relocate_deadline(
+                        record.get("site_name"), now).strftime("%Y-%m-%d %H:%M:%S")
+                    self.__ensure_protect_tag(context=context, torrent_hash=torrent_hash,
+                                              title=record.get("title"))
+                    changed = True
+                    logger.info(f"订阅收容：{record.get('title') or torrent_hash} 下载 "
+                                f"{elapsed_hours:.1f} 小时仍未完成，已转入 {self._relocate_dir}，"
+                                f"到期 {record['deadline']}")
+                else:
+                    logger.warning(f"订阅收容：移动 {torrent_hash} 到 {self._relocate_dir} 失败，下轮重试")
+        if changed:
+            self.__save_relocate_records(records)
+
+    def __ensure_protect_tag(self, context: "DownloaderContext", torrent_hash: str,
+                             title: Optional[str]) -> None:
+        """为订阅种子补打保护标签（幂等），避免被其它清理逻辑删除。"""
+        tag = self._relocate_tag
+        if not tag:
+            return
+        try:
+            torrent = context.torrent_helper.get_torrents(torrent_hashes=torrent_hash)
+            if not torrent:
+                return
+            tags = context.torrent_helper.get_torrent_tags(torrent=torrent)
+            if tag in tags:
+                return
+            tags.append(tag)
+            context.torrent_helper.set_torrent_tag(torrent_hash=torrent_hash, tags=tags)
+            logger.info(f"订阅收容：已为 {title or torrent_hash} 打保护标签 {tag}")
+        except Exception as err:
+            logger.warning(f"订阅收容：打保护标签失败 {torrent_hash} - {err}")
+
+    @staticmethod
+    def __parse_time_value(value: Any) -> Optional[datetime]:
+        """解析记录中的时间字符串。"""
+        if not value:
+            return None
+        try:
+            return datetime.strptime(str(value), "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return None
 
     def __update_and_save_statistic_info(self, torrent_tasks: Dict[str, TorrentTask]):
         """
@@ -1477,6 +1772,10 @@ class HitAndRunQ(_PluginBase):
 
         # 现阶段，由于获取下载来源涉及主程序大幅调整，暂时处理方案为，如果没有种子详情（页面详情）的，均认为是RSS订阅
         task_type = TaskType.NORMAL if torrent_info.description else TaskType.RSS_SUBSCRIBE
+        # 订阅下载的种子登记到收容跟踪：下载超时仍未完成时移入收容目录
+        self.__register_relocate(torrent_hash=torrent_hash, downloader=downloader,
+                                 torrent_info=torrent_info,
+                                 source=str(event.event_data.get("source") or ""))
         self.__process_event(torrent_hash=torrent_hash, torrent_data=torrent_info, task_type=task_type,
                              context=downloader_context)
 
@@ -1613,7 +1912,13 @@ class HitAndRunQ(_PluginBase):
             elif torrent_task.deleted:
                 torrent_task.hr_status = HNRStatus.NEEDS_SEEDING
                 status_description = "需要做种"
-                self.__send_hr_message(torrent_task=torrent_task, title="【H&R种子任务需要做种】", warn=True)
+                notified = self.__get_notified()
+                notice_key = f"seed:{torrent_task.hash}"
+                if notice_key not in notified:
+                    notified[notice_key] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    self.__save_notified(notified)
+                    self.__send_hr_message(torrent_task=torrent_task,
+                                           title="【H&R种子任务需要做种】", warn=True)
             else:
                 status_description = "仍未满足 H&R 要求"
 
