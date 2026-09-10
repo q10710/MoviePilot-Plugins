@@ -66,7 +66,7 @@ class HitAndRunQ(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/hitandrunq.png"
     # 插件版本
-    plugin_version = "2.1.0"
+    plugin_version = "2.1.1"
     # 插件作者
     plugin_author = "Q"
     # 作者主页
@@ -1105,7 +1105,7 @@ class HitAndRunQ(_PluginBase):
                     presence.setdefault(torrent_hash, name)
                 logger.info(f"下载器 {name} 共有 {len(seeding_dict)} 个种子参与H&R检查")
 
-            # 检查种子标签变更情况（仅 qBittorrent 支持标签）
+            # 检查种子标签变更情况（qBittorrent tags / Transmission labels 均支持）
             for name, context in contexts.items():
                 if name not in seeding_by_downloader:
                     continue
@@ -1250,12 +1250,8 @@ class HitAndRunQ(_PluginBase):
                                              histories: Dict[str, TorrentHistory],
                                              seeding_torrents_dict: Dict[str, Any]):
         """
-        根据种子标签同步H&R记录：仅 qBittorrent 支持标签同步，其它下载器按站点规则纳入
+        根据种子标签同步H&R记录：qBittorrent（tags）与 Transmission（labels）均支持标签
         """
-        if not context.is_qbittorrent:
-            logger.info(f"下载器 {context.name} 不支持种子标签，跳过标签同步")
-            return
-
         # 初始化汇总信息
         added_tasks = []
         reset_tasks = []
@@ -1434,9 +1430,13 @@ class HitAndRunQ(_PluginBase):
 
     def auto_monitor(self):
         """
-        监控服务
+        监控服务（实验性）：在配置的随机时点额外执行一轮H&R检查
         """
-        pass
+        logger.info(f"{self.plugin_name} 自动监控触发，执行一轮额外检查")
+        try:
+            self.check()
+        except Exception as e:
+            logger.error(f"自动监控执行检查失败：{e}")
 
     @eventmanager.register(EventType.DownloadAdded)
     def handle_download_added_event(self, event: Event = None):
@@ -1707,10 +1707,6 @@ class HitAndRunQ(_PluginBase):
         context = self.__get_context(torrent_task.downloader or "")
         if not context:
             logger.warning(f"下载器 {torrent_task.downloader} 不可用，跳过H&R标签更新")
-            return
-
-        if not context.is_qbittorrent:
-            logger.info(f"下载器 {context.name} 不支持种子标签，跳过H&R标签更新")
             return
 
         torrent = context.torrent_helper.get_torrents(torrent_hashes=torrent_task.hash)
