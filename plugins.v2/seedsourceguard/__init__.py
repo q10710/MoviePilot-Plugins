@@ -32,7 +32,7 @@ class SeedSourceGuard(_PluginBase):
     plugin_desc = ("检测本地源文件是否有下载器在做种、下载器是否存在文件丢失的无效做种或"
                    "tracker 全部失败的做种任务；连续N天异常可通知或按策略处置，杜绝无效做种与孤儿文件。")
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/seedsourceguard.png"
-    plugin_version = "1.1.6"
+    plugin_version = "1.1.7"
     plugin_label = "下载管理"
     plugin_author = "local"
     plugin_config_prefix = "seedsourceguard_"
@@ -1057,14 +1057,25 @@ class SeedSourceGuard(_PluginBase):
             return False
 
         def fget(it: Any, key: str, default: Any = None) -> Any:
-            """兼容 dict 与对象的字段读取。"""
-            try:
-                if isinstance(it, dict):
-                    return it.get(key, default)
-                return getattr(it, key, default)
-            except Exception:
-                return default
+            """兼容 dict 与对象的字段读取，并同时兼容 camelCase / snake_case 字段名。
 
+            Transmission 的 trackerStats 经 transmission-rpc 封装后暴露
+            last_announce_succeeded 等 snake_case 属性，而原始 RPC 字段为
+            lastAnnounceSucceeded，因此按 camelCase 名读取不到真实值时自动
+            再尝试其 snake_case 形式。
+            """
+            candidates = [key]
+            snake = "".join("_" + ch.lower() if ch.isupper() else ch for ch in key)
+            if snake != key:
+                candidates.append(snake)
+            for name in candidates:
+                try:
+                    value = it.get(name) if isinstance(it, dict) else getattr(it, name, None)
+                except Exception:
+                    continue
+                if value is not None:
+                    return value
+            return default
         announced = False
         succeeded = False
         for it in real:
