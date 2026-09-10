@@ -11,6 +11,9 @@ DEFAULT_DELETE_EXCLUDE_TAGS = ""
 # 默认收容目录：超时未完成的订阅种子移入这里，该目录不参与媒体库整理。
 DEFAULT_RELOCATE_DIR = "/nastools/data/downloads/hr"
 
+# 未完成清理天数：收容种子转入收容目录后仍未下载完成的清理阈值（站点从下载完成才计 H&R，未完成即不进入考察）。
+DEFAULT_RELOCATE_INCOMPLETE_DAYS = 14
+
 DEFAULT_VOLATILITY_WINDOW_DAYS = 3
 
 DEFAULT_RECOGNITION_GUARD_CUSTOM_CONFIG = """####### 配置说明 BEGIN #######
@@ -314,6 +317,16 @@ class PluginConfig:
     def relocate_delete_files(self) -> bool:
         """收容到期删除时是否连源文件一并删除。"""
         return self.get_bool("relocate_delete_files", True)
+
+    @property
+    def relocate_incomplete_days(self) -> int:
+        """未完成清理天数：收容种子转入收容目录后仍未下载完成满 N 天即删除任务与文件；0 表示不清理。
+
+        站点 H&R 从「下载完成」才开始考察，一直下不完的种子不会进入考察，因此按「站点不计 H&R」
+        在超过该天数后清理，避免收容目录被长期占用。
+        """
+        value = self.get_int("relocate_incomplete_days", DEFAULT_RELOCATE_INCOMPLETE_DAYS)
+        return value if value and value > 0 else 0
 
     @property
     def default_hr_hours(self) -> float:
