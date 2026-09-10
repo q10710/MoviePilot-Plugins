@@ -536,19 +536,32 @@ class DeletedMediaSubCleaner(_PluginBase):
                 if library.type not in self._media_types:
                     continue
                 try:
-                    for item in self._media_chain.items(server=name, library_id=library.id):
-                        if not item:
-                            continue
-                        key = self.__media_key(item)
-                        if not key:
-                            continue
-                        snapshot[key] = {
-                            "title": item.title,
-                            "year": item.year,
-                            "type": library.type,
-                            "media_source": item.media_source,
-                            "media_id": item.media_id,
-                        }
+                    # 显式分页拉取，避免媒体服务器分页细节导致条目缺失
+                    offset = 0
+                    page_size = 200
+                    while True:
+                        page_items = list(self._media_chain.items(
+                            server=name, library_id=library.id,
+                            start_index=offset, limit=page_size,
+                        ))
+                        if not page_items:
+                            break
+                        for item in page_items:
+                            if not item:
+                                continue
+                            key = self.__media_key(item)
+                            if not key:
+                                continue
+                            snapshot[key] = {
+                                "title": item.title,
+                                "year": item.year,
+                                "type": library.type,
+                                "media_source": item.media_source,
+                                "media_id": item.media_id,
+                            }
+                        if len(page_items) < page_size:
+                            break
+                        offset += len(page_items)
                 except Exception as err:
                     logger.error(f"读取媒体服务器 {name} 媒体库 {library.name} 条目失败：{err}")
 
