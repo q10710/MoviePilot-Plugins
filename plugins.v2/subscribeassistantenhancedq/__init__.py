@@ -105,7 +105,7 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/subscribeassistantenhancedq.png"
     # 插件版本
-    plugin_version = "0.9.7"
+    plugin_version = "0.9.8"
     _site_cache_candidate_helper_warned = False
     # 插件作者
     plugin_author = "Q"
@@ -2115,12 +2115,12 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
 
     def _relocate_completion_state(self, downloader: str, torrent_hash: str,
                                    raw=None) -> Tuple[bool, bool, Optional[datetime.datetime]]:
-        """读取收容种子状态，返回 (是否取到种子, 是否已完成, 完成时间)。
+        """读取收容种子状态，返回 (是否取到种子, 是否已完成下载, 完成时间)。
 
-        站点 H&R 从「下载完成」才开始考察：未完成时不能删除收容种子，否则会白等甚至违约；
+        第二个返回值为严格完成判定（TorrentInfo.finished：进度到 100% 或下载器明确完成态），
+        站点 H&R 从「下载完成」才开始考察，因此未完成时不能删除收容种子，否则会白等甚至违约；
         完成时间用于把到期点改成「下载完成时间 + 站点 H&R 时长」。
-        完成判定用 TorrentInfo.finished（严格：进度到 100% 或下载器明确完成态），
-        避免把「部分下载但已在上传」的种子按已完成处理。raw 由调用方传入可省一次下载器查询。
+        raw 由调用方传入可省一次下载器查询。
         """
         if not self._downloader_helper or not downloader or not torrent_hash:
             return False, False, None
@@ -2195,12 +2195,12 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
                     record["downloader"] = downloader
                     records[torrent_hash] = record
                     changed = True
-                present, completed, completed_at = self._relocate_completion_state(
+                present, finished, completed_at = self._relocate_completion_state(
                     downloader, torrent_hash, raw=raw)
                 if not present:
                     # 本轮取不到种子状态（下载器瞬断等），保留记录等下一轮
                     continue
-                if not completed:
+                if not finished:
                     # 站点 H&R 从下载完成才开始考察，一直下不完的种子不会进入考察，
                     # 因此超过「未完成清理天数」后按「站点不计 H&R」删除任务与文件；未到阈值只跳过
                     limit_days = int(getattr(self._config, "relocate_incomplete_days", 0) or 0)
