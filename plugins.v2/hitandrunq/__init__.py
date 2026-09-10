@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional, Tuple, Type, TypeVar, Union
 import pytz
 from app.sdk.network import SitesHelper
 from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
 from pydantic import BaseModel
 
 from app.sdk.config import settings
@@ -201,7 +202,23 @@ class HitAndRunQ(_PluginBase):
         定义远程控制命令
         :return: 命令关键字、事件、描述、附带数据
         """
-        return []
+        return [{
+            "cmd": "/hr_hours_scan",
+            "event": EventType.PluginAction,
+            "desc": "立即刷新站点H&R时长",
+            "category": "站点",
+            "data": {"action": "hr_hours_scan"},
+        }]
+
+    @eventmanager.register(EventType.PluginAction)
+    def handle_hours_scan_command(self, event: Event = None) -> None:
+        """处理 /hr_hours_scan 命令：立即抓取并合并站点 H&R 时长。"""
+        if not event or not event.event_data:
+            return
+        if event.event_data.get("action") != "hr_hours_scan":
+            return
+        self.post_message(title=self.plugin_name, text="开始刷新站点 H&R 时长 ...")
+        self.run_hr_hours_scan()
 
     def get_api(self) -> List[Dict[str, Any]]:
         return []
@@ -278,6 +295,41 @@ class HitAndRunQ(_PluginBase):
                                             'model': 'relocate_tag',
                                             'label': '收容保护标签',
                                             'hint': '打在收容种子上，需同时加入订阅助手的「排除标签」',
+                                            'persistent-hint': True
+                                        }
+                                    }
+                                ]
+                            },
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 8},
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'site_hr_hours',
+                                            'label': '站点H&R时长（可选）',
+                                            'hint': '格式：站点名:小时，多个用逗号或换行分隔，例如 CARPT:168,听听歌:72；填了即覆盖该站做种时长',
+                                            'persistent-hint': True
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 4},
+                                'content': [
+                                    {
+                                        'component': 'VSwitch',
+                                        'props': {
+                                            'model': 'hr_auto_scan',
+                                            'label': '自动刷新站点时长',
+                                            'hint': '每天抓取各站 H&R 页面并合并进上面的配置',
                                             'persistent-hint': True
                                         }
                                     }
@@ -779,6 +831,8 @@ class HitAndRunQ(_PluginBase):
             "relocate_dir": "/nastools/data/downloads/hr",
             "relocate_tag": "订阅收容",
             "relocate_delete_files": True,
+            "site_hr_hours": "",
+            "hr_auto_scan": True,
             "hit_and_run_tag": "H&R",
             "spider_period": 720,
             "hr_ratio": 99,
@@ -1125,6 +1179,14 @@ class HitAndRunQ(_PluginBase):
                     "trigger": "interval",
                     "func": self.__relocate_check,
                     "kwargs": {"minutes": 10}
+                })
+
+            if getattr(self._hnr_config, "hr_auto_scan", True):
+                services.append({
+                    "id": f"{self.__class__.__name__}HrScan",
+                    "name": f"{self.plugin_name}站点时长刷新",
+                    "trigger": CronTrigger.from_crontab("40 5 * * *"),
+                    "func": self.run_hr_hours_scan,
                 })
 
             if self._hnr_config.auto_monitor:
@@ -1524,6 +1586,56 @@ class HitAndRunQ(_PluginBase):
         logger.info(f"站点 {torrent_task.site_name}，H&R种子任务转移到下载器 {target_downloader}："
                     f"{torrent_task.identifier}，此前累计做种 "
                     f"{FormatHelper.format_hour(torrent_task.seeding_time_offset)} 小时")
+
+    # ── 站点 H&R 时长 ─────────────────────────────────────────
+
+    @staticmethod
+    def __parse_site_hours(text: Any) -> Dict[str, float]:
+        """解析「站点名:小时」文本为字典。"""
+        result: Dict[str, float] = {}
+        for item in str(text or "").replace("；", ",").replace(";", ",").replace("\n", ",").split(","):
+            item = item.strip()
+            if not item or ":" not in item:
+                continue
+            name, _, value = item.rpartition(":")
+            try:
+                result[name.strip()] = float(value.strip())
+            except Exception:
+                continue
+        return result
+
+    def run_hr_hours_scan(self) -> None:
+        """抓取各站 H&R 做种时长并合并进「站点H&R时长」配置。
+
+        合并规则：抓到的值大于等于旧值时更新；比旧值更小时保留旧值并记日志，
+        避免抓取误差导致 H&R 判定提前。
+        """
+        if not self._hnr_config or not getattr(self._hnr_config, "hr_auto_scan", True):
+            return
+        try:
+            from .hr_hours import SiteHrHoursScanner
+
+            found = SiteHrHoursScanner().scan()
+        except Exception as err:
+            logger.error(f"站点 H&R 时长自动刷新失败：{err}")
+            return
+        if not found:
+            logger.info("站点 H&R 时长自动刷新：本轮未抓到任何站点时长")
+            return
+        current = self.__parse_site_hours(getattr(self._hnr_config, "site_hr_hours", ""))
+        updated = dict(current)
+        kept = []
+        for name, hours in found.items():
+            old = current.get(name)
+            if old and hours < old:
+                kept.append(f"{name}(保留 {old:g}，抓到 {hours:g})")
+                continue
+            updated[name] = hours
+        merged = ",".join(f"{name}:{hours:g}" for name, hours in updated.items())
+        self._hnr_config.site_hr_hours = merged
+        self.__update_config()
+        logger.info(f"站点 H&R 时长自动刷新：抓到 {len(found)} 个站点，写入配置 {len(updated)} 个"
+                    f"{('；保留旧值 ' + '、'.join(kept)) if kept else ''}")
 
     # ── 订阅超时收容 ──────────────────────────────────────────
 
