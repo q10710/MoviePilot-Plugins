@@ -67,7 +67,7 @@ class HitAndRunQ(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/hitandrunq.png"
     # 插件版本
-    plugin_version = "2.2.1"
+    plugin_version = "2.2.2"
     # 插件作者
     plugin_author = "Q"
     # 作者主页
@@ -1383,9 +1383,18 @@ class HitAndRunQ(_PluginBase):
             if task_id in torrent_tasks:
                 del torrent_tasks[task_id]
 
-    def __update_torrent_tasks_state(self, torrents: List[Any], torrent_tasks: Dict[str, TorrentTask]):
+    def __update_torrent_tasks_state(self,
+                                     torrent_tasks: Dict[str, TorrentTask],
+                                     presence: Dict[str, str],
+                                     torrents_by_downloader: Dict[str, Dict[str, Any]],
+                                     contexts: Dict[str, DownloaderContext]) -> None:
         """
         更新H&R任务的最新状态（上下传、分享率、做种时间），并跨下载器累计做种数据
+
+        :param torrent_tasks: H&R 任务记录（hash -> TorrentTask）
+        :param presence: 本轮所有可用下载器中的种子 hash -> 所在下载器名称
+        :param torrents_by_downloader: 下载器名 -> 该下载器中 hash -> 种子对象
+        :param contexts: 下载器名 -> DownloaderContext
         """
         for torrent_hash, torrent_task in torrent_tasks.items():
             # 已删除的任务不再更新状态
