@@ -64,6 +64,7 @@ class SiteHrHoursScanner:
 
             for row in SiteOper().list() or []:
                 sites.append({
+                    "id": getattr(row, "id", None),
                     "name": getattr(row, "name", None),
                     "domain": getattr(row, "domain", None),
                     "cookie": getattr(row, "cookie", None),
@@ -81,6 +82,17 @@ class SiteHrHoursScanner:
         except Exception as err:
             logger.error(f"站点 H&R 时长抓取：读取站点列表失败：{err}")
         return sites
+
+    @classmethod
+    def find_site(cls, site) -> Optional[dict]:
+        """按站点 ID 或站点名定位站点配置，供需要临时抓取单站时长时使用；找不到返回 None。"""
+        key = str(site or "").strip()
+        if not key:
+            return None
+        for item in cls._load_sites():
+            if str(item.get("id")) == key or str(item.get("name") or "").strip() == key:
+                return item
+        return None
 
     def fetch(self, site: dict) -> Optional[float]:
         """抓取单个站点的 H&R 时长；抓不到返回 None。"""
