@@ -26,6 +26,10 @@ from app.schemas import MediaInfo
 from app.schemas.types import EventType, MediaType
 
 
+# TMDB 身份来源标识：新版 MoviePilot 的订阅/媒体条目用 media_source + media_id 描述媒体身份
+TMDB_MEDIA_SOURCE = "themoviedb"
+
+
 
 class BestVersionGuard(_PluginBase):
     """洗版订阅守护插件。"""
@@ -33,7 +37,7 @@ class BestVersionGuard(_PluginBase):
     plugin_name = "洗版守护"
     plugin_desc = "定时检查电视剧订阅：未完结的误标洗版自动取消，恢复普通订阅继续追更。"
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/bestversionguard.png"
-    plugin_version = "2.4.7"
+    plugin_version = "2.4.8"
     plugin_label = "订阅"
     plugin_author = "local"
     plugin_config_prefix = "bestversionguard_"
@@ -234,6 +238,35 @@ class BestVersionGuard(_PluginBase):
             "fixed_count": self._fixed_count,
         })
 
+    @staticmethod
+    def _resolve_tmdbid(sub: Any) -> Optional[int]:
+        """从订阅对象解析 TMDB ID。
+
+        新版 MoviePilot 的 Subscribe 已移除 tmdbid 字段，改用 media_source + media_id；
+        为兼容两种版本，这里优先读旧字段，其次从 media_source/media_id 推导，
+        并兼容 media_source 为枚举/字符串、media_id 为数字字符串两种形态。
+        """
+        legacy = getattr(sub, "tmdbid", None)
+        if legacy:
+            try:
+                return int(legacy)
+            except (TypeError, ValueError):
+                pass
+        media_source = getattr(sub, "media_source", None)
+        if media_source is not None:
+            media_source = str(
+                getattr(media_source, "value", media_source) or ""
+            ).strip().lower()
+        if media_source and media_source != TMDB_MEDIA_SOURCE:
+            return None
+        media_id = getattr(sub, "media_id", None)
+        if not media_id:
+            return None
+        try:
+            return int(str(media_id).strip())
+        except (TypeError, ValueError):
+            return None
+
     def _get_library_episodes(self, tmdbid: int, season: int, title: str, year: str) -> Set[int]:
         try:
             mi = MediaInfo()
@@ -306,7 +339,9 @@ class BestVersionGuard(_PluginBase):
         for sub in subscribes:
             if sub.type != MediaType.TV.value:
                 continue
-            if not sub.tmdbid:
+            # 新版 MoviePilot 的 Subscribe 已移除 tmdbid 字段，改用 media_source + media_id
+            tmdbid = self._resolve_tmdbid(sub)
+            if not tmdbid:
                 continue
             # 跳过用户手动暂停(S)的订阅，只处理运行中(R)、待定(P)、新建(N)等
             if sub.state == "S":
@@ -323,7 +358,7 @@ class BestVersionGuard(_PluginBase):
             if not is_assistant_best and not is_normal_best:
                 continue
 
-            tmdb_info = _get_tmdb(sub.tmdbid)
+            tmdb_info = _get_tmdb(tmdbid)
             if not tmdb_info:
                 continue
 
@@ -331,9 +366,9 @@ class BestVersionGuard(_PluginBase):
             in_production = tmdb_info.get("in_production", True)
 
             # 获取该季 TMDB 总集数，判断媒体库是否全集入库
-            season_total = self._get_tmdb_season_total(sub.tmdbid, sub.season)
+            season_total = self._get_tmdb_season_total(tmdbid, sub.season)
             lib_complete = self._is_season_complete(
-                sub.tmdbid, sub.season, season_total, sub.name, sub.year
+                tmdbid, sub.season, season_total, sub.name, sub.year
             ) if season_total > 0 else False
 
             # 判断该季是否已完结
