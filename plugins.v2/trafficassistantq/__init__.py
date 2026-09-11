@@ -40,15 +40,15 @@ class TrafficAssistantQ(_PluginBase):
     """站点流量管理Q改版：基于官方站点流量管理，联动站点刷流，分享率低于下限时按最终配置自动新建/同步刷流任务并启动。"""
 
     # 插件名称
-    plugin_name = "站点流量管理Q改版"
+    plugin_name = "站点流量管理Q自用版"
     # 插件描述
     plugin_desc = "自动管理流量，保障站点分享率。低于分享率下限时，按最终配置自动新建或同步该站刷流任务并启动；高于上限自动暂停。最终配置记忆最后一次手动改动的刷流任务规则，任务被全部删除后仍可重建。基于官方 TrafficAssistant v2.0.0 改造。"
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/trafficassistantq.png"
     # 插件版本
-    plugin_version = "2.0.1"
+    plugin_version = "2.0.2"
     # 插件作者
-    plugin_author = "Q"
+    plugin_author = "q1071091473"
     # 作者主页
     author_url = "https://github.com/q10710"
     # 插件配置项ID前缀
