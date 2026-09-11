@@ -46,7 +46,7 @@ class TrafficAssistantQ(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/trafficassistantq.png"
     # 插件版本
-    plugin_version = "2.0.3"
+    plugin_version = "2.0.4"
     # 插件作者
     plugin_author = "Q"
     # 作者主页
@@ -636,7 +636,7 @@ class TrafficAssistantQ(_PluginBase):
         if self._traffic_config.enabled and self._traffic_config.cron:
             return [{
                 "id": "TrafficAssistantQ",
-                "name": "站点流量管理Q改版服务",
+                "name": "站点流量管理Q自用版服务",
                 "trigger": CronTrigger.from_crontab(self._traffic_config.cron),
                 "func": self.traffic,
                 "kwargs": {}
