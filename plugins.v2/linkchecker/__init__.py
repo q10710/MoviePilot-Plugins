@@ -12,7 +12,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from app.core.config import settings
@@ -28,7 +27,7 @@ class LinkChecker(_PluginBase):
     plugin_name = "硬链接检查"
     plugin_desc = "扫描下载目录和媒体库目录中的孤立硬链接文件，连续3天孤立自动删除。"
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/linkchecker.png"
-    plugin_version = "3.2.0"
+    plugin_version = "3.2.1"
     plugin_label = "文件管理"
     plugin_author = "local"
     plugin_config_prefix = "linkchecker_"
@@ -56,7 +55,6 @@ class LinkChecker(_PluginBase):
     _allow_library_delete: bool = False
     # 曾经出现过硬链接（links>=2）的文件指纹，用于判断「曾经被硬链接过、如今已断开」
     _linked_seen: set = None
-    _scheduler = None
     _last_scan_time: Optional[str] = None
     _last_download_orphans: List[Dict[str, Any]] = []
     _last_library_orphans: List[Dict[str, Any]] = []
@@ -110,11 +108,33 @@ class LinkChecker(_PluginBase):
             f"额外排除={len(self._exclude_dirs)} 项, 收容目录={self._relocate_dirs or '（按目录名兜底）'}"
         )
         if self._enabled and self._cron:
-            self._schedule_service()
+            # 服务注册交给 get_service()，由 MoviePilot 主调度器统一调度（插件重载后自动恢复）
+            logger.info(f"定时扫描将由主调度器注册: {self._cron}")
 
     def get_state(self) -> bool:
         """获取插件启用状态。"""
         return self._enabled
+
+    def get_service(self) -> List[Dict[str, Any]]:
+        """向 MoviePilot 主调度器注册定时扫描服务（标准做法）。
+
+        旧版用插件内自建的 BackgroundScheduler：重载插件会导致该线程失效且不再恢复
+        （实测 2026-09-11 改时间并重载后，14:30 的扫描没有触发），因此改为标准 get_service()，
+        由主调度器统一管理，插件重载或主程序重启后自动恢复，也能在调度器列表中查到。
+        """
+        if not self._enabled or not self._cron:
+            return []
+        try:
+            trigger = CronTrigger.from_crontab(self._cron, timezone=settings.TZ)
+        except Exception as err:
+            logger.error(f"定时扫描 cron 表达式无效，未注册定时任务：{self._cron} - {err}")
+            return []
+        return [{
+            "id": f"{self.__class__.__name__}Scan",
+            "name": "硬链接检查定时扫描",
+            "trigger": trigger,
+            "func": self._scheduled_scan,
+        }]
 
     @staticmethod
     def get_command() -> List[Dict[str, Any]]:
@@ -496,25 +516,8 @@ class LinkChecker(_PluginBase):
 
     def stop_service(self) -> None:
         """停止插件后台服务并释放资源。"""
-        if self._scheduler:
-            self._scheduler.shutdown(wait=False)
-            self._scheduler = None
-
-    # ── 定时服务 ──────────────────────────────────────────────
-
-    def _schedule_service(self) -> None:
-        """注册定时扫描服务。"""
-        if not self._scheduler:
-            self._scheduler = BackgroundScheduler(timezone=settings.TZ)
-            self._scheduler.start()
-        self._scheduler.remove_all_jobs()
-        self._scheduler.add_job(
-            func=self._scheduled_scan,
-            trigger=CronTrigger.from_crontab(self._cron),
-            name="LinkChecker_scan",
-            id="LinkChecker_scan",
-        )
-        logger.info(f"定时扫描已注册: {self._cron}")
+        # 定时任务已交由 MoviePilot 主调度器统一管理，无需在此手动清理
+        pass
 
     def _scheduled_scan(self) -> None:
         """定时扫描入口。"""
