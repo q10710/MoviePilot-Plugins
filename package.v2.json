@@ -162,5 +162,19 @@
     "history": {
       "v1.2.0": "自动限速Q改版（基于官方 v1.1.5 改造）：修复标签映射解析崩溃——官方默认值「标签:限速(KB)」是说明文字，原版直接 int() 转换导致每轮执行报错并中断限速；现改为逐行校验解析（兼容全角/半角冒号、KB 后缀、空行），非法行只记 warning 跳过，不再中断整轮；默认值改为空（留空=不做按标签限速）。"
     }
+  },
+  "EpisodeNoExistQ": {
+    "id": "EpisodeNoExistQ",
+    "name": "缺失集数订阅Q改版",
+    "description": "订阅媒体库缺失集数的电视剧；适配新版 MoviePilot 的 MediaServerItem（已无 tmdbid 字段），改用 media_source + media_id 识别 TMDB 身份，并兼容中文媒体类型。基于官方缺失集数订阅 v2.0.5 改造。",
+    "labels": "订阅",
+    "version": "2.1.0",
+    "version_name": "2.1.0",
+    "icon": "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/episodenoexistq.png",
+    "author": "Q",
+    "level": 1,
+    "history": {
+      "v2.1.0": "缺失集数订阅Q改版（基于官方 v2.0.5 改造）：① 修复致命错误——新版 MoviePilot 的 MediaServerItem 已移除 tmdbid 字段（改为 media_source + media_id），原版 item.tmdbid 直接抛 AttributeError 导致每轮 12 小时检查失败；改为按 media_source/media_id 解析 TMDB ID（兼容枚举与字符串身份、数字字符串 ID），非 TMDB 身份安全跳过；② 媒体类型兼容中英文（Series/show 与 电视剧），避免全部条目被误判为电影跳过；③ item.dict() 在 pydantic v2 已废弃，改为 model_dump 优先的兼容转换。"
+    }
   }
 }
