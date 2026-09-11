@@ -128,14 +128,15 @@
     "version_name": "2.2.4"
   },
   "DeletedMediaSubCleaner": {
-    "name": "删档订阅清理",
+    "name": "删档订阅清理Q自用版",
     "description": "媒体库中的电影/电视剧被删除后，若订阅仍存在且迟迟不下载，连续达到宽限天数后按配置清理该订阅（仅通知/暂停/删除）。",
     "labels": "订阅",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "icon": "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/deletedmediasubcleaner.png",
-    "author": "Q",
+    "author": "q1071091473",
     "level": 1,
     "history": {
+      "v1.0.1": "插件更名为「删档订阅清理Q自用版」，作者统一为 q1071091473；功能无变化。",
       "v1.0.0": "初始版本：对比媒体库快照识别被删除的电影/电视剧，连续缺失达到宽限天数（默认 3 天）且对应订阅仍存在、期间无新下载记录时，按配置处置订阅；首次运行只建立基线，媒体服务器读取失败时整轮中止，避免误判。"
     }
   },
