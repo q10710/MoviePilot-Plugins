@@ -144,16 +144,16 @@ class History(TypedDict):
 
 class EpisodeNoExistQ(_PluginBase):
     # 插件名称
-    plugin_name = "缺失集数订阅Q改版"
+    plugin_name = "缺失集数订阅Q自用版"
     # 插件描述
     plugin_desc = ("订阅媒体库缺失集数的电视剧；适配新版 MoviePilot 的 MediaServerItem（已无 tmdbid 字段），"
                    "改用 media_source + media_id 识别 TMDB 身份，并兼容中文媒体类型。基于官方缺失集数订阅 v2.0.5 改造。")
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/episodenoexistq.png"
     # 插件版本
-    plugin_version = "2.1.1"
+    plugin_version = "2.1.2"
     # 插件作者
-    plugin_author = "Q"
+    plugin_author = "q1071091473"
     # 作者主页
     author_url = "https://github.com/q10710"
     # 插件配置项ID前缀
