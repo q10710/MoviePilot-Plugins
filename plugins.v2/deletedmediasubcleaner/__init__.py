@@ -43,9 +43,9 @@ class DeletedMediaSubCleaner(_PluginBase):
                    "连续达到宽限天数后按配置清理该订阅。")
     plugin_icon = ("https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/"
                    "main/icons/deletedmediasubcleaner.png")
-    plugin_version = "1.0.1"
+    plugin_version = "1.0.2"
     plugin_label = "订阅"
-    plugin_author = "q1071091473"
+    plugin_author = "Q"
     author_url = "https://github.com/q10710"
     plugin_config_prefix = "deletedmediasubcleaner_"
     plugin_order = 62
