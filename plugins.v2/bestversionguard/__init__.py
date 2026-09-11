@@ -10,6 +10,7 @@
 3. 其他情况（Returning Series / in_production / lack>0）→ 取消洗版
 """
 
+import time
 from datetime import datetime
 from app.log import logger
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -39,7 +40,7 @@ class BestVersionGuard(_PluginBase):
     plugin_name = "洗版守护"
     plugin_desc = "定时检查电视剧订阅：未完结的误标洗版自动取消，恢复普通订阅继续追更。"
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/bestversionguard.png"
-    plugin_version = "2.4.9"
+    plugin_version = "2.5.0"
     plugin_label = "订阅"
     plugin_author = "local"
     plugin_config_prefix = "bestversionguard_"
@@ -49,13 +50,20 @@ class BestVersionGuard(_PluginBase):
     _enabled = False
     _cron: str = "0 3 * * *"
     _notify: bool = True
+    # 媒体库文件丢失（库缺集但订阅认为已完成）时，自动重置订阅触发重新下载
+    _reset_missing_enabled: bool = True
+    # 同一订阅重置限频天数（0 = 不限频），避免媒体库查询异常导致反复重下
+    _reset_cooldown_days: int = 1
 
     _subscribe_oper = None
     _fixed_count: int = 0
     _last_run: Optional[str] = None
     _last_fixed: List[Dict[str, Any]] = []
+    _last_reset: List[Dict[str, Any]] = []
     # 持久化：已取消洗版的订阅 ID，避免重复操作
     _fixed_ids: Set[str] = set()
+    # 持久化：已重置订阅 ID -> 上次重置时间戳（用于限频）
+    _reset_records: Dict[str, float] = {}
 
     def init_plugin(self, config: dict = None) -> None:
         self.stop_service()
@@ -63,13 +71,17 @@ class BestVersionGuard(_PluginBase):
         saved = self.get_data("state") or {}
         self._fixed_ids = set(saved.get("fixed_ids", []))
         self._fixed_count = saved.get("fixed_count", 0)
+        self._reset_records = {str(k): float(v) for k, v in (saved.get("reset_records") or {}).items()}
         if not config:
             self._enabled = False
             return
         self._enabled = bool(config.get("enabled"))
         self._cron = config.get("cron") or "0 3 * * *"
         self._notify = bool(config.get("notify"))
+        self._reset_missing_enabled = bool(config.get("reset_missing_enabled", True))
+        self._reset_cooldown_days = int(config.get("reset_cooldown_days") or 0)
         logger.info(f"初始化完成, enabled={self._enabled}, cron={self._cron}, "
+                    f"库缺集重置={self._reset_missing_enabled}（限频 {self._reset_cooldown_days} 天），"
                     f"已取消 {len(self._fixed_ids)} 条")
         if self._enabled:
             # 定时任务交由 MoviePilot 主调度器统一注册（见 get_service）
@@ -142,12 +154,34 @@ class BestVersionGuard(_PluginBase):
                         "component": "VSwitch",
                         "props": {"model": "notify", "label": "操作时发送通知"},
                     },
+                    {
+                        "component": "VSwitch",
+                        "props": {
+                            "model": "reset_missing_enabled",
+                            "label": "媒体库文件丢失时重置订阅（重新下载）",
+                            "hint": ("媒体库中该季确实缺集、但订阅认为已下完（说明文件被删了）时，"
+                                     "清空下载事实并恢复缺集数，让订阅重新搜索下载。"),
+                            "persistent-hint": True,
+                        },
+                    },
+                    {
+                        "component": "VTextField",
+                        "props": {
+                            "model": "reset_cooldown_days",
+                            "label": "重置限频（天，0=不限频）",
+                            "type": "number",
+                            "hint": "同一订阅在该天数内最多重置一次，避免媒体库查询异常导致反复重下",
+                            "persistent-hint": True,
+                        },
+                    },
                 ],
             }
         ], {
             "enabled": False,
             "cron": "0 3 * * *",
             "notify": True,
+            "reset_missing_enabled": True,
+            "reset_cooldown_days": 1,
         }
 
     def get_page(self) -> Optional[List[dict]]:
@@ -238,7 +272,46 @@ class BestVersionGuard(_PluginBase):
         self.save_data("state", {
             "fixed_ids": list(self._fixed_ids),
             "fixed_count": self._fixed_count,
+            "reset_records": self._reset_records,
         })
+
+    def _can_reset(self, subscribe_id: Any) -> bool:
+        """判断该订阅当前是否允许重置（按限频天数去抖，0 表示不限频）。"""
+        if self._reset_cooldown_days <= 0:
+            return True
+        last = self._reset_records.get(str(subscribe_id))
+        if not last:
+            return True
+        return (time.time() - float(last)) >= self._reset_cooldown_days * 86400
+
+    def _reset_subscribe(self, sub: Any) -> bool:
+        """重置订阅，让它重新搜索下载；字段与主程序「订阅重置」保持一致。
+
+        媒体库那份被删后，主程序仍以为该季已下完（lack_episode=0、note 记录全部集数），
+        不会自动补下；清空下载事实并恢复缺集数后，下一轮订阅搜索即会重新获取。
+        """
+        if not self._subscribe_oper:
+            return False
+        payload = {
+            "note": [],
+            "lack_episode": sub.total_episode,
+            "current_priority": None,
+            "current_audio_format": None,
+            "current_bitrate": None,
+            "current_bit_depth": None,
+            "current_sample_rate": None,
+            "episode_priority": {},
+            "manual_total_episode": 0,
+            "state": "R",
+        }
+        try:
+            self._subscribe_oper.update(sid=sub.id, payload=payload)
+        except Exception as e:
+            logger.info(f"重置订阅失败: {sub.name} - {e}")
+            return False
+        self._reset_records[str(sub.id)] = time.time()
+        self._save_state()
+        return True
 
     @staticmethod
     def _resolve_tmdbid(sub: Any) -> Optional[int]:
@@ -326,6 +399,7 @@ class BestVersionGuard(_PluginBase):
 
         tmdb_chain = TmdbChain()
         fixed_list: List[Dict[str, Any]] = []
+        reset_list: List[Dict[str, Any]] = []
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         tmdb_cache: Dict[int, dict] = {}
@@ -377,6 +451,34 @@ class BestVersionGuard(_PluginBase):
             season_ended = lib_complete or (
                 tmdb_status == "Ended" and (not sub.lack_episode or sub.lack_episode <= 0)
             )
+
+            # ── 媒体库文件丢失：库确实缺集，但订阅认为已下完（lack_episode<=0） ──
+            # 说明媒体库那份被删了（如硬链接断开后被清理），主程序不会自动补下，
+            # 需重置订阅把下载事实清空、恢复缺集数，让后续订阅搜索重新获取并洗版整理。
+            if (
+                self._reset_missing_enabled
+                and season_total > 0
+                and not lib_complete
+                and (sub.total_episode or 0) > 0
+                and (not sub.lack_episode or sub.lack_episode <= 0)
+            ):
+                if sub.state == "P":
+                    # 已有下载在进行，等它跑完再判断，避免重复下载
+                    logger.info(f"库缺集但当前有下载进行中，暂不重置: {sub.name} S{sub.season}")
+                    continue
+                if not self._can_reset(sub.id):
+                    logger.info(f"库缺集但处于重置限频期（{self._reset_cooldown_days} 天），跳过: "
+                                f"{sub.name} S{sub.season}")
+                    continue
+                if self._reset_subscribe(sub):
+                    logger.info(f"库缺集重置订阅: {sub.name} S{sub.season} "
+                                f"(媒体库缺 {season_total} 集，等待重新下载)")
+                    reset_list.append({
+                        "name": sub.name, "year": sub.year, "season": sub.season,
+                        "reason": f"媒体库缺 {season_total} 集但订阅认为已下完",
+                        "reset_time": now_str,
+                    })
+                    continue
 
             if season_ended:
                 fix_key = str(sub.id)
@@ -435,13 +537,21 @@ class BestVersionGuard(_PluginBase):
         self._last_run = now_str
         self._fixed_count += len(fixed_list)
         self._last_fixed = fixed_list
+        self._last_reset = reset_list
 
-        logger.info(f"检查完成: 取消 {len(fixed_list)} 个")
+        logger.info(f"检查完成: 取消 {len(fixed_list)} 个，库缺集重置 {len(reset_list)} 个")
 
-        if self._notify and fixed_list:
-            names = "、".join(f"{f['name']} S{f['season']}" for f in fixed_list[:10])
-            suffix = f"等 {len(fixed_list)} 个" if len(fixed_list) > 10 else ""
-            self.post_message(title="洗版守护", text=f"取消洗版: {names}{suffix}")
+        if self._notify and (fixed_list or reset_list):
+            lines: List[str] = []
+            if fixed_list:
+                names = "、".join(f"{f['name']} S{f['season']}" for f in fixed_list[:10])
+                suffix = f"等 {len(fixed_list)} 个" if len(fixed_list) > 10 else ""
+                lines.append(f"取消洗版: {names}{suffix}")
+            if reset_list:
+                names = "、".join(f"{f['name']} S{f['season']}" for f in reset_list[:10])
+                suffix = f"等 {len(reset_list)} 个" if len(reset_list) > 10 else ""
+                lines.append(f"媒体库文件丢失，已重置订阅重新下载: {names}{suffix}")
+            self.post_message(title="洗版守护", text="\n".join(lines))
 
     # ── API ───────────────────────────────────────────────────
 
