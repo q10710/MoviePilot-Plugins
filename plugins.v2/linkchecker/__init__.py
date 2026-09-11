@@ -32,9 +32,10 @@ class LinkChecker(_PluginBase):
     plugin_name = "硬链接检查Q自用版"
     plugin_desc = "扫描下载目录和媒体库目录中的孤立硬链接文件，连续3天孤立自动删除；并可清理只剩元数据、没有视频的空壳季目录/剧目录。"
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/linkchecker.png"
-    plugin_version = "3.3.3"
+    plugin_version = "3.3.4"
     plugin_label = "文件管理"
     plugin_author = "Q"
+    author_url = "https://github.com/q10710"
     plugin_config_prefix = "linkchecker_"
     plugin_order = 50
     auth_level = 1
