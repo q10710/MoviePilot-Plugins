@@ -32,7 +32,7 @@ class LinkChecker(_PluginBase):
     plugin_name = "硬链接检查"
     plugin_desc = "扫描下载目录和媒体库目录中的孤立硬链接文件，连续3天孤立自动删除；并可清理只剩元数据、没有视频的空壳季目录/剧目录。"
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/linkchecker.png"
-    plugin_version = "3.3.0"
+    plugin_version = "3.3.1"
     plugin_label = "文件管理"
     plugin_author = "local"
     plugin_config_prefix = "linkchecker_"
@@ -51,6 +51,13 @@ class LinkChecker(_PluginBase):
     # 影视条目标识文件名：目录内出现任一即认为该目录是「剧/电影条目目录」，而不是分类目录。
     _MEDIA_MARKER_FILES = {
         "tvshow.nfo", "movie.nfo", "poster.jpg", "folder.jpg", "fanart.jpg", "backdrop.jpg",
+    }
+    # 无扩展名的刮削图文件名（Kodi/Emby 常见）：这类文件算元数据，不影响空壳判定；
+    # 其它来源不明的无扩展名文件按实体文件处理，保护目录不被误删。
+    _ARTIFACT_NAMES = {
+        "fanart", "backdrop", "logo", "clearlogo", "clearart", "landscape",
+        "banner", "thumb", "disc", "discart", "art", "keyart", "cdart",
+        "poster", "folder", "season", "tvshow", "default",
     }
     # 季目录名特征（小写、整名匹配），如 Season 1 / S01 / Specials / 第1季 / OVA。
     _SEASON_DIR_PATTERNS = (
@@ -962,17 +969,19 @@ class LinkChecker(_PluginBase):
                 fpath = os.path.join(cur, fname)
                 if self._is_ignored(fpath):
                     continue
-                ext = os.path.splitext(fname)[1].lower()
+                lower = fname.lower()
+                if lower.startswith("."):
+                    # 系统隐藏文件（如 .DS_Store）不影响空壳判定
+                    continue
+                ext = os.path.splitext(lower)[1]
                 if not ext:
-                    if fname.startswith("."):
-                        # 系统隐藏文件（如 .DS_Store）不影响空壳判定
-                        continue
-                    return None
-                if ext not in self._META_EXTS:
+                    if lower not in self._ARTIFACT_NAMES:
+                        # 无扩展名且不是已知刮削图 → 来源不明，按实体文件处理
+                        return None
+                elif ext not in self._META_EXTS:
                     # 存在视频、音频或未知类型文件 → 不是空壳
                     return None
                 file_count += 1
-                lower = fname.lower()
                 if lower in self._MEDIA_MARKER_FILES or lower.startswith("season"):
                     has_marker = True
                 try:
