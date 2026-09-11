@@ -98,17 +98,17 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
     """
 
     # 插件名称
-    plugin_name = "订阅助手Q改版"
+    plugin_name = "订阅助手Q自用版"
     # 插件描述
     plugin_desc = ("多场景管理订阅，实现订阅全生命周期管理；订阅下载超过收容门槛仍未完成的 H&R 种子"
                    "按绝对时长移入收容目录保留做种，按站点 H&R 时长到期后再清理，避免直接删种造成 H&R 违约。")
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/subscribeassistantenhancedq.png"
     # 插件版本
-    plugin_version = "0.9.10"
+    plugin_version = "0.9.11"
     _site_cache_candidate_helper_warned = False
     # 插件作者
-    plugin_author = "Q"
+    plugin_author = "q1071091473"
     # 作者主页
     author_url = "https://github.com/q10710"
     # 插件配置项ID前缀
