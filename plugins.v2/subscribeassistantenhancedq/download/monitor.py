@@ -559,6 +559,10 @@ class DownloadMonitor:
                 data[torrent_hash] = task
             return data
 
+        # 修复：此前只定义了 updater 却没有真正写入，导致连续缺失计数永远清不掉——
+        # 种子短暂消失后恢复可见仍保留旧计数，之后再出现一次瞬断就可能直接判「手动删除」。
+        self._update("torrents", updater)
+
     def _update_downloader(self, torrent_hash: str, downloader: str) -> bool:
         """把种子记录指向实际所在的下载器（自动转移做种场景），返回是否发生变更。"""
         changed = {"value": False}
