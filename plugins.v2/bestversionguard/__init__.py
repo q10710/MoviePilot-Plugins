@@ -40,7 +40,7 @@ class BestVersionGuard(_PluginBase):
     plugin_name = "洗版守护"
     plugin_desc = "定时检查电视剧订阅：未完结的误标洗版自动取消，恢复普通订阅继续追更。"
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/bestversionguard.png"
-    plugin_version = "2.5.0"
+    plugin_version = "2.5.1"
     plugin_label = "订阅"
     plugin_author = "local"
     plugin_config_prefix = "bestversionguard_"
@@ -79,7 +79,12 @@ class BestVersionGuard(_PluginBase):
         self._cron = config.get("cron") or "0 3 * * *"
         self._notify = bool(config.get("notify"))
         self._reset_missing_enabled = bool(config.get("reset_missing_enabled", True))
-        self._reset_cooldown_days = int(config.get("reset_cooldown_days") or 0)
+        # 配置缺省时必须回落到 1 天限频：不能用 `or 0`，否则未提交该键时会变成"不限频"
+        raw_cooldown = config.get("reset_cooldown_days")
+        try:
+            self._reset_cooldown_days = int(raw_cooldown) if raw_cooldown not in (None, "") else 1
+        except (TypeError, ValueError):
+            self._reset_cooldown_days = 1
         logger.info(f"初始化完成, enabled={self._enabled}, cron={self._cron}, "
                     f"库缺集重置={self._reset_missing_enabled}（限频 {self._reset_cooldown_days} 天），"
                     f"已取消 {len(self._fixed_ids)} 条")
