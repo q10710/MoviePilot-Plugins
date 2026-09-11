@@ -15,15 +15,15 @@ from app.schemas import ServiceInfo
 
 class LimitQ(_PluginBase):
     # 插件名称
-    plugin_name = "自动限速Q改版"
+    plugin_name = "自动限速Q自用版"
     # 插件描述
     plugin_desc = "给qb、tr的下载任务限速（按标签或全部覆盖）；修复官方版标签映射填写占位说明时每轮报错中断的问题，并改为标准主调度器定时。基于官方自动限速 v1.1.5 改造。"
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/limitq.png"
     # 插件版本
-    plugin_version = "1.2.0"
+    plugin_version = "1.2.1"
     # 插件作者
-    plugin_author = "Q"
+    plugin_author = "q1071091473"
     # 作者主页
     author_url = "https://github.com/q10710"
     # 插件配置项ID前缀
