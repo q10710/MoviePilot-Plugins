@@ -67,9 +67,9 @@ class HitAndRunQ(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/hitandrunq.png"
     # 插件版本
-    plugin_version = "2.2.4"
+    plugin_version = "2.2.5"
     # 插件作者
-    plugin_author = "q1071091473"
+    plugin_author = "Q"
     # 作者主页
     author_url = "https://github.com/q10710"
     # 插件配置项ID前缀
