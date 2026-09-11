@@ -105,7 +105,7 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/subscribeassistantenhancedq.png"
     # 插件版本
-    plugin_version = "0.9.8"
+    plugin_version = "0.9.9"
     _site_cache_candidate_helper_warned = False
     # 插件作者
     plugin_author = "Q"
@@ -338,6 +338,7 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
             state_coordinator=None,
             fetch_fn=self._fetch_downloader_torrent,
             present_fn=self._downloader_torrent_present,
+            locate_fn=self._locate_torrent_in_downloaders,
             manual_delete_enabled=cfg.download_monitor_enabled and cfg.manual_delete_listen,
             pending_download_enabled=cfg.pending_download_enabled,
         )
@@ -2315,6 +2316,48 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
         if error:
             return None
         return bool(torrents)
+
+    def _locate_torrent_in_downloaders(self, torrent_hash: str,
+                                       preferred: Optional[str] = None) -> Tuple[Optional[str], bool]:
+        """跨下载器定位种子，返回 (所在下载器名, 结论是否确定)。
+
+        用于识别「自动转移做种」：种子下载完成后可能被搬到另一个下载器（如 qb → tr），
+        原下载器里已查不到，但它并未被用户删除，不应按手动删除善后。
+        结论确定=True 表示已遍历全部已配置下载器且无任何报错，可据此认定种子确实不存在；
+        有下载器报错时为 False（不可判定），调用方应本轮跳过、等下一轮再判。
+        """
+        if not self._downloader_helper or not torrent_hash:
+            return None, False
+        candidates: List[str] = []
+        if preferred:
+            candidates.append(str(preferred))
+        try:
+            services = self._downloader_helper.get_services() or {}
+        except Exception as err:
+            logger.debug(f"下载监控：获取下载器列表失败：{err}")
+            services = {}
+        for name in services.keys():
+            if name not in candidates:
+                candidates.append(name)
+        conclusive = bool(services)
+        for name in candidates:
+            try:
+                service = self._downloader_helper.get_service(name=name)
+                instance = getattr(service, "instance", None) if service else None
+                if not instance:
+                    conclusive = False
+                    continue
+                torrents, error = instance.get_torrents(ids=torrent_hash)
+                if error:
+                    conclusive = False
+                    continue
+                if torrents:
+                    return name, True
+            except Exception as err:
+                logger.debug(f"下载监控：查询下载器 {name} 中的种子失败 {torrent_hash}：{err}")
+                conclusive = False
+                continue
+        return None, conclusive
 
     def _schedule_delayed_subscribe_search(self, subscribe, scene: str):
         """随机延迟执行单订阅搜索，并返回实际延迟秒数供调用方展示。"""
