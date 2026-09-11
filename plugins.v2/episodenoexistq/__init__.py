@@ -11,7 +11,7 @@ from enum import Enum
 from typing import Any, Dict, List, Optional, TypedDict
 
 from app.chain.tmdb import TmdbChain
-from app.schemas.types import MediaType
+from app.schemas.types import MediaSource, MediaType
 from app import schemas
 from app.chain.download import DownloadChain
 from app.chain.media import MediaChain
@@ -151,7 +151,7 @@ class EpisodeNoExistQ(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/episodenoexistq.png"
     # 插件版本
-    plugin_version = "2.1.0"
+    plugin_version = "2.1.1"
     # 插件作者
     plugin_author = "Q"
     # 作者主页
@@ -732,7 +732,8 @@ class EpisodeNoExistQ(_PluginBase):
         # 获取媒体信息
         tmdbinfo = self._mediaChain.recognize_media(
             mtype=MediaType.TV,
-            tmdbid=tmdbid,
+            media_source=MediaSource.TMDB,
+            media_id=str(tmdbid),
         )
 
         if tmdbinfo:
@@ -772,7 +773,7 @@ class EpisodeNoExistQ(_PluginBase):
                     episode_total = len(filted_episodes)
 
                     # 判断用户是否已经添加订阅
-                    if self._subOper.exists(tmdbid, None, season=season):
+                    if self._subOper.exists(MediaSource.TMDB, str(tmdbid), season=season):
                         logger.info(
                             f"【{title}】第【{season}】季已存在订阅, 跳过"
                         )
@@ -820,7 +821,7 @@ class EpisodeNoExistQ(_PluginBase):
                             continue
 
                         # 判断用户是否已经添加订阅
-                        if self._subOper.exists(tmdbid, None, season=season):
+                        if self._subOper.exists(MediaSource.TMDB, str(tmdbid), season=season):
                             logger.info(
                                 f"【{title}】第【{season}】季已存在订阅, 跳过"
                             )
@@ -834,7 +835,7 @@ class EpisodeNoExistQ(_PluginBase):
                     else:
                         logger.debug(f"【{title}】第【{season}】季全集不存在")
                         # 判断用户是否已经添加订阅
-                        if self._subOper.exists(tmdbid, None, season=season):
+                        if self._subOper.exists(MediaSource.TMDB, str(tmdbid), season=season):
                             logger.info(
                                 f"【{title}】第【{season}】季已存在订阅, 跳过"
                             )
@@ -979,7 +980,7 @@ class EpisodeNoExistQ(_PluginBase):
                     break
 
         # 判断用户是否已经添加订阅
-        if self._subOper.exists(tmdbid, None, season=season):
+        if self._subOper.exists(MediaSource.TMDB, str(tmdbid), season=season):
             logger.info(f"{title_season} 订阅已存在")
             return True
 
@@ -996,7 +997,8 @@ class EpisodeNoExistQ(_PluginBase):
             title=title,
             year=year,
             mtype=MediaType.TV,
-            tmdbid=tmdbid,
+            media_source=MediaSource.TMDB,
+            media_id=str(tmdbid),
             season=season,
             exist_ok=True,
             username=self.plugin_name,
