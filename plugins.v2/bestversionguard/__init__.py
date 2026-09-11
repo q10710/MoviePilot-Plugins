@@ -22,8 +22,10 @@ from app.core.config import settings
 from app.core.event import eventmanager, Event
 from app.db.subscribe_oper import SubscribeOper
 from app.plugins import _PluginBase
-from app.schemas import MediaInfo
 from app.schemas.types import EventType, MediaType
+# 统一用插件 SDK 暴露的领域 MediaInfo：app.schemas 里还有一个同名 pydantic 模型，
+# 缺 get_poster_image 等方法，传给主程序媒体库接口会抛 AttributeError。
+from app.sdk.media import MediaInfo
 
 
 # TMDB 身份来源标识：新版 MoviePilot 的订阅/媒体条目用 media_source + media_id 描述媒体身份
@@ -37,7 +39,7 @@ class BestVersionGuard(_PluginBase):
     plugin_name = "洗版守护"
     plugin_desc = "定时检查电视剧订阅：未完结的误标洗版自动取消，恢复普通订阅继续追更。"
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/bestversionguard.png"
-    plugin_version = "2.4.8"
+    plugin_version = "2.4.9"
     plugin_label = "订阅"
     plugin_author = "local"
     plugin_config_prefix = "bestversionguard_"
