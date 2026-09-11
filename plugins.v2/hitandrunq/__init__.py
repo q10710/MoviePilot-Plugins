@@ -60,16 +60,16 @@ class HitAndRunQ(_PluginBase):
     """H&R 助手 Q 改版插件：支持多下载器与下载器间转移做种识别。"""
 
     # 插件名称
-    plugin_name = "H&R助手Q改版"
+    plugin_name = "H&R助手Q自用版"
     # 插件描述
     plugin_desc = ("监听下载、订阅、刷流等行为，对H&R种子进行自动标签管理；"
                    "支持多下载器，并可识别种子在下载器之间的转移做种，避免误报种子被删除。")
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/hitandrunq.png"
     # 插件版本
-    plugin_version = "2.2.3"
+    plugin_version = "2.2.4"
     # 插件作者
-    plugin_author = "Q"
+    plugin_author = "q1071091473"
     # 作者主页
     author_url = "https://github.com/q10710"
     # 插件配置项ID前缀
