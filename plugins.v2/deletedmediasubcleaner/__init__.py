@@ -38,14 +38,14 @@ MEDIA_TYPE_TV = "电视剧"
 class DeletedMediaSubCleaner(_PluginBase):
     """删档订阅清理插件。"""
 
-    plugin_name = "删档订阅清理"
+    plugin_name = "删档订阅清理Q自用版"
     plugin_desc = ("媒体库中的电影/电视剧被删除后，若订阅仍存在且迟迟不下载，"
                    "连续达到宽限天数后按配置清理该订阅。")
     plugin_icon = ("https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/"
                    "main/icons/deletedmediasubcleaner.png")
-    plugin_version = "1.0.0"
+    plugin_version = "1.0.1"
     plugin_label = "订阅"
-    plugin_author = "Q"
+    plugin_author = "q1071091473"
     author_url = "https://github.com/q10710"
     plugin_config_prefix = "deletedmediasubcleaner_"
     plugin_order = 62
