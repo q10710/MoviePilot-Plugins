@@ -20,12 +20,12 @@ from app.schemas.types import EventType, MediaType
 class StaleSubCleaner(_PluginBase):
     """过期订阅清理插件。"""
 
-    plugin_name = "过期订阅清理"
+    plugin_name = "过期订阅清理Q自用版"
     plugin_desc = "检查电视剧订阅，超过指定天数未下载新剧集则自动取消订阅。"
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/stalesubcleaner.png"
-    plugin_version = "1.1.3"
+    plugin_version = "1.1.4"
     plugin_label = "订阅"
-    plugin_author = "local"
+    plugin_author = "q1071091473"
     plugin_config_prefix = "stalesubcleaner_"
     plugin_order = 61
     auth_level = 1
