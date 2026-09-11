@@ -6,7 +6,6 @@
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
-from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from app.core.config import settings
@@ -24,7 +23,7 @@ class StaleSubCleaner(_PluginBase):
     plugin_name = "过期订阅清理"
     plugin_desc = "检查电视剧订阅，超过指定天数未下载新剧集则自动取消订阅。"
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/stalesubcleaner.png"
-    plugin_version = "1.1.2"
+    plugin_version = "1.1.3"
     plugin_label = "订阅"
     plugin_author = "local"
     plugin_config_prefix = "stalesubcleaner_"
@@ -35,7 +34,7 @@ class StaleSubCleaner(_PluginBase):
     _cron: str = "0 6 * * *"
     _stale_days: int = 15
     _notify: bool = True
-    _scheduler = None
+
     _subscribe_oper = None
     _download_oper = None
     _last_run: Optional[str] = None
@@ -61,11 +60,32 @@ class StaleSubCleaner(_PluginBase):
             f"stale_days={self._stale_days}"
         )
         if self._enabled:
-            self._schedule_service()
+            # 定时任务交由 MoviePilot 主调度器统一注册（见 get_service）
+            logger.info(f"定时检查将由主调度器注册: {self._cron}")
 
     def get_state(self) -> bool:
         """获取插件启用状态。"""
         return self._enabled
+
+    def get_service(self) -> List[Dict[str, Any]]:
+        """向 MoviePilot 主调度器注册定时检查服务（标准做法）。
+
+        此前用插件内自建的 BackgroundScheduler：插件重载后该线程会失效且不再恢复，
+        定时任务会静默停摆，因此改为标准 get_service()，由主调度器统一管理并自动恢复。
+        """
+        if not self._enabled or not self._cron:
+            return []
+        try:
+            trigger = CronTrigger.from_crontab(self._cron, timezone=settings.TZ)
+        except Exception as err:
+            logger.error(f"cron 表达式无效，未注册定时任务：{self._cron} - {err}")
+            return []
+        return [{
+            "id": f"{self.__class__.__name__}Check",
+            "name": "过期订阅清理检查",
+            "trigger": trigger,
+            "func": self._do_check,
+        }]
 
     @staticmethod
     def get_command() -> List[Dict[str, Any]]:
@@ -239,25 +259,8 @@ class StaleSubCleaner(_PluginBase):
 
     def stop_service(self) -> None:
         """停止插件后台服务并释放资源。"""
-        if self._scheduler:
-            self._scheduler.shutdown(wait=False)
-            self._scheduler = None
-
-    # ── 定时服务 ──────────────────────────────────────────────
-
-    def _schedule_service(self) -> None:
-        """注册定时检查服务。"""
-        if not self._scheduler:
-            self._scheduler = BackgroundScheduler(timezone=settings.TZ)
-            self._scheduler.start()
-        self._scheduler.remove_all_jobs()
-        self._scheduler.add_job(
-            func=self._do_check,
-            trigger=CronTrigger.from_crontab(self._cron),
-            name="StaleSubCleaner_check",
-            id="StaleSubCleaner_check",
-        )
-        logger.info(f"定时检查已注册: {self._cron}")
+        # 定时任务已交由 MoviePilot 主调度器统一管理，无需在此手动清理
+        pass
 
     # ── 核心逻辑 ──────────────────────────────────────────────
 
