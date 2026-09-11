@@ -40,9 +40,9 @@ class BestVersionGuard(_PluginBase):
     plugin_name = "洗版守护Q自用版"
     plugin_desc = "定时检查电视剧订阅：未完结的误标洗版自动取消，恢复普通订阅继续追更。"
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/bestversionguard.png"
-    plugin_version = "2.5.2"
+    plugin_version = "2.5.3"
     plugin_label = "订阅"
-    plugin_author = "q1071091473"
+    plugin_author = "Q"
     plugin_config_prefix = "bestversionguard_"
     plugin_order = 60
     auth_level = 1
