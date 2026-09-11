@@ -105,7 +105,7 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/subscribeassistantenhancedq.png"
     # 插件版本
-    plugin_version = "0.9.9"
+    plugin_version = "0.9.10"
     _site_cache_candidate_helper_warned = False
     # 插件作者
     plugin_author = "Q"
