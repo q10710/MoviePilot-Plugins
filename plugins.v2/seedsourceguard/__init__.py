@@ -32,9 +32,10 @@ class SeedSourceGuard(_PluginBase):
     plugin_desc = ("检测本地源文件是否有下载器在做种、下载器是否存在文件丢失的无效做种或"
                    "tracker 全部失败的做种任务；连续N天异常可通知或按策略处置，杜绝无效做种与孤儿文件。")
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/seedsourceguard.png"
-    plugin_version = "1.1.9"
+    plugin_version = "1.1.10"
     plugin_label = "下载管理"
     plugin_author = "Q"
+    author_url = "https://github.com/q10710"
     plugin_config_prefix = "seedsourceguard_"
     plugin_order = 66
     auth_level = 1
