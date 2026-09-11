@@ -27,6 +27,7 @@ class DownloadMonitor:
                  subscribe_oper=None,
                  fetch_fn: Optional[Callable] = None,
                  present_fn: Optional[Callable] = None,
+                 locate_fn: Optional[Callable] = None,
                  manual_delete_enabled: bool = True,
                  manual_miss_threshold: int = 2,
                  pending_download_enabled: bool = True,
@@ -46,6 +47,9 @@ class DownloadMonitor:
         self._fetch_fn = fetch_fn
         # present_fn(downloader, hash) -> Optional[bool]：True=存在，False=可达但不存在，None=不可判定。
         self._present_fn = present_fn
+        # locate_fn(hash, preferred) -> (下载器名|None, 结论是否确定)：
+        # 跨下载器定位种子，用于识别「自动转移做种」把种子搬到别的下载器的情况。
+        self._locate_fn = locate_fn
         # 关闭监听手动删除时，仍清理本地失效任务，但不触发删种善后。
         self._manual_delete_enabled = manual_delete_enabled
         # 连续 miss 达阈值才判手动删除，避免下载器瞬断触发误删善后。
@@ -207,6 +211,7 @@ class DownloadMonitor:
         pending_miss_count = 0
         cleanup_count = 0
         removed_count = 0
+        transferred_count = 0
         triggered_subscribe_ids = set()
         for torrent_hash, task in list(torrents.items()):
             downloader = task.get("downloader")
@@ -284,6 +289,26 @@ class DownloadMonitor:
                 skipped_count += 1
                 continue
             subscribe = self._resolve_subscribe(task.get("subscribe_id"))
+            # 「自动转移做种」会把完成后的种子从原下载器搬到另一个下载器（如 qb → tr），
+            # 此时原下载器里已经查不到，但种子并未被用户删除。判定手动删除前先跨下载器找一遍，
+            # 找到就把记录指向新下载器并清零计数，避免写入删除指纹、回滚订阅、触发重复补搜。
+            if self._locate_fn:
+                located, conclusive = self._locate_fn(torrent_hash, downloader)
+                if located:
+                    if located != downloader and self._update_downloader(torrent_hash, located):
+                        logger.info(
+                            f"下载监控：种子 {self._format_torrent_desc(torrent_hash, task)} "
+                            f"已从 {downloader} 转移到 {located}（自动转移做种），"
+                            f"{self._format_task_subscribe_label(task)}，更新下载器并继续跟踪"
+                        )
+                    self._reset_missing(torrent_hash)
+                    transferred_count += 1
+                    continue
+                if not conclusive:
+                    # 有下载器取种子报错，无法确认种子是否真的被删除，本轮保守跳过
+                    unknown_present_count += 1
+                    skipped_count += 1
+                    continue
             if self._manual_delete_enabled and subscribe is not None and cleanup:
                 logger.info(
                     f"下载监控：种子 {self._format_torrent_desc(torrent_hash, task)} "
@@ -316,6 +341,7 @@ class DownloadMonitor:
         detail(
             f"下载监控：本轮检查 {total} 个下载任务，下载器中仍存在 {visible_count} 个，"
             f"{skip_detail}，已处理删除 {cleanup_count} 个，从订阅下载任务移除 {removed_count} 个"
+            + (f"，识别到已转移做种 {transferred_count} 个" if transferred_count else "")
         )
 
     def _format_task_subscribe_label(self, task: dict) -> str:
@@ -532,6 +558,23 @@ class DownloadMonitor:
                 task.pop("missing_count", None)
                 data[torrent_hash] = task
             return data
+
+    def _update_downloader(self, torrent_hash: str, downloader: str) -> bool:
+        """把种子记录指向实际所在的下载器（自动转移做种场景），返回是否发生变更。"""
+        changed = {"value": False}
+
+        def updater(data: dict) -> dict:
+            task = data.get(torrent_hash)
+            if not task:
+                return data
+            if task.get("downloader") != downloader:
+                task["downloader"] = downloader
+                data[torrent_hash] = task
+                changed["value"] = True
+            return data
+
+        self._update("torrents", updater)
+        return changed["value"]
 
         self._update("torrents", updater)
 
