@@ -14,7 +14,6 @@ from datetime import datetime
 from app.log import logger
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from app.chain.tmdb import TmdbChain
@@ -34,7 +33,7 @@ class BestVersionGuard(_PluginBase):
     plugin_name = "洗版守护"
     plugin_desc = "定时检查电视剧订阅：未完结的误标洗版自动取消，恢复普通订阅继续追更。"
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/bestversionguard.png"
-    plugin_version = "2.4.6"
+    plugin_version = "2.4.7"
     plugin_label = "订阅"
     plugin_author = "local"
     plugin_config_prefix = "bestversionguard_"
@@ -44,7 +43,7 @@ class BestVersionGuard(_PluginBase):
     _enabled = False
     _cron: str = "0 3 * * *"
     _notify: bool = True
-    _scheduler = None
+
     _subscribe_oper = None
     _fixed_count: int = 0
     _last_run: Optional[str] = None
@@ -67,10 +66,31 @@ class BestVersionGuard(_PluginBase):
         logger.info(f"初始化完成, enabled={self._enabled}, cron={self._cron}, "
                     f"已取消 {len(self._fixed_ids)} 条")
         if self._enabled:
-            self._schedule_service()
+            # 定时任务交由 MoviePilot 主调度器统一注册（见 get_service）
+            logger.info(f"定时检查将由主调度器注册: {self._cron}")
 
     def get_state(self) -> bool:
         return self._enabled
+
+    def get_service(self) -> List[Dict[str, Any]]:
+        """向 MoviePilot 主调度器注册定时检查服务（标准做法）。
+
+        此前用插件内自建的 BackgroundScheduler：插件重载后该线程会失效且不再恢复，
+        定时任务会静默停摆，因此改为标准 get_service()，由主调度器统一管理并自动恢复。
+        """
+        if not self._enabled or not self._cron:
+            return []
+        try:
+            trigger = CronTrigger.from_crontab(self._cron, timezone=settings.TZ)
+        except Exception as err:
+            logger.error(f"cron 表达式无效，未注册定时任务：{self._cron} - {err}")
+            return []
+        return [{
+            "id": f"{self.__class__.__name__}Check",
+            "name": "洗版守护检查",
+            "trigger": trigger,
+            "func": self._guard_check,
+        }]
 
     @staticmethod
     def get_command() -> List[Dict[str, Any]]:
@@ -203,24 +223,8 @@ class BestVersionGuard(_PluginBase):
         return page
 
     def stop_service(self) -> None:
-        if self._scheduler:
-            self._scheduler.shutdown(wait=False)
-            self._scheduler = None
-
-    # ── 定时服务 ──────────────────────────────────────────────
-
-    def _schedule_service(self) -> None:
-        if not self._scheduler:
-            self._scheduler = BackgroundScheduler(timezone=settings.TZ)
-            self._scheduler.start()
-        self._scheduler.remove_all_jobs()
-        self._scheduler.add_job(
-            func=self._guard_check,
-            trigger=CronTrigger.from_crontab(self._cron),
-            name="BestVersionGuard_check",
-            id="BestVersionGuard_check",
-        )
-        logger.info(f"定时检查已注册: {self._cron}")
+        # 定时任务已交由 MoviePilot 主调度器统一管理，无需在此手动清理
+        pass
 
     # ── 辅助方法 ──────────────────────────────────────────────
 
