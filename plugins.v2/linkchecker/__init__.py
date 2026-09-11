@@ -7,6 +7,7 @@
 
 import os
 import re
+import hashlib
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -27,7 +28,7 @@ class LinkChecker(_PluginBase):
     plugin_name = "硬链接检查"
     plugin_desc = "扫描下载目录和媒体库目录中的孤立硬链接文件，连续3天孤立自动删除。"
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/linkchecker.png"
-    plugin_version = "3.1.3"
+    plugin_version = "3.2.0"
     plugin_label = "文件管理"
     plugin_author = "local"
     plugin_config_prefix = "linkchecker_"
@@ -51,6 +52,10 @@ class LinkChecker(_PluginBase):
     _auto_delete: bool = False
     _delete_threshold: int = 3
     _notify: bool = False
+    # 是否允许删除媒体库侧的断开残留（默认关闭：媒体库那份通常是唯一副本）
+    _allow_library_delete: bool = False
+    # 曾经出现过硬链接（links>=2）的文件指纹，用于判断「曾经被硬链接过、如今已断开」
+    _linked_seen: set = None
     _scheduler = None
     _last_scan_time: Optional[str] = None
     _last_download_orphans: List[Dict[str, Any]] = []
@@ -74,9 +79,12 @@ class LinkChecker(_PluginBase):
         self._auto_delete = False
         self._delete_threshold = 3
         self._notify = False
+        self._allow_library_delete = False
+        self._linked_seen = set()
         # 加载持久化的跟踪记录
         saved = self.get_data("tracker") or {}
         self._orphan_tracker = saved.get("orphans", {})
+        self._linked_seen = set(saved.get("linked") or [])
         if not config:
             self._enabled = False
             return
@@ -94,9 +102,11 @@ class LinkChecker(_PluginBase):
         self._auto_delete = bool(config.get("auto_delete"))
         self._delete_threshold = int(config.get("delete_threshold") or 3)
         self._notify = bool(config.get("notify"))
+        self._allow_library_delete = bool(config.get("allow_library_delete"))
         logger.info(
             f"初始化完成, enabled={self._enabled}, cron={self._cron}, "
             f"auto_delete={self._auto_delete}, threshold={self._delete_threshold}, "
+            f"允许删媒体库残留={self._allow_library_delete}, 已记录硬链接指纹={len(self._linked_seen)}, "
             f"额外排除={len(self._exclude_dirs)} 项, 收容目录={self._relocate_dirs or '（按目录名兜底）'}"
         )
         if self._enabled and self._cron:
@@ -274,6 +284,24 @@ class LinkChecker(_PluginBase):
                             }
                         ],
                     },
+                    {
+                        "component": "VCol",
+                        "props": {"cols": 12},
+                        "content": [
+                            {
+                                "component": "VSwitch",
+                                "props": {
+                                    "model": "allow_library_delete",
+                                    "label": "允许删除媒体库侧的断开残留（默认关闭）",
+                                    "hint": (
+                                        "默认只清理下载侧：当硬链接断开且媒体库那份已不存在时，删除下载侧残留。"
+                                        "媒体库侧的断开残留默认只报告不删除（那份通常是唯一副本）。"
+                                    ),
+                                    "persistent-hint": True,
+                                },
+                            }
+                        ],
+                    },
                 ],
             }
         ], {
@@ -286,6 +314,7 @@ class LinkChecker(_PluginBase):
             "auto_delete": False,
             "delete_threshold": 3,
             "notify": False,
+            "allow_library_delete": False,
         }
 
     def get_page(self) -> Optional[List[dict]]:
@@ -499,24 +528,51 @@ class LinkChecker(_PluginBase):
 
     def _save_tracker(self) -> None:
         """持久化跟踪记录。"""
-        self.save_data("tracker", {"orphans": self._orphan_tracker})
+        self.save_data("tracker", {
+            "orphans": self._orphan_tracker,
+            "linked": sorted(self._linked_seen),
+        })
+
+    @staticmethod
+    def _path_key(path: str) -> str:
+        """路径指纹：用于记录「曾经被硬链接过」的文件，避免持久化超长路径列表。"""
+        return hashlib.md5(str(path).encode("utf-8", errors="ignore")).hexdigest()[:20]
 
     def _do_scan(self) -> None:
-        """执行扫描：重新扫描目录，按天更新跟踪记录，达到阈值自动删除。"""
+        """执行扫描：找出「曾经被硬链接、如今只剩一份」的文件，按天计数并在达阈值后处置。
+
+        判定要点（2026-09-11 重做）：
+        - 只有 links 曾经 ≥2（说明下载侧与媒体库侧曾经同时存在）而现在 =1 的文件才算「断开残留」；
+          从未被硬链接过的文件（移动入库、独立文件等）一律不处理，避免把媒体库正常文件当残留删除。
+        - 媒体库侧默认只报告不删除（那份通常是唯一副本），除非显式开启「允许删除媒体库残留」。
+        - 下载侧的删除仍受「自动删除」开关与阈值控制。
+        """
         self._last_download_orphans = []
         self._last_library_orphans = []
         self._last_deleted = 0
 
-        # 重新扫描
-        dl_orphans = self._scan_dirs(self._download_dirs)
-        lib_orphans = self._scan_dirs(self._library_dirs)
+        # 扫描两侧全部视频文件（含硬链接），用于建立/更新「曾经硬链接」历史
+        all_dl = self._scan_files(self._download_dirs)
+        all_lib = self._scan_files(self._library_dirs)
+        dl_prefixes = tuple(d.rstrip("/") + "/" for d in self._download_dirs)
 
-        # 收集本次所有孤立文件路径
         current_paths: set = set()
-        for f in dl_orphans:
-            current_paths.add(f["_path"])
-        for f in lib_orphans:
-            current_paths.add(f["_path"])
+        download_side: set = set()
+        for f in all_dl + all_lib:
+            path = f["_path"]
+            key = self._path_key(path)
+            if int(f.get("_nlink") or 1) >= 2:
+                # 当前仍是硬链接：记入历史，供以后判断是否断开
+                self._linked_seen.add(key)
+                continue
+            if key in self._linked_seen:
+                current_paths.add(path)
+                if dl_prefixes and path.startswith(dl_prefixes):
+                    download_side.add(path)
+
+        # 展示列表：只列断开残留（下载侧与媒体库侧分开）
+        dl_orphans = [f for f in all_dl if f["_path"] in download_side]
+        lib_orphans = [f for f in all_lib if f["_path"] in current_paths and f["_path"] not in download_side]
 
         # 按天计数：同一天多次扫描只算一次
         today = datetime.now().strftime("%Y-%m-%d")
@@ -541,10 +597,15 @@ class LinkChecker(_PluginBase):
 
         # 检查是否达到删除阈值
         to_delete: List[str] = []
-        if self._auto_delete:
-            for path, days in self._orphan_tracker.items():
-                if days >= self._delete_threshold:
+        for path, days in self._orphan_tracker.items():
+            if days < self._delete_threshold:
+                continue
+            if path in download_side:
+                if self._auto_delete:
                     to_delete.append(path)
+            elif self._allow_library_delete:
+                # 媒体库侧默认只报告；开启后才会删除（那份通常是唯一副本，谨慎）
+                to_delete.append(path)
 
         # 删除达到阈值的文件
         for path in to_delete:
@@ -696,8 +757,12 @@ class LinkChecker(_PluginBase):
         parts = {part.strip().lower() for part in Path(filepath).parts}
         return bool(parts & self._RELOCATE_DIR_NAMES)
 
-    def _scan_dirs(self, dirs: List[str]) -> List[Dict[str, Any]]:
-        """扫描目录，返回孤立文件列表。"""
+    def _scan_files(self, dirs: List[str]) -> List[Dict[str, Any]]:
+        """扫描目录下所有视频文件（含硬链接），返回文件信息与链接数。
+
+        与旧版不同：这里不过滤 links，保留链接数 ≥2 的文件，用于判断「曾经被硬链接过」——
+        只有曾经是硬链接、现在链接数为 1（说明另一侧已被删除）的文件才进入清理候选。
+        """
         results: List[Dict[str, Any]] = []
         for base_dir in dirs:
             if not os.path.isdir(base_dir):
@@ -714,8 +779,6 @@ class LinkChecker(_PluginBase):
                         stat = os.stat(fpath)
                     except OSError:
                         continue
-                    if stat.st_nlink != 1:
-                        continue
                     results.append({
                         "dir_path": root,
                         "file_name": fname,
@@ -725,9 +788,14 @@ class LinkChecker(_PluginBase):
                         "media_info": self._extract_media_info(fpath),
                         "_path": fpath,
                         "_size": stat.st_size,
+                        "_nlink": int(stat.st_nlink),
                     })
         results.sort(key=lambda x: (x["dir_path"], x["file_name"]))
         return results
+
+    def _scan_dirs(self, dirs: List[str]) -> List[Dict[str, Any]]:
+        """扫描目录，返回链接数为 1（即两侧只剩一份）的视频文件。"""
+        return [f for f in self._scan_files(dirs) if f.get("_nlink", 1) == 1]
 
     def _extract_media_info(self, filepath: str) -> str:
         """从文件路径提取详细媒体信息。"""
