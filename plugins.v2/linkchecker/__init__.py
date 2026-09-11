@@ -3,10 +3,15 @@
 扫描下载目录和媒体库目录，找出 links=1 的孤立视频文件。
 每次扫描重新检查，不依赖历史记录。
 同一文件连续 3 次扫描都出现在孤立列表中 → 自动删除。
+
+另附「空壳目录」清理：媒体库里只剩 nfo/海报/字幕、没有任何视频的季目录或剧目录，
+可按配置在出现后直接删除（媒体库维护，与硬链接判定无关）。
 """
 
 import os
 import re
+import time
+import shutil
 import hashlib
 from datetime import datetime
 from pathlib import Path
@@ -25,9 +30,9 @@ class LinkChecker(_PluginBase):
     """硬链接孤立文件检查插件。"""
 
     plugin_name = "硬链接检查"
-    plugin_desc = "扫描下载目录和媒体库目录中的孤立硬链接文件，连续3天孤立自动删除。"
+    plugin_desc = "扫描下载目录和媒体库目录中的孤立硬链接文件，连续3天孤立自动删除；并可清理只剩元数据、没有视频的空壳季目录/剧目录。"
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/linkchecker.png"
-    plugin_version = "3.2.1"
+    plugin_version = "3.3.0"
     plugin_label = "文件管理"
     plugin_author = "local"
     plugin_config_prefix = "linkchecker_"
@@ -35,6 +40,26 @@ class LinkChecker(_PluginBase):
     auth_level = 1
 
     _VIDEO_EXTS = {".mkv", ".mp4", ".ts", ".avi", ".m2ts", ".mov", ".wmv", ".flv", ".webm", ".m4v"}
+
+    # 空壳目录判据：目录下所有文件的扩展名都落在本白名单内（元数据/字幕/字体/校验文件）才算「只剩壳」。
+    # 采用白名单而不是黑名单：只要出现任何视频、音频或未知类型文件，就不认为是空壳，避免误删有实体内容的目录。
+    _META_EXTS = {
+        ".nfo", ".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp",
+        ".srt", ".ass", ".ssa", ".sub", ".idx", ".sup", ".vtt",
+        ".ttf", ".otf", ".xml", ".sfv", ".txt", ".log", ".url", ".db",
+    }
+    # 影视条目标识文件名：目录内出现任一即认为该目录是「剧/电影条目目录」，而不是分类目录。
+    _MEDIA_MARKER_FILES = {
+        "tvshow.nfo", "movie.nfo", "poster.jpg", "folder.jpg", "fanart.jpg", "backdrop.jpg",
+    }
+    # 季目录名特征（小写、整名匹配），如 Season 1 / S01 / Specials / 第1季 / OVA。
+    _SEASON_DIR_PATTERNS = (
+        r"^season\s*\d+$",
+        r"^s\d{1,2}$",
+        r"^specials?$",
+        r"^第\s*\d+\s*季$",
+        r"^ova$",
+    )
 
     # 常见收容目录名：路径中任意一层目录名命中即跳过扫描。
     # 收容目录里的种子通常 links=1、且媒体库侧没有对应 inode，天然符合「孤立」判定，
@@ -64,6 +89,18 @@ class LinkChecker(_PluginBase):
     _last_scan_date: str = ""
     # 本次扫描删除的文件数
     _last_deleted: int = 0
+    # 是否清理空壳目录（独立开关，默认关闭，公开给他人使用时需显式开启）
+    _clean_empty_dirs: bool = False
+    # 空壳目录删除阈值（按天计，默认 1 = 出现即清理）
+    _empty_dir_days: int = 1
+    # 空壳目录静置小时数：目录内最新文件距今不足该时长则跳过，避免误删正在整理写入的目录
+    _empty_dir_grace_hours: int = 24
+    # 空壳目录跟踪记录：目录路径 → 连续出现天数
+    _empty_tracker: Dict[str, int] = {}
+    # 本次扫描识别到的空壳目录（未删除的）
+    _last_empty_dirs: List[Dict[str, Any]] = []
+    # 本次扫描删除的空壳目录数
+    _last_deleted_dirs: int = 0
 
     def init_plugin(self, config: dict = None) -> None:
         """根据插件配置初始化运行状态。"""
@@ -79,10 +116,17 @@ class LinkChecker(_PluginBase):
         self._notify = False
         self._allow_library_delete = False
         self._linked_seen = set()
+        self._clean_empty_dirs = False
+        self._empty_dir_days = 1
+        self._empty_dir_grace_hours = 24
+        self._empty_tracker = {}
+        self._last_empty_dirs = []
+        self._last_deleted_dirs = 0
         # 加载持久化的跟踪记录
         saved = self.get_data("tracker") or {}
         self._orphan_tracker = saved.get("orphans", {})
         self._linked_seen = set(saved.get("linked") or [])
+        self._empty_tracker = dict(saved.get("empty") or {})
         if not config:
             self._enabled = False
             return
@@ -101,10 +145,28 @@ class LinkChecker(_PluginBase):
         self._delete_threshold = int(config.get("delete_threshold") or 3)
         self._notify = bool(config.get("notify"))
         self._allow_library_delete = bool(config.get("allow_library_delete"))
+        self._clean_empty_dirs = bool(config.get("clean_empty_dirs"))
+        # 配置缺省值不能用 `or 默认值`：键未提交时应回落到默认值，而不是被当成 0
+        raw_days = config.get("empty_dir_days")
+        try:
+            self._empty_dir_days = int(raw_days) if raw_days not in (None, "") else 1
+        except (TypeError, ValueError):
+            self._empty_dir_days = 1
+        if self._empty_dir_days < 1:
+            self._empty_dir_days = 1
+        raw_grace = config.get("empty_dir_grace_hours")
+        try:
+            self._empty_dir_grace_hours = int(raw_grace) if raw_grace not in (None, "") else 24
+        except (TypeError, ValueError):
+            self._empty_dir_grace_hours = 24
+        if self._empty_dir_grace_hours < 0:
+            self._empty_dir_grace_hours = 0
         logger.info(
             f"初始化完成, enabled={self._enabled}, cron={self._cron}, "
             f"auto_delete={self._auto_delete}, threshold={self._delete_threshold}, "
             f"允许删媒体库残留={self._allow_library_delete}, 已记录硬链接指纹={len(self._linked_seen)}, "
+            f"清理空壳目录={self._clean_empty_dirs}(阈值{self._empty_dir_days}天/静置{self._empty_dir_grace_hours}小时), "
+            f"跟踪空壳目录={len(self._empty_tracker)}, "
             f"额外排除={len(self._exclude_dirs)} 项, 收容目录={self._relocate_dirs or '（按目录名兜底）'}"
         )
         if self._enabled and self._cron:
@@ -172,6 +234,13 @@ class LinkChecker(_PluginBase):
                 "methods": ["GET"],
                 "auth": "bear",
                 "summary": "重置跟踪记录",
+            },
+            {
+                "path": "/clean_empty",
+                "endpoint": self._api_clean_empty,
+                "methods": ["GET"],
+                "auth": "bear",
+                "summary": "手动清理识别到的空壳目录",
             },
         ]
 
@@ -322,6 +391,55 @@ class LinkChecker(_PluginBase):
                             }
                         ],
                     },
+                    {
+                        "component": "VCol",
+                        "props": {"cols": 12},
+                        "content": [
+                            {
+                                "component": "VSwitch",
+                                "props": {
+                                    "model": "clean_empty_dirs",
+                                    "label": "清理空壳目录（媒体库里只剩 nfo/海报、没有视频的季/剧目录，默认关闭）",
+                                    "hint": (
+                                        "只扫媒体库目录：目录下所有文件都是元数据/字幕（nfo/jpg/srt 等），"
+                                        "且能识别为剧集或电影条目目录时才判为空壳，分类目录（国漫/国产剧等）不受影响；"
+                                        "目录内最新文件距今不足「空壳静置小时数」的会跳过，避免整理写入中被误删。"
+                                    ),
+                                    "persistent-hint": True,
+                                },
+                            }
+                        ],
+                    },
+                    {
+                        "component": "VCol",
+                        "props": {"cols": 12},
+                        "content": [
+                            {
+                                "component": "VTextField",
+                                "props": {
+                                    "model": "empty_dir_days",
+                                    "label": "空壳目录清理阈值（连续天数，默认 1 = 出现即清理）",
+                                    "placeholder": "1",
+                                    "type": "number",
+                                },
+                            }
+                        ],
+                    },
+                    {
+                        "component": "VCol",
+                        "props": {"cols": 12},
+                        "content": [
+                            {
+                                "component": "VTextField",
+                                "props": {
+                                    "model": "empty_dir_grace_hours",
+                                    "label": "空壳静置小时数（目录内最新文件距今不足该时长则跳过，默认 24）",
+                                    "placeholder": "24",
+                                    "type": "number",
+                                },
+                            }
+                        ],
+                    },
                 ],
             }
         ], {
@@ -335,6 +453,9 @@ class LinkChecker(_PluginBase):
             "delete_threshold": 3,
             "notify": False,
             "allow_library_delete": False,
+            "clean_empty_dirs": False,
+            "empty_dir_days": 1,
+            "empty_dir_grace_hours": 24,
         }
 
     def get_page(self) -> Optional[List[dict]]:
@@ -348,6 +469,7 @@ class LinkChecker(_PluginBase):
         dl_size = self._format_size(sum(f.get("_size", 0) for f in self._last_download_orphans))
         lib_size = self._format_size(sum(f.get("_size", 0) for f in self._last_library_orphans))
         tracking_count = len(self._orphan_tracker)
+        empty_count = len(self._last_empty_dirs)
 
         page = [
             {
@@ -401,6 +523,24 @@ class LinkChecker(_PluginBase):
                                                     "type": "info",
                                                     "text": f"跟踪中: {tracking_count} 个文件",
                                                     "variant": "tonal",
+                                                },
+                                            }
+                                        ],
+                                    },
+                                    {
+                                        "component": "VCol",
+                                        "props": {"cols": 12},
+                                        "content": [
+                                            {
+                                                "component": "VAlert",
+                                                "props": {
+                                                    "type": "warning" if empty_count else "success",
+                                                    "variant": "tonal",
+                                                    "text": (
+                                                        f"空壳目录: {empty_count} 个（本次已删除 {self._last_deleted_dirs} 个，"
+                                                        f"清理开关: {'开' if self._clean_empty_dirs else '关'}，"
+                                                        f"阈值 {self._empty_dir_days} 天，静置 {self._empty_dir_grace_hours} 小时）"
+                                                    ),
                                                 },
                                             }
                                         ],
@@ -460,6 +600,18 @@ class LinkChecker(_PluginBase):
                                     }
                                 },
                             },
+                            {
+                                "component": "VBtn",
+                                "props": {"color": "warning", "variant": "outlined", "disabled": empty_count == 0},
+                                "text": "清理空壳目录",
+                                "events": {
+                                    "click": {
+                                        "api": "plugin/LinkChecker/clean_empty",
+                                        "method": "get",
+                                        "params": {"apikey": settings.API_TOKEN},
+                                    }
+                                },
+                            },
                         ],
                     },
                 ],
@@ -471,6 +623,9 @@ class LinkChecker(_PluginBase):
 
         if self._last_library_orphans:
             page.append(self._build_table_card("媒体库孤立文件", self._last_library_orphans))
+
+        if self._last_empty_dirs:
+            page.append(self._build_empty_dir_card(self._last_empty_dirs))
 
         return page
 
@@ -514,6 +669,45 @@ class LinkChecker(_PluginBase):
             ],
         }
 
+    def _build_empty_dir_card(self, items: List[Dict[str, Any]]) -> dict:
+        """构建空壳目录列表卡片。"""
+        list_items = []
+        for item in items[:100]:
+            count = item.get("_track_count", 0)
+            count_str = f" [连续{count}天]" if count > 1 else ""
+            list_items.append({
+                "component": "VListItem",
+                "content": [
+                    {
+                        "component": "VListItemTitle",
+                        "text": f"{item['dir_name']}{count_str}",
+                    },
+                    {
+                        "component": "VListItemSubtitle",
+                        "text": (
+                            f"{item['dir_path']} | 剩余元数据文件 {item['file_count']} 个 "
+                            f"| 最新更新 {item['mtime']}"
+                        ),
+                    },
+                ],
+            })
+        return {
+            "component": "VCard",
+            "content": [
+                {"component": "VCardTitle", "props": {"title": f"空壳目录 ({len(items)} 个)"}},
+                {
+                    "component": "VCardText",
+                    "content": [
+                        {
+                            "component": "VList",
+                            "props": {"dense": True},
+                            "content": list_items,
+                        }
+                    ],
+                },
+            ],
+        }
+
     def stop_service(self) -> None:
         """停止插件后台服务并释放资源。"""
         # 定时任务已交由 MoviePilot 主调度器统一管理，无需在此手动清理
@@ -524,7 +718,12 @@ class LinkChecker(_PluginBase):
         logger.info("定时扫描开始")
         self._do_scan()
         total = len(self._last_download_orphans) + len(self._last_library_orphans)
-        if self._notify and (total > 0 or self._last_deleted > 0):
+        if self._notify and (
+            total > 0
+            or self._last_deleted > 0
+            or self._last_empty_dirs
+            or self._last_deleted_dirs > 0
+        ):
             self._send_notify()
 
     # ── 核心逻辑 ──────────────────────────────────────────────
@@ -534,6 +733,7 @@ class LinkChecker(_PluginBase):
         self.save_data("tracker", {
             "orphans": self._orphan_tracker,
             "linked": sorted(self._linked_seen),
+            "empty": self._empty_tracker,
         })
 
     @staticmethod
@@ -621,6 +821,9 @@ class LinkChecker(_PluginBase):
             except OSError as e:
                 logger.info(f"自动删除失败: {path} - {e}")
 
+        # 空壳目录清理（媒体库维护，独立开关与阈值）
+        self._scan_empty_dirs(is_new_day)
+
         self._save_tracker()
 
         # 过滤掉已删除的文件，构建展示列表
@@ -639,7 +842,8 @@ class LinkChecker(_PluginBase):
         lib = len(self._last_library_orphans)
         logger.info(
             f"扫描完成: 下载目录 {dl} 个, 媒体库 {lib} 个, "
-            f"自动删除 {self._last_deleted} 个, 跟踪 {len(self._orphan_tracker)} 个"
+            f"自动删除 {self._last_deleted} 个, 跟踪 {len(self._orphan_tracker)} 个, "
+            f"空壳目录 {len(self._last_empty_dirs)} 个(本轮删除 {self._last_deleted_dirs} 个)"
         )
 
     def _do_clean(self, target: str) -> int:
@@ -666,6 +870,168 @@ class LinkChecker(_PluginBase):
         logger.info(f"手动清理完成: {deleted} 个文件")
         return deleted
 
+    def _scan_empty_dirs(self, is_new_day: bool) -> None:
+        """扫描媒体库空壳目录并按配置清理（独立开关，默认关闭）。
+
+        空壳目录 = 目录下只剩元数据/字幕文件、没有任何视频的季目录或剧目录。
+        与硬链接判定无关，属媒体库维护：视频被删除或转移后目录里可能只剩 nfo/海报，
+        媒体服务器仍会把它显示成剧集条目，因此需要清掉。
+        安全边界：只扫媒体库目录；全部文件必须命中元数据白名单；必须能识别为影视条目目录；
+        目录内最新文件需静置足够久；忽略/排除/收容目录一律跳过。
+        """
+        self._last_empty_dirs = []
+        self._last_deleted_dirs = 0
+        if not self._clean_empty_dirs or not self._library_dirs:
+            self._empty_tracker = {}
+            return
+
+        candidates: Dict[str, Dict[str, Any]] = {}
+        for base_dir in self._library_dirs:
+            if not os.path.isdir(base_dir):
+                continue
+            base_abs = os.path.abspath(base_dir)
+            for root, dirnames, _ in os.walk(base_abs):
+                # 排除被忽略/额外排除/收容的目录及其子树
+                dirnames[:] = [
+                    d for d in dirnames
+                    if not self._is_ignored(os.path.join(root, d) + os.sep)
+                ]
+                if os.path.abspath(root) == base_abs:
+                    continue
+                info = self._empty_dir_candidate(root)
+                if info:
+                    candidates[root] = info
+
+        current = set(candidates.keys())
+        if is_new_day:
+            # 新的一天：本次仍存在的 +1，消失的清零
+            for path in list(self._empty_tracker.keys()):
+                if path in current:
+                    self._empty_tracker[path] += 1
+                else:
+                    del self._empty_tracker[path]
+            for path in current:
+                self._empty_tracker.setdefault(path, 1)
+        else:
+            for path in current:
+                self._empty_tracker.setdefault(path, 1)
+
+        to_delete = [
+            path for path, days in self._empty_tracker.items()
+            if days >= self._empty_dir_days
+        ]
+        # 按路径深度倒序：先删季目录，再删已变空的剧目录
+        for path in sorted(to_delete, key=lambda p: len(Path(p).parts), reverse=True):
+            if not os.path.isdir(path):
+                self._empty_tracker.pop(path, None)
+                continue
+            days = self._empty_tracker.get(path, 0)
+            try:
+                shutil.rmtree(path)
+                self._last_deleted_dirs += 1
+                logger.info(f"删除空壳目录(连续{days}天): {path}")
+            except OSError as e:
+                logger.info(f"删除空壳目录失败: {path} - {e}")
+            self._empty_tracker.pop(path, None)
+
+        self._last_empty_dirs = sorted(
+            [
+                {**info, "_track_count": self._empty_tracker.get(path, 0)}
+                for path, info in candidates.items()
+                if path in self._empty_tracker
+            ],
+            key=lambda x: x["dir_path"],
+        )
+        if candidates or self._last_deleted_dirs:
+            logger.info(
+                f"空壳目录检查: 识别 {len(candidates)} 个, 本轮删除 {self._last_deleted_dirs} 个, "
+                f"跟踪 {len(self._empty_tracker)} 个"
+            )
+
+    def _empty_dir_candidate(self, root: str) -> Optional[Dict[str, Any]]:
+        """判断目录是否为空壳目录，是则返回展示信息，否则返回 None。"""
+        newest = 0.0
+        file_count = 0
+        has_marker = False
+        for cur, dirnames, filenames in os.walk(root):
+            dirnames[:] = [
+                d for d in dirnames
+                if not self._is_ignored(os.path.join(cur, d) + os.sep)
+            ]
+            for fname in filenames:
+                fpath = os.path.join(cur, fname)
+                if self._is_ignored(fpath):
+                    continue
+                ext = os.path.splitext(fname)[1].lower()
+                if not ext:
+                    if fname.startswith("."):
+                        # 系统隐藏文件（如 .DS_Store）不影响空壳判定
+                        continue
+                    return None
+                if ext not in self._META_EXTS:
+                    # 存在视频、音频或未知类型文件 → 不是空壳
+                    return None
+                file_count += 1
+                lower = fname.lower()
+                if lower in self._MEDIA_MARKER_FILES or lower.startswith("season"):
+                    has_marker = True
+                try:
+                    mtime = os.stat(fpath).st_mtime
+                except OSError:
+                    continue
+                if mtime > newest:
+                    newest = mtime
+        if file_count <= 0:
+            # 全空目录不处理：可能是整理过程中的中间态
+            return None
+        if not has_marker and not self._looks_like_media_dir(root):
+            # 分类目录（国漫/国产剧/欧美剧等）没有条目标识文件，也不会命中季/年份命名，直接跳过
+            return None
+        if self._empty_dir_grace_hours > 0 and newest:
+            if (time.time() - newest) < self._empty_dir_grace_hours * 3600:
+                # 目录仍在写入/整理中，等静置足够久再处理
+                return None
+        return {
+            "dir_path": root,
+            "dir_name": os.path.basename(root.rstrip("/\\")) or root,
+            "file_count": file_count,
+            "mtime": datetime.fromtimestamp(newest).strftime("%Y-%m-%d %H:%M") if newest else "未知",
+        }
+
+    def _looks_like_media_dir(self, path: str) -> bool:
+        """按目录名判断是否像影视条目目录（季目录或带年份的剧/电影目录）。"""
+        name = os.path.basename(path.rstrip("/\\"))
+        lowered = name.lower()
+        for pattern in self._SEASON_DIR_PATTERNS:
+            if re.match(pattern, lowered):
+                return True
+        # 剧名/片名通常带年份，如「恶魔法则 (2023)」「Some.Movie.2024」
+        return bool(re.search(r"(19|20)\d{2}", name))
+
+    def _do_clean_empty(self) -> int:
+        """手动删除本次识别到的空壳目录，返回删除数量。"""
+        deleted = 0
+        for info in sorted(
+            self._last_empty_dirs,
+            key=lambda x: len(Path(x["dir_path"]).parts),
+            reverse=True,
+        ):
+            path = info["dir_path"]
+            if not os.path.isdir(path):
+                self._empty_tracker.pop(path, None)
+                continue
+            try:
+                shutil.rmtree(path)
+                deleted += 1
+                logger.info(f"手动删除空壳目录: {path}")
+            except OSError as e:
+                logger.info(f"删除空壳目录失败: {path} - {e}")
+            self._empty_tracker.pop(path, None)
+        self._last_empty_dirs = []
+        self._last_deleted_dirs += deleted
+        self._save_tracker()
+        return deleted
+
     def _send_notify(self) -> None:
         """发送通知。"""
         dl = len(self._last_download_orphans)
@@ -679,6 +1045,11 @@ class LinkChecker(_PluginBase):
             parts.append(f"媒体库孤立: {lib} 个 ({lib_size})")
         if self._last_deleted > 0:
             parts.append(f"自动删除: {self._last_deleted} 个")
+        if self._last_deleted_dirs > 0:
+            parts.append(f"删除空壳目录: {self._last_deleted_dirs} 个")
+        empty = len(self._last_empty_dirs)
+        if empty > 0:
+            parts.append(f"空壳目录待处理: {empty} 个（开关{'已开启' if self._clean_empty_dirs else '未开启'}）")
         if parts:
             self.post_message(title="硬链接检查", text="\n".join(parts))
 
@@ -694,7 +1065,14 @@ class LinkChecker(_PluginBase):
             "library_count": len(self._last_library_orphans),
             "deleted": self._last_deleted,
             "tracking": len(self._orphan_tracker),
+            "empty_dir_count": len(self._last_empty_dirs),
+            "empty_dir_deleted": self._last_deleted_dirs,
         }
+
+    async def _api_clean_empty(self, apikey: str = "") -> Dict[str, Any]:
+        """API: 手动清理识别到的空壳目录。"""
+        deleted = self._do_clean_empty()
+        return {"success": True, "deleted": deleted}
 
     async def _api_clean(self, target: str = "all", apikey: str = "") -> Dict[str, Any]:
         """API: 手动清理。"""
