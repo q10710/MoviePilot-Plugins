@@ -5,7 +5,7 @@
 **MoviePilot V2 / V3 自用插件仓库**
 
 [![MoviePilot](https://img.shields.io/badge/MoviePilot-V2%20%7C%20V3-1f6feb?style=flat-square&logo=appveyor&logoColor=white)](https://github.com/jxxghp/MoviePilot)
-[![Plugins](https://img.shields.io/badge/插件-9%20个-3fb950?style=flat-square)](#插件清单)
+[![Plugins](https://img.shields.io/badge/插件-10%20个-3fb950?style=flat-square)](#插件清单)
 [![Author](https://img.shields.io/badge/作者-Q-8957e5?style=flat-square)](https://github.com/q10710)
 [![Last Commit](https://img.shields.io/github/last-commit/q10710/MoviePilot-Plugins?style=flat-square&color=8b949e)](https://github.com/q10710/MoviePilot-Plugins/commits/main)
 
