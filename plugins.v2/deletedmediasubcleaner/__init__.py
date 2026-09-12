@@ -43,7 +43,7 @@ class DeletedMediaSubCleaner(_PluginBase):
                    "连续达到宽限天数后按配置清理该订阅。")
     plugin_icon = ("https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/"
                    "main/icons/deletedmediasubcleaner.png")
-    plugin_version = "1.0.2"
+    plugin_version = "1.0.3"
     plugin_label = "订阅"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -432,6 +432,24 @@ class DeletedMediaSubCleaner(_PluginBase):
             logger.info(f"首次运行，已建立媒体库基线快照（{len(current)} 个条目），本轮不做判定")
             return
 
+        # 采集骤降保护（第二道安全门）：条目数明显少于上轮快照时，视为媒体服务器同步/分页异常，
+        # 本轮只刷新基线、不做消失判定与天数推进，避免把整批正常条目误判为「已删除」
+        prev_count = len(snapshot)
+        current_count = len(current)
+        if prev_count and (prev_count - current_count) >= max(5, int(prev_count * 0.1)):
+            self.save_data(DATA_SNAPSHOT, current)
+            state.update({
+                "last_run": now.strftime("%Y-%m-%d %H:%M:%S"),
+                "library_count": current_count,
+                "baseline": False,
+            })
+            self.save_data(DATA_STATE, state)
+            logger.warning(
+                f"媒体库条目数骤降（{prev_count} -> {current_count}），"
+                "本轮跳过消失判定以避免误判"
+            )
+            return
+
         # 新增的缺失项
         disappeared = [key for key in snapshot if key not in current]
         for key in disappeared:
@@ -526,11 +544,11 @@ class DeletedMediaSubCleaner(_PluginBase):
             try:
                 libraries = self._media_chain.librarys(server=name)
             except Exception as err:
-                logger.error(f"获取媒体服务器 {name} 媒体库失败：{err}")
-                continue
+                logger.error(f"获取媒体服务器 {name} 媒体库失败，本轮中止以避免误判：{err}")
+                return None
             if libraries is None:
-                logger.warning(f"媒体服务器 {name} 未返回媒体库列表，跳过该服务器")
-                continue
+                logger.error(f"媒体服务器 {name} 未返回媒体库列表，本轮中止以避免误判")
+                return None
             success_servers += 1
             for library in libraries:
                 if library.type not in self._media_types:
