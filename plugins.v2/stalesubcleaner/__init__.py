@@ -23,7 +23,7 @@ class StaleSubCleaner(_PluginBase):
     plugin_name = "过期订阅清理Q自用版"
     plugin_desc = "检查电视剧订阅，超过指定天数未下载新剧集则自动取消订阅。"
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/stalesubcleaner.png"
-    plugin_version = "1.1.6"
+    plugin_version = "1.1.7"
     plugin_label = "订阅"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -287,7 +287,11 @@ class StaleSubCleaner(_PluginBase):
                 continue
 
             # 获取该订阅的最后下载时间
-            last_download = self._get_last_download_time(sub.tmdbid, sub.season)
+            identity = self._resolve_media_identity(sub)
+            if not identity:
+                logger.info(f"跳过订阅（无法解析媒体身份）: {sub.name} S{sub.season}")
+                continue
+            last_download = self._get_last_download_time(identity[0], identity[1], sub.season)
 
             if last_download is None:
                 # 从未下载过，用订阅创建时间
@@ -341,11 +345,30 @@ class StaleSubCleaner(_PluginBase):
                 text=f"已取消过期订阅: {names}{suffix}",
             )
 
-    def _get_last_download_time(self, tmdbid: int, season: int) -> Optional[datetime]:
-        """获取指定订阅的最后一次下载时间。"""
+    @staticmethod
+    def _resolve_media_identity(sub: Any) -> Optional[Tuple[str, str]]:
+        """解析订阅的媒体身份（media_source + media_id），兼容旧版 tmdbid 字段。
+
+        新版 MoviePilot 的 Subscribe 已移除 tmdbid，改用 media_source + media_id；
+        旧字段仅作兜底，两者都取不到时返回 None，由调用方跳过该订阅。
+        """
+        media_source = getattr(sub, "media_source", None)
+        if media_source is not None:
+            media_source = str(getattr(media_source, "value", media_source) or "").strip().lower()
+        media_id = getattr(sub, "media_id", None)
+        if media_source and media_id:
+            return media_source, str(media_id).strip()
+        legacy = getattr(sub, "tmdbid", None)
+        if legacy:
+            return "themoviedb", str(legacy)
+        return None
+
+    def _get_last_download_time(self, media_source: str, media_id: str,
+                               season: int) -> Optional[datetime]:
+        """按媒体身份获取指定订阅的最后一次下载时间（按季过滤）。"""
         try:
-            records = self._download_oper.get_by_type_tmdbid(
-                tmdbid=tmdbid, mtype=MediaType.TV.value
+            records = self._download_oper.get_by_media_identity(
+                media_source=media_source, media_id=str(media_id)
             )
             if not records:
                 return None
@@ -356,14 +379,19 @@ class StaleSubCleaner(_PluginBase):
             for r in records:
                 # 按季过滤
                 r_season = getattr(r, 'season', None) or getattr(r, 'seasons', None)
-                if r_season is not None and r_season != season:
-                    continue
+                if r_season:
+                    season_text = str(r_season).upper()
+                    if season is not None and (
+                        f"S{int(season):02d}" not in season_text
+                        and f"S{season}" not in season_text
+                    ):
+                        continue
                 r_time = self._parse_time(getattr(r, 'date', None))
                 if r_time and (latest is None or r_time > latest):
                     latest = r_time
             return latest
         except Exception as e:
-            logger.debug(f"查询下载记录失败: tmdbid={tmdbid} S{season} - {e}")
+            logger.debug(f"查询下载记录失败: {media_source}:{media_id} S{season} - {e}")
         return None
 
     @staticmethod
