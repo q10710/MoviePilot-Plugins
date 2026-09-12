@@ -5,7 +5,7 @@
 **MoviePilot V2 / V3 自用插件仓库**
 
 [![MoviePilot](https://img.shields.io/badge/MoviePilot-V2%20%7C%20V3-1f6feb?style=flat-square&logo=appveyor&logoColor=white)](https://github.com/jxxghp/MoviePilot)
-[![Plugins](https://img.shields.io/badge/插件-10%20个-3fb950?style=flat-square)](#插件清单)
+[![Plugins](https://img.shields.io/badge/插件-9%20个-3fb950?style=flat-square)](#插件清单)
 [![Author](https://img.shields.io/badge/作者-Q-8957e5?style=flat-square)](https://github.com/q10710)
 [![Last Commit](https://img.shields.io/github/last-commit/q10710/MoviePilot-Plugins?style=flat-square&color=8b949e)](https://github.com/q10710/MoviePilot-Plugins/commits/main)
 
@@ -30,7 +30,6 @@
 | 🎬 | **洗版守护Q自用版** | 未完结却被误标洗版的订阅自动取消洗版；媒体库文件丢失时自动重置订阅重新下载 | 自建 |
 | 🧹 | **过期订阅清理Q自用版** | 订阅超过设定天数未下载到新剧集时自动取消 | 自建 |
 | 🗑️ | **删档订阅清理Q自用版** | 媒体库条目被删除而订阅仍在、长期不下载时，按配置清理该订阅 | 自建 |
-| 👤 | **渠道用户自动建号Q自用版** | 其他渠道账号首次发消息时，自动按渠道 userid 创建 MoviePilot 普通用户并完成绑定，使其能正常使用查询、搜索、订阅 | 自建 |
 
 > 插件显示名统一为「原名 + Q自用版」，作者统一为 `Q`，**插件 ID 保持不变**，因此升级不会影响已有配置与数据。
 
