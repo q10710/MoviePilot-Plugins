@@ -760,21 +760,29 @@ class SubscriptionCleanup:
 
         判据：文件修改时间晚于清理事务创建时间。旧文件必然早于快照建立时间，因此不会误伤；
         取不到时间（远端存储、文件不存在）时返回 False，保持原有删除行为。
+        目录（整包/原盘整理产物）不做该判断：目录修改时间会被后续写入刷新，据此跳过会漏清旧版本。
         """
         created_at = (task or {}).get("time")
         if not isinstance(created_at, (int, float)):
             return False
         path = SubscriptionCleanup._fileitem_path(fileitem)
-        modify_time = fileitem.get("modify_time") if isinstance(fileitem, dict) else None
         newest = None
         if path:
             try:
-                if os.path.exists(path):
+                if os.path.isdir(path):
+                    # 目录不参与新鲜度判断，保持原有删除行为
+                    return False
+                if os.path.isfile(path):
                     newest = os.path.getmtime(path)
             except Exception as err:
                 logger.debug(f"订阅整理拦截：读取媒体库文件时间失败 {path}：{err}")
-        if newest is None and isinstance(modify_time, (int, float)) and modify_time > 0:
-            newest = float(modify_time)
+        if newest is None:
+            modify_time = fileitem.get("modify_time") if isinstance(fileitem, dict) else None
+            if isinstance(modify_time, (int, float)) and modify_time > 0:
+                newest = float(modify_time)
+                # 部分存储返回毫秒时间戳，换算为秒后再比较
+                if newest > 1e11:
+                    newest = newest / 1000.0
         if newest is None:
             return False
         return newest > float(created_at)
