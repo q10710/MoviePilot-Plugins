@@ -103,7 +103,7 @@ class ChannelUserBootstrap(_PluginBase):
     plugin_name = "渠道用户自动建号Q自用版"
     plugin_desc = "其他渠道账号首次发消息时，自动按渠道 userid 创建 MoviePilot 普通用户并完成绑定，使其能正常使用查询、搜索、订阅。"
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/channeluserbootstrap.png"
-    plugin_version = "1.0.1"
+    plugin_version = "1.0.2"
     plugin_label = "系统设置"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -359,6 +359,7 @@ class ChannelUserBootstrap(_PluginBase):
         channel_type = self._detect_channel_type(source)
         payload = self._load_payload(body)
         if payload is not None:
+            channel_type = channel_type or self._infer_channel_type(payload)
             userid = self._collect_userid(payload, channel_type, source=source)
             if userid:
                 return userid, channel_type or "unknown"
@@ -366,10 +367,56 @@ class ChannelUserBootstrap(_PluginBase):
         if decrypted is not None:
             payload = self._load_payload(decrypted)
             if payload is not None:
-                userid = self._collect_userid(payload, channel_type or "wechat", source=source)
+                # 能解密的只有企业微信回调，渠道类型据此确定为 wechat
+                channel_type = channel_type or self._infer_channel_type(payload) or "wechat"
+                userid = self._collect_userid(payload, channel_type, source=source)
                 if userid:
-                    return userid, channel_type or "wechat"
+                    return userid, channel_type
         return None, None
+
+    @classmethod
+    def _infer_channel_type(cls, payload: Any) -> Optional[str]:
+        """在缺少 source 参数时，按报文结构推断渠道类型。
+
+        真实渠道回调未必带 source（企业微信回调就是 source=None），
+        只靠 source 反查会把渠道判成 unknown，导致写入的绑定键不正确。
+        这里按各渠道报文的显著特征做保守推断，识别不出则返回 None。
+        """
+        if not isinstance(payload, dict):
+            return None
+        # 企业微信 app 模式：XML 里带 FromUserName，或密文回调带 Encrypt
+        if "FromUserName" in payload or "Encrypt" in payload:
+            return "wechat"
+        # 企业微信 bot 模式：{"body": {"from": {"userid": ...}}}
+        body = payload.get("body")
+        if isinstance(body, dict):
+            if isinstance(body.get("from"), dict) and body["from"].get("userid"):
+                return "wechat"
+            if body.get("from") and body.get("msgtype"):
+                return "wechat"
+        # Telegram：message/edited_message/callback_query 下带 from.id
+        for key in ("message", "edited_message", "callback_query", "channel_post"):
+            node = payload.get(key)
+            if isinstance(node, dict) and isinstance(node.get("from"), dict) and node["from"].get("id") is not None:
+                return "telegram"
+        # 飞书：header + event.sender
+        if "header" in payload and isinstance(payload.get("event"), dict):
+            sender = payload["event"].get("sender")
+            if isinstance(sender, dict):
+                return "feishu"
+        # Slack：event.user 或顶层 user
+        event = payload.get("event")
+        if isinstance(event, dict) and event.get("user"):
+            return "slack"
+        if payload.get("type") == "event_callback" and payload.get("user"):
+            return "slack"
+        # 钉钉：senderStaffId / senderId
+        if payload.get("senderStaffId") or payload.get("senderId"):
+            return "dingtalk"
+        # 企业微信智能机器人（clawbot）：wechat_userid 字段
+        if payload.get("wechat_userid"):
+            return "wechatclawbot"
+        return None
 
     def _collect_userid(self, payload: Any, channel_type: Optional[str],
                         source: Optional[str] = None) -> Optional[str]:
@@ -613,9 +660,12 @@ class ChannelUserBootstrap(_PluginBase):
         if not self._allow_new_user():
             logger.warning(f"渠道用户自动建号：已达每小时上限 {self._hourly_limit}，本轮跳过 {channel_type}/{userid}")
             return None
-        username = self._create_user(binding_key, userid)
+        username, created = self._create_user(binding_key, userid)
         if not username:
             return None
+        if not created:
+            # 并发请求已建好同一账号：仅复用，不再记录与通知
+            return username
         self._record_created(channel_type, userid, username)
         logger.info(
             f"渠道用户自动建号：{channel_type}/{userid} → {username}"
@@ -668,8 +718,8 @@ class ChannelUserBootstrap(_PluginBase):
         self.save_data(DATA_RATE, window)
         return True
 
-    def _create_user(self, binding_key: str, userid: str) -> Optional[str]:
-        """按渠道用户ID创建普通用户并写入绑定，返回用户名。"""
+    def _create_user(self, binding_key: str, userid: str) -> Tuple[Optional[str], bool]:
+        """按渠道用户ID创建普通用户并写入绑定，返回 (用户名, 是否本次新建)。"""
         name = self._unique_name(userid)
         try:
             from app.application.security.token import get_password_hash
@@ -684,10 +734,28 @@ class ChannelUserBootstrap(_PluginBase):
                 settings={binding_key: userid, "nickname": ""},
             )
         except Exception as err:
+            # 并发回调（同一用户短时间连发多条）可能同时走到建号：唯一约束冲突时
+            # 说明另一个请求已建好，直接复查并复用，不当作错误。
+            if self._is_duplicate_error(err):
+                existing = self._resolve_existing(binding_key, userid)
+                if existing:
+                    logger.debug(f"渠道用户自动建号：{name} 已由并发请求创建，复用现有账号")
+                    return existing, False
             logger.error(f"渠道用户自动建号：创建用户失败 {name}：{err}")
-            return None
+            return None, False
         self._remember_binding(binding_key, userid, name)
-        return name
+        return name, True
+
+    @staticmethod
+    def _is_duplicate_error(err: Exception) -> bool:
+        """判断异常是否属于「用户名已存在」的唯一约束冲突。"""
+        text = str(err).lower()
+        return (
+            "uniqueviolation" in text
+            or "duplicate key" in text
+            or "already exists" in text
+            or "unique constraint" in text
+        )
 
     def _unique_name(self, base: str) -> str:
         """生成不冲突的用户名：base、base-2、base-3 …"""
