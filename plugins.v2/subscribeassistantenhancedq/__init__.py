@@ -114,7 +114,7 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/subscribeassistantenhancedq.png"
     # 插件版本
-    plugin_version = "0.10.2"
+    plugin_version = "0.10.3"
     _site_cache_candidate_helper_warned = False
     # 插件作者
     plugin_author = "Q"
@@ -772,11 +772,6 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
             self._relocate_overdue(cleanup)
         except Exception as err:
             logger.error(f"订阅收容：超时收容检查异常 {err}", exc_info=True)
-        # Q 版改造：收容种子在收容目录里下载完成后搬回影视目录，交给正常流程整理入库
-        try:
-            self._restore_hr_completed()
-        except Exception as err:
-            logger.error(f"订阅收容：完成转回检查异常 {err}", exc_info=True)
         # Q 版改造：同时检查收容种子的到期情况，到期后删除任务
         try:
             self._relocate_expired()
@@ -2177,63 +2172,6 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
             return int((entry or {}).get("round") or 0)
         except (TypeError, ValueError):
             return 0
-
-    def _restore_hr_completed(self):
-        """收容种子在收容目录内下载完成后，搬回影视下载目录交给正常流程整理入库。
-
-        收容目录刻意排除在媒体库整理之外，因此「在收容目录里下完」的种子不搬回就永远不会入库
-        （只能等到期删除）。这里对「已完成且仍在收容目录」的种子做一次性搬回：同一份种子不删除、
-        不重新添加，做种不中断；收容记录继续保留，仍按「完成时间 + 站点 H&R 时长」到期清理。
-        """
-        records = dict(self.get_data("relocate_records") or {})
-        if not records:
-            return
-        relocate_dir = str(getattr(self._config, "relocate_dir", "") or "").strip()
-        if not relocate_dir:
-            return
-        for torrent_hash, record in list(records.items()):
-            if record.get("restored_for_transfer"):
-                continue
-            downloader, _conclusive, raw = self._locate_torrent_downloader(
-                torrent_hash, preferred=record.get("downloader"))
-            if not downloader:
-                continue
-            present, finished, _completed_at = self._relocate_completion_state(
-                downloader, torrent_hash, raw=raw)
-            if not present or not finished:
-                continue
-            current_dir = self._torrent_save_path(downloader, torrent_hash)
-            if not current_dir or os.path.normpath(current_dir) != os.path.normpath(relocate_dir):
-                # 已不在收容目录（例如被自动转移做种搬到别处），无需搬回
-                continue
-            media_dir = self._resolve_media_download_dir(torrent_hash)
-            if not media_dir:
-                continue
-            service = self._downloader_helper.get_service(name=downloader)
-            instance = getattr(service, "instance", None) if service else None
-            if not self._move_torrent_location(instance, torrent_hash, media_dir):
-                logger.warning(f"订阅收容：{record.get('title') or torrent_hash} 已下载完成但搬回"
-                               f"影视目录 {media_dir} 未成功，下一轮重试")
-                continue
-            with self._relocate_lock:
-                current = self.get_data("relocate_records") or {}
-                entry = current.get(torrent_hash) or record
-                entry["restored_for_transfer"] = True
-                entry["restored_at"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                current[torrent_hash] = entry
-                self.save_data("relocate_records", current)
-            logger.info(f"订阅收容：{record.get('title') or torrent_hash} 已在收容目录下载完成，"
-                        f"搬回影视目录 {media_dir} 等待整理入库（继续做种，到期后按站点时长清理）")
-            if getattr(self._config, "notify", True):
-                try:
-                    self.post_message(
-                        title="【订阅收容已完成，转回影视目录】",
-                        text=(f"{record.get('title') or torrent_hash}"
-                              f"（站点 {record.get('site_name') or '-'}）已在收容目录下载完成，"
-                              f"已搬回影视目录等待整理入库；种子继续做种，到期后按站点 H&R 时长清理。"),
-                    )
-                except Exception as err:
-                    logger.debug(f"订阅收容：完成转回通知发送失败：{err}")
 
     def _hr_round_mark_final(self, torrent_hash: str) -> None:
         """标记该种子已达收容往返上限：之后只保留在影视目录，不再搬动或删除。"""
