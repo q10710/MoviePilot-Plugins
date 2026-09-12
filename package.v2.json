@@ -61,11 +61,12 @@
     "name": "过期订阅清理Q自用版",
     "description": "检查订阅，超过指定天数未下载的自动取消。电视剧和电影可分别设置天数。",
     "labels": "订阅",
-    "version": "1.1.7",
+    "version": "1.1.8",
     "icon": "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/stalesubcleaner.png",
     "author": "Q",
     "level": 1,
     "history": {
+      "v1.1.8": "最近一次取消清单改为持久化：此前只存在内存，重启 MoviePilot 后数据页只显示「累计取消 N 个」，看不到具体影视名。现在把最近一次非空清单写入插件数据、初始化时读回，重启后仍可查看；手动检查命令的通知也改为带具体影视名（此前只报数量）。清理判定与闲置天数阈值不变。",
       "v1.1.7": "修复定时检查整轮失败：新版 MoviePilot 的 Subscribe 已移除 tmdbid 字段（改用 media_source + media_id），旧代码直接读取 sub.tmdbid 抛 AttributeError，导致「过期订阅清理检查」每轮直接失败、无法清理（实测 2026-09-12 18:00 一轮报 'Subscribe' object has no attribute 'tmdbid'，0 个订阅被处理）。现在改为按媒体身份解析（media_source + media_id，兼容旧 tmdbid 兜底），并用下载历史的规范身份查询接口取最后下载时间；解析不到媒体身份的订阅跳过并记日志，不再中断整轮。修复后实测：整轮正常完成并按配置取消 63 个过期订阅（状态置为暂停 S，可恢复）。",
       "v1.1.6": "补充 author_url（项目主页链接），补齐插件页面的作者主页跳转；功能无变化。",
       "v1.1.5": "作者名改为 Q（用户要求，纯展示变更，功能无变化）。",
