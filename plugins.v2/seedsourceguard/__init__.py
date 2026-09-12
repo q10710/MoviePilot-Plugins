@@ -32,7 +32,7 @@ class SeedSourceGuard(_PluginBase):
     plugin_desc = ("检测本地源文件是否有下载器在做种、下载器是否存在文件丢失的无效做种或"
                    "tracker 全部失败的做种任务；连续N天异常可通知或按策略处置，杜绝无效做种与孤儿文件。")
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/seedsourceguard.png"
-    plugin_version = "1.1.10"
+    plugin_version = "1.1.11"
     plugin_label = "下载管理"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -1238,7 +1238,10 @@ class SeedSourceGuard(_PluginBase):
             handled = self._handle_no_seed(path, days, handle)
             if handled:
                 handled_list.append(handled)
-                days_data.pop(key, None)
+                # 仅当处置真正执行（删除/移动成功）才移出记录；仅通知、未开开关或处置失败时
+                # 保留计数，避免下轮从 1 重新计数（页面出现「已持续 1 次扫描」的假象）
+                if handled.get("disposed"):
+                    days_data.pop(key, None)
 
         # 无效做种计数
         invalid_map = {}
@@ -1251,7 +1254,8 @@ class SeedSourceGuard(_PluginBase):
             handled = self._handle_invalid(item, days, handle)
             if handled:
                 handled_list.append(handled)
-                days_data.pop(key, None)
+                if handled.get("disposed"):
+                    days_data.pop(key, None)
 
         # 红种做种计数（带站点/网络级故障保护）
         red_map = {}
@@ -1285,7 +1289,8 @@ class SeedSourceGuard(_PluginBase):
             handled = self._handle_red(item, days, handle, healthy_roots)
             if handled:
                 handled_list.append(handled)
-                days_data.pop(key, None)
+                if handled.get("disposed"):
+                    days_data.pop(key, None)
 
         # 清理已恢复的旧记录（保留当前仍异常项的天数历史）
         for prefix in ("no_seed:", "invalid:", "red:"):
@@ -1365,8 +1370,10 @@ class SeedSourceGuard(_PluginBase):
             count += 1
             if count >= self._days:
                 stale[key] = count
-            else:
-                days_data[full_key] = count
+            # 计数始终写回：若项达标但未真正处置（仅通知／未开开关／处置失败），
+            # 下轮必须继续反映「连续异常」；否则记录被清零后会重新从 1 计数，
+            # 页面长期显示「已持续 1 次扫描」的假象（此项从未中断过）。
+            days_data[full_key] = min(count, 9999)
         return stale
 
     @staticmethod
@@ -1391,17 +1398,19 @@ class SeedSourceGuard(_PluginBase):
         text = f"孤儿源文件 {path}（连续 {days} 次扫描仍无做种任务）"
         if action == "notify" or not handle:
             logger.warning(f"检测到孤儿源文件：{path}，连续 {days} 次扫描")
-            return {"time": datetime.now().strftime("%m-%d %H:%M"), "text": f"检测到 {text}"}
+            return {"time": datetime.now().strftime("%m-%d %H:%M"),
+                    "text": f"检测到 {text}", "disposed": False}
         if not self._allow_delete:
             logger.warning(f"孤儿源文件 {path} 已达标但未开启删除开关，跳过处置")
-            return {"time": datetime.now().strftime("%m-%d %H:%M"), "text": f"达标未处置 {text}"}
+            return {"time": datetime.now().strftime("%m-%d %H:%M"),
+                    "text": f"达标未处置 {text}", "disposed": False}
         try:
             if action == "delete":
                 import shutil
                 shutil.rmtree(path, ignore_errors=True)
                 logger.info(f"已删除孤儿源文件：{path}")
                 return {"time": datetime.now().strftime("%m-%d %H:%M"),
-                        "text": f"已删除 {text}"}
+                        "text": f"已删除 {text}", "disposed": True}
             if action == "move":
                 if not self._move_path:
                     logger.warning("未配置回收目录，跳过移动")
@@ -1413,11 +1422,11 @@ class SeedSourceGuard(_PluginBase):
                 shutil.move(path, str(dest))
                 logger.info(f"已移动孤儿源文件：{path} -> {dest}")
                 return {"time": datetime.now().strftime("%m-%d %H:%M"),
-                        "text": f"已移动 {text} -> {dest}"}
+                        "text": f"已移动 {text} -> {dest}", "disposed": True}
         except Exception as err:
             logger.error(f"处置孤儿源文件失败 {path}：{err}")
             return {"time": datetime.now().strftime("%m-%d %H:%M"),
-                    "text": f"处置失败 {text}：{err}"}
+                    "text": f"处置失败 {text}：{err}", "disposed": False}
         return None
 
     def _handle_invalid(self, item: Dict[str, Any], days: int,
@@ -1430,10 +1439,12 @@ class SeedSourceGuard(_PluginBase):
         text = f"无效做种 {dl}：{name}（连续 {days} 次扫描仍文件丢失/报错）"
         if action == "notify" or not handle:
             logger.warning(f"检测到无效做种：{dl} / {name}，连续 {days} 次扫描")
-            return {"time": datetime.now().strftime("%m-%d %H:%M"), "text": f"检测到 {text}"}
+            return {"time": datetime.now().strftime("%m-%d %H:%M"),
+                    "text": f"检测到 {text}", "disposed": False}
         if not self._allow_delete:
             logger.warning(f"无效做种 {dl} / {name} 已达标但未开启删除开关，跳过处置")
-            return {"time": datetime.now().strftime("%m-%d %H:%M"), "text": f"达标未处置 {text}"}
+            return {"time": datetime.now().strftime("%m-%d %H:%M"),
+                    "text": f"达标未处置 {text}", "disposed": False}
         if action in ("delete_torrent", "delete_all") and hash_value:
             delete_file = (action == "delete_all")
             try:
@@ -1445,11 +1456,12 @@ class SeedSourceGuard(_PluginBase):
                 instance.delete_torrents(delete_file, [hash_value])
                 logger.info(f"已删除无效做种任务：{dl} / {name}（delete_file={delete_file}）")
                 return {"time": datetime.now().strftime("%m-%d %H:%M"),
-                        "text": f"已删除任务 {'及文件 ' if delete_file else ''}{text}"}
+                        "text": f"已删除任务 {'及文件 ' if delete_file else ''}{text}",
+                        "disposed": True}
             except Exception as err:
                 logger.error(f"删除无效做种任务失败 {dl} / {name}：{err}")
                 return {"time": datetime.now().strftime("%m-%d %H:%M"),
-                        "text": f"删除失败 {text}：{err}"}
+                        "text": f"删除失败 {text}：{err}", "disposed": False}
         return None
 
     def _handle_red(self, item: Dict[str, Any], days: int,
@@ -1470,11 +1482,12 @@ class SeedSourceGuard(_PluginBase):
         text = f"红种做种 {dl}：{name}（连续 {days} 次扫描 tracker 仍通告失败）"
         if action != "delete" or not handle:
             logger.warning(f"检测到红种做种：{dl} / {name}，连续 {days} 次扫描")
-            return {"time": datetime.now().strftime("%m-%d %H:%M"), "text": f"检测到 {text}"}
+            return {"time": datetime.now().strftime("%m-%d %H:%M"),
+                    "text": f"检测到 {text}", "disposed": False}
         if not self._allow_delete:
             logger.warning(f"红种做种 {dl} / {name} 已达标但未开启删除开关，跳过处置")
             return {"time": datetime.now().strftime("%m-%d %H:%M"),
-                    "text": f"达标未处置 {text}"}
+                    "text": f"达标未处置 {text}", "disposed": False}
         if not hash_value:
             return None
         # 源文件是否仍被其它正常做种任务覆盖：正常任务集合由结算阶段计算并传入
@@ -1492,11 +1505,12 @@ class SeedSourceGuard(_PluginBase):
                 f"已删除红种做种任务：{dl} / {name}（delete_file={delete_file}）"
             )
             return {"time": datetime.now().strftime("%m-%d %H:%M"),
-                    "text": (f"已删除 {'任务及源文件 ' if delete_file else '任务 '}{text}")}
+                    "text": (f"已删除 {'任务及源文件 ' if delete_file else '任务 '}{text}"),
+                    "disposed": True}
         except Exception as err:
             logger.error(f"删除红种做种任务失败 {dl} / {name}：{err}")
             return {"time": datetime.now().strftime("%m-%d %H:%M"),
-                    "text": f"删除失败 {text}：{err}"}
+                    "text": f"删除失败 {text}：{err}", "disposed": False}
 
     # ── 落盘与通知 ────────────────────────────────────────────
 
