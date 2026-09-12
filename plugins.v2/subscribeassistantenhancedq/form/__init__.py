@@ -78,6 +78,7 @@ LABELS = {
     "backfill_best_version_now": "立即扫描存量并回填",
     "best_version_movie_remaining_days": "电影洗版时限（天）",
     "best_version_tv_remaining_days": "剧集洗版时限（天）",
+    "best_version_episode_remaining_days": "分集洗版时限（天）",
     # 完结信号
     "completion_guard_mode": "完结守卫模式",
     "site_completion_evidence_enabled": "站点完结信号",
@@ -165,6 +166,7 @@ HINTS = {
     "backfill_best_version_now": "保存后对存量分集洗版订阅执行一次回填，执行后自动复位",
     "best_version_movie_remaining_days": "电影洗版订阅达到指定天数后自动终止，有下载则按最新时间计算，为0时不限",
     "best_version_tv_remaining_days": "剧集洗版订阅达到指定天数后自动终止，有下载则按最新时间计算，为0时不限",
+    "best_version_episode_remaining_days": "分集洗版订阅目标集齐全后，超过指定天数仍未升级则标记洗版完成并停止洗版；为0时不限",
     # 完结信号
     "completion_guard_mode": "选择完成前复核强度，默认使用平衡策略",
     "site_completion_evidence_enabled": "使用站点资源标题佐证完结信号",
@@ -223,6 +225,7 @@ TABS = [
     ]),
     ("订阅洗版", [
         ["best_version_type", "best_version_movie_remaining_days", "best_version_tv_remaining_days"],
+        ["best_version_episode_remaining_days"],
         ["best_version_episode_to_full", "best_version_backfill_enabled", "backfill_best_version_now"],
     ]),
     ("完结信号", [
