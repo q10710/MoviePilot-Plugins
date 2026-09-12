@@ -86,6 +86,10 @@ from .shared.config import (
 from .shared.log import detail, truncate_log_value
 from .shared.subscribe import format_subscribe
 
+# H&R 收容往返最后一轮在影视目录的观察期（小时）：期内静默等待下载与整理入库，
+# 期满仍未完成才搬回收容目录继续保种（沿用上游「保留 + 保护期」的思路）。
+HR_ROUND_GRACE_HOURS = 24
+
 
 class SummaryPayload(BaseModel):
     """订阅助手概览接口的业务数据模型。"""
@@ -114,7 +118,7 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/subscribeassistantenhancedq.png"
     # 插件版本
-    plugin_version = "0.10.6"
+    plugin_version = "0.10.7"
     _site_cache_candidate_helper_warned = False
     # 插件作者
     plugin_author = "Q"
@@ -777,6 +781,11 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
             self._relocate_expired()
         except Exception as err:
             logger.error(f"订阅收容：收容到期检查异常 {err}")
+        # Q 版改造：最后一轮搬回影视目录后的 24 小时观察期检查（期满未完成则搬回收容目录保种）
+        try:
+            self._hr_round_grace_check()
+        except Exception as err:
+            logger.error(f"订阅收容：观察期检查异常 {err}")
 
     def _ensure_best_version_anchor(self, sid, now) -> float:
         """读取洗版首次观察锚点；缺失时以当前时间写入订阅任务数据。"""
@@ -2032,9 +2041,9 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
         #   同一轮内再超时则搬回收容目录（不额外增加轮次）；
         #   到达配置的最后一轮时搬回影视目录并保留停手（保留 + 通知）。
         # 已达上限并保留在影视目录的种子：静默保留，不再搬动、不删除、不重复通知。
-        if self._hr_round_is_final(torrent_hash):
+        if self._hr_round_in_grace(torrent_hash):
             logger.info(f"订阅收容：{torrent_task.get('title') if torrent_task else torrent_hash} "
-                        f"已达收容往返上限并保留在影视目录，本轮不再处理")
+                        f"处于最后一轮 {HR_ROUND_GRACE_HOURS} 小时观察期，本轮静默保留")
             return RELOCATE_FINAL_KEEP
         round_limit = self._hr_round_limit()
         current_dir = self._torrent_save_path(downloader, torrent_hash)
@@ -2058,9 +2067,10 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
                 return RELOCATE_RETAINED
             self._remove_relocate_record(torrent_hash)
             if last_round:
-                self._hr_round_mark_final(torrent_hash)
+                self._hr_round_enter_grace(torrent_hash, subscribe, torrent_task)
                 logger.info(f"订阅收容：{record_title} 第 {round_no}/{round_limit} 轮命中（最后一轮），"
-                            f"已搬回影视目录 {media_dir} 并保留（不再自动搬动或删除）")
+                            f"已搬回影视目录 {media_dir} 并进入 {HR_ROUND_GRACE_HOURS} 小时观察期"
+                            f"（期满仍未完成再搬回收容目录保种）")
                 return RELOCATE_KEPT_FINAL
             logger.info(f"订阅收容：{record_title} 第 {round_no}/{round_limit} 轮命中，"
                         f"已从收容目录搬回影视目录 {media_dir}（同一份种子继续下载）")
@@ -2070,10 +2080,10 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
         if round_no <= 0:
             round_no = self._hr_round_bump(torrent_hash, subscribe, torrent_task)
         if round_no >= round_limit:
-            self._hr_round_mark_final(torrent_hash)
-            logger.info(f"订阅收容：{record_title} 已达收容往返上限 {round_no}/{round_limit}，"
-                        f"保留在影视目录不再搬动")
-            return RELOCATE_KEPT_FINAL
+            # 观察期已结束（或保护期已过）：仍下不完，搬回收容目录继续保种，轮次重新计数
+            if self._hr_return_to_hr(instance, downloader, torrent_hash, subscribe, torrent_task):
+                return RELOCATE_FINAL_KEEP
+            return RELOCATE_RETAINED
         if not self._move_torrent_location(instance, torrent_hash, relocate_dir):
             logger.warning(f"订阅收容：移动 {torrent_hash} 到 {relocate_dir} 未成功，本轮保留种子")
             return RELOCATE_RETAINED
@@ -2184,12 +2194,8 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
                 self.save_data("hr_rounds", rounds)
 
     def _hr_round_is_final(self, torrent_hash: str) -> bool:
-        """该种子是否已达收容往返上限并保留停手。"""
-        if not torrent_hash:
-            return False
-        rounds = self.get_data("hr_rounds") or {}
-        entry = rounds.get(torrent_hash) if isinstance(rounds, dict) else None
-        return bool(entry and entry.get("final"))
+        """兼容旧调用：等价于该种子是否处于最后一轮的观察期。"""
+        return self._hr_round_in_grace(torrent_hash)
 
     def _hr_round_current(self, torrent_hash: str) -> int:
         """读取该种子当前已累计的收容往返轮次（未记录时返回 0）。"""
@@ -2203,7 +2209,15 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
             return 0
 
     def _hr_round_mark_final(self, torrent_hash: str) -> None:
-        """标记该种子已达收容往返上限：之后只保留在影视目录，不再搬动或删除。"""
+        """收容往返最后一轮：进入 24 小时观察期（保留在影视目录，期满未完成再搬回收容目录）。"""
+        self._hr_round_enter_grace(torrent_hash)
+
+    def _hr_round_enter_grace(self, torrent_hash: str, subscribe=None, torrent_task=None) -> None:
+        """记录收容往返最后一轮的观察期，并给下载监控写同时长的保护期。
+
+        观察期内种子保留在影视目录：可正常下载、整理入库；期满仍未完成才搬回收容目录保种。
+        轮次记录顺带保留收容时间戳，供搬回收容目录时续用，避免「未完成清理」计时被刷新。
+        """
         if not torrent_hash:
             return
         with self._relocate_lock:
@@ -2211,10 +2225,174 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
             if not isinstance(rounds, dict):
                 rounds = {}
             entry = rounds.get(torrent_hash) or {}
-            entry["final"] = True
-            entry["final_at"] = time.time()
+            entry["grace_until"] = time.time() + HR_ROUND_GRACE_HOURS * 3600
+            if subscribe is not None:
+                entry["subscribe_id"] = getattr(subscribe, "id", None)
+            title = str((torrent_task or {}).get("title") or entry.get("title") or "")
+            if title:
+                entry["title"] = title
+            records = self.get_data("relocate_records") or {}
+            previous = records.get(torrent_hash) or {}
+            if previous.get("relocated_at"):
+                entry["relocated_at"] = previous["relocated_at"]
+            if previous.get("deadline"):
+                entry["deadline"] = previous["deadline"]
             rounds[torrent_hash] = entry
             self.save_data("hr_rounds", rounds)
+        self._hr_round_apply_grace(torrent_hash, subscribe, torrent_task)
+
+    def _hr_round_grace_until(self, torrent_hash: str) -> float:
+        """读取观察期截止时间戳；无记录返回 0。"""
+        if not torrent_hash:
+            return 0
+        rounds = self.get_data("hr_rounds") or {}
+        entry = rounds.get(torrent_hash) if isinstance(rounds, dict) else None
+        try:
+            return float((entry or {}).get("grace_until") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _hr_round_in_grace(self, torrent_hash: str) -> bool:
+        """该种子是否处于最后一轮的观察期内（期内静默等待，不搬动不删除）。"""
+        return self._hr_round_grace_until(torrent_hash) > time.time()
+
+    def _hr_round_apply_grace(self, torrent_hash: str, subscribe=None, torrent_task=None) -> None:
+        """给下载监控写观察期保护：期内不判低进度超时、不重复收容。"""
+        monitor = self._modules.get("download_monitor")
+        if not monitor or not torrent_hash:
+            return
+        subscribe_id = getattr(subscribe, "id", None)
+        if not subscribe_id:
+            rounds = self.get_data("hr_rounds") or {}
+            entry = rounds.get(torrent_hash) if isinstance(rounds, dict) else None
+            subscribe_id = (entry or {}).get("subscribe_id")
+        if not subscribe_id:
+            subscribe_id = (torrent_task or {}).get("subscribe_id")
+        if not subscribe_id:
+            return
+        try:
+            monitor.apply_timeout_grace(int(subscribe_id), torrent_hash, HR_ROUND_GRACE_HOURS)
+        except Exception as err:
+            logger.debug(f"订阅收容：写观察期保护失败 {torrent_hash}：{err}")
+
+    def _hr_return_to_hr(self, instance, downloader: str, torrent_hash: str,
+                         subscribe=None, torrent_task=None) -> bool:
+        """观察期结束仍未完成时，把种子搬回收容目录继续保种。
+
+        同一份种子不删除也不重新添加；收容记录重建（续用原收容时间与到期点），
+        轮次清零，之后若再次命中会重新从第 1 轮开始尝试搬回影视目录下载，
+        直到内容下完入库或收容到期清理。
+        """
+        cfg = self._config
+        relocate_dir = str(getattr(cfg, "relocate_dir", "") or "").strip() if cfg else ""
+        if not relocate_dir or not instance or not torrent_hash:
+            return False
+        if not self._move_torrent_location(instance, torrent_hash, relocate_dir):
+            logger.warning(f"订阅收容：{torrent_hash} 观察期结束但搬回收容目录未成功，本轮保留种子")
+            return False
+        record = torrent_task or {}
+        now = datetime.datetime.now()
+        site_name = str(record.get("site_name") or "").strip() or self._site_name_from_history(torrent_hash)
+        site_id = record.get("site") or self._site_id_from_name(site_name)
+        hr_hours = self._relocate_hours(site_name, site_id=site_id, torrent_task=record)
+        deadline = (now + datetime.timedelta(hours=hr_hours)).strftime("%Y-%m-%d %H:%M:%S")
+        entry = {
+            "hash": torrent_hash,
+            "downloader": downloader,
+            "title": record.get("title") or "",
+            "site_name": site_name,
+            "site_id": site_id,
+            "subscribe_id": getattr(subscribe, "id", None) or record.get("subscribe_id"),
+            "relocated_at": now.strftime("%Y-%m-%d %H:%M:%S"),
+            "hr_hours": hr_hours,
+            "deadline": deadline,
+            "delete_files": bool(getattr(cfg, "relocate_delete_files", True)),
+            "round": 0,
+        }
+        # 续用原收容时间与到期点，避免「未完成清理」计时被反复重置
+        previous_relocated_at = str(record.get("relocated_at") or "").strip()
+        if previous_relocated_at:
+            entry["relocated_at"] = previous_relocated_at
+        previous_deadline = str(record.get("deadline") or "").strip()
+        if previous_deadline:
+            entry["deadline"] = previous_deadline
+        with self._relocate_lock:
+            records = self.get_data("relocate_records") or {}
+            records[torrent_hash] = entry
+            self.save_data("relocate_records", records)
+        self._hr_round_clear(torrent_hash)
+        self._hr_round_apply_grace(torrent_hash, subscribe, record)
+        logger.info(f"订阅收容：{entry['title'] or torrent_hash} 观察期结束仍未完成，"
+                    f"已搬回收容目录保种（站点 {site_name or '-'}，轮次重新计数）")
+        if getattr(cfg, "notify", True):
+            try:
+                self.post_message(
+                    title="【订阅收容】H&R 种子观察期结束，已搬回收容目录保种",
+                    text=(f"{entry['title'] or torrent_hash}\n"
+                          f"最后一轮在影视目录观察 {HR_ROUND_GRACE_HOURS} 小时后仍未下载完成，"
+                          f"已搬回保种目录继续做种；站点 {site_name or '-'}，"
+                          f"按站点 H&R 时长到期后清理。"),
+                )
+            except Exception as err:
+                logger.debug(f"订阅收容：搬回收容目录通知发送失败：{err}")
+        return True
+
+    def _hr_round_grace_check(self):
+        """收容往返最后一轮的观察期检查。
+
+        期满时：种子已不在任何下载器 → 清空轮次；已完成 → 清空轮次（内容交回正常流程）；
+        仍未完成 → 搬回收容目录保种并重新计数轮次。
+        """
+        if not self._downloader_helper or not self._config:
+            return
+        rounds = self.get_data("hr_rounds") or {}
+        if not isinstance(rounds, dict) or not rounds:
+            return
+        now_ts = time.time()
+        checked = 0
+        for torrent_hash, entry in list(rounds.items()):
+            if not isinstance(entry, dict):
+                continue
+            try:
+                grace_until = float(entry.get("grace_until") or 0)
+            except (TypeError, ValueError):
+                grace_until = 0
+            if grace_until <= 0 or now_ts < grace_until:
+                continue
+            checked += 1
+            try:
+                downloader, conclusive, raw = self._locate_torrent_downloader(
+                    torrent_hash, preferred=entry.get("downloader"))
+                if not downloader:
+                    if conclusive:
+                        self._hr_round_clear(torrent_hash)
+                        logger.info(f"订阅收容：{entry.get('title') or torrent_hash} "
+                                    f"观察期结束但种子已不在任何下载器，清空轮次记录")
+                    continue
+                present, finished, _ = self._relocate_completion_state(downloader, torrent_hash, raw=raw)
+                if not present:
+                    continue
+                if finished:
+                    self._hr_round_clear(torrent_hash)
+                    logger.info(f"订阅收容：{entry.get('title') or torrent_hash} "
+                                f"观察期内已完成下载，清空收容往返轮次")
+                    continue
+                subscribe = None
+                subscribe_id = entry.get("subscribe_id")
+                if self._subscribe_oper and subscribe_id:
+                    try:
+                        subscribe = self._subscribe_oper.get(subscribe_id)
+                    except Exception as err:
+                        logger.debug(f"订阅收容：读取订阅 {subscribe_id} 失败：{err}")
+                service = self._downloader_helper.get_service(name=downloader)
+                instance = getattr(service, "instance", None) if service else None
+                if not instance:
+                    continue
+                self._hr_return_to_hr(instance, downloader, torrent_hash, subscribe, entry)
+            except Exception as err:
+                logger.error(f"订阅收容：观察期处理 {torrent_hash} 异常：{err}", exc_info=True)
+        if checked:
+            detail(f"订阅收容：本轮检查 {checked} 个观察期结束的 H&R 收容往返记录")
 
     def _torrent_save_path(self, downloader: str, torrent_hash: str) -> str:
         """读取种子当前保存目录：qb 取 save_path，tr 取 download_dir；取不到返回空串。"""
