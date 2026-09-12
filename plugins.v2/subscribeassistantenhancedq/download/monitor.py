@@ -873,6 +873,36 @@ class DownloadMonitor:
 
         self._update("subscribes", updater)
 
+    def apply_timeout_grace(self, subscribe_id: int, torrent_hash: str, hours: float = 24.0) -> None:
+        """给「订阅范围 + 该 hash」写人工保护期，供 H&R 收容往返的观察期使用。
+
+        与达到连续低进度保护上限时的保护期同源：期内不判低进度超时、不重复收容。
+        scope 用下载监控自己的种子记录推导，保证与判定时的范围键一致。
+        """
+        if not subscribe_id or not torrent_hash:
+            return
+        torrent_task = self._get_torrent_task(torrent_hash) or {}
+        sid = str(subscribe_id)
+        scope_key = self._timeout_scope_key(int(subscribe_id), torrent_task)
+        try:
+            grace_hours = max(float(hours or 0), 0)
+        except (TypeError, ValueError):
+            grace_hours = 0
+        ignore_until = time.time() + grace_hours * 3600
+
+        def updater(data: dict) -> dict:
+            task = data.get(sid, {})
+            states = task.get("timeout_states", {})
+            state = states.get(scope_key, {})
+            state["ignore_until"] = ignore_until
+            state["last_torrent_hash"] = torrent_hash
+            states[scope_key] = state
+            task["timeout_states"] = states
+            data[sid] = task
+            return data
+
+        self._update("subscribes", updater)
+
     def _clear_timeout_state(self, subscribe_id: int, torrent_task: dict):
         """进度恢复增长时清理同一订阅范围的连续低进度状态。"""
         sid = str(subscribe_id)
