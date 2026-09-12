@@ -48,7 +48,7 @@ class BestVersionGuard(_PluginBase):
     plugin_name = "洗版守护Q自用版"
     plugin_desc = "定时检查电视剧订阅：未完结的误标洗版自动取消，恢复普通订阅继续追更。"
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/bestversionguard.png"
-    plugin_version = "2.5.5"
+    plugin_version = "2.5.6"
     plugin_label = "订阅"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -81,6 +81,10 @@ class BestVersionGuard(_PluginBase):
         self._fixed_ids = set(saved.get("fixed_ids", []))
         self._fixed_count = saved.get("fixed_count", 0)
         self._reset_records = {str(k): float(v) for k, v in (saved.get("reset_records") or {}).items()}
+        # 最近一次明细需持久化：否则重启后数据页只显示累计数量、看不到具体影视名
+        self._last_run = saved.get("last_run") or self._last_run
+        self._last_fixed = saved.get("last_fixed") or []
+        self._last_reset = saved.get("last_reset") or []
         if not config:
             self._enabled = False
             return
@@ -287,6 +291,9 @@ class BestVersionGuard(_PluginBase):
             "fixed_ids": list(self._fixed_ids),
             "fixed_count": self._fixed_count,
             "reset_records": self._reset_records,
+            "last_run": self._last_run,
+            "last_fixed": (self._last_fixed or [])[:50],
+            "last_reset": (self._last_reset or [])[:50],
         })
 
     def _can_reset(self, subscribe_id: Any) -> bool:
@@ -608,22 +615,38 @@ class BestVersionGuard(_PluginBase):
 
         self._last_run = now_str
         self._fixed_count += len(fixed_list)
-        self._last_fixed = fixed_list
-        self._last_reset = reset_list
+        # 仅在本轮确有结果时更新明细，保留最近一次非空清单（重启后数据页仍能看到影视名）
+        if fixed_list:
+            self._last_fixed = fixed_list
+        if reset_list:
+            self._last_reset = reset_list
+        self._save_state()
 
         logger.info(f"检查完成: 取消 {len(fixed_list)} 个，库缺集重置 {len(reset_list)} 个")
 
         if self._notify and (fixed_list or reset_list):
-            lines: List[str] = []
-            if fixed_list:
-                names = "、".join(f"{f['name']} S{f['season']}" for f in fixed_list[:10])
-                suffix = f"等 {len(fixed_list)} 个" if len(fixed_list) > 10 else ""
-                lines.append(f"取消洗版: {names}{suffix}")
-            if reset_list:
-                names = "、".join(f"{f['name']} S{f['season']}" for f in reset_list[:10])
-                suffix = f"等 {len(reset_list)} 个" if len(reset_list) > 10 else ""
-                lines.append(f"媒体库文件丢失，已重置订阅重新下载: {names}{suffix}")
+            lines = self._format_lists(fixed_list, reset_list)
             self.post_message(title="洗版守护", text="\n".join(lines))
+
+    @staticmethod
+    def _format_lists(fixed_list: List[Dict[str, Any]],
+                      reset_list: List[Dict[str, Any]],
+                      limit: int = 10) -> List[str]:
+        """格式化取消洗版/重置订阅清单（前 N 个明细 + 总数后缀），供通知复用。"""
+        lines: List[str] = []
+        if fixed_list:
+            names = "、".join(
+                f"{f.get('name', '')} S{f.get('season')}" for f in fixed_list[:limit]
+            )
+            suffix = f"等 {len(fixed_list)} 个" if len(fixed_list) > limit else ""
+            lines.append(f"取消洗版: {names}{suffix}")
+        if reset_list:
+            names = "、".join(
+                f"{f.get('name', '')} S{f.get('season')}" for f in reset_list[:limit]
+            )
+            suffix = f"等 {len(reset_list)} 个" if len(reset_list) > limit else ""
+            lines.append(f"媒体库文件丢失，已重置订阅重新下载: {names}{suffix}")
+        return lines
 
     # ── API ───────────────────────────────────────────────────
 
@@ -645,7 +668,9 @@ class BestVersionGuard(_PluginBase):
             return
         logger.info("收到手动检查命令")
         self._guard_check()
-        self.post_message(
-            title="洗版守护",
-            text=f"检查完成\n取消洗版: {len(self._last_fixed)} 个",
-        )
+        lines = self._format_lists(self._last_fixed, self._last_reset)
+        if lines:
+            text = f"检查完成（最近一次 {self._last_run or '未知'}）\n" + "\n".join(lines)
+        else:
+            text = "检查完成\n未发现需要处置的订阅"
+        self.post_message(title="洗版守护", text=text)
