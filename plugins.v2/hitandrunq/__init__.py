@@ -67,7 +67,7 @@ class HitAndRunQ(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/hitandrunq.png"
     # 插件版本
-    plugin_version = "2.2.5"
+    plugin_version = "2.2.6"
     # 插件作者
     plugin_author = "Q"
     # 作者主页
@@ -1262,7 +1262,16 @@ class HitAndRunQ(_PluginBase):
                 seeding_by_downloader[name] = seeding_dict
                 torrents_by_downloader[name] = seeding_dict
                 for torrent_hash in seeding_dict:
-                    presence.setdefault(torrent_hash, name)
+                    existing = presence.get(torrent_hash)
+                    if not existing:
+                        presence[torrent_hash] = name
+                        continue
+                    # 同一份种子同时存在于多个下载器（自动转移做种 / 辅种）时，
+                    # 优先保留 H&R 记录里登记的那一份，避免把「同一种子多副本」
+                    # 误判成「转移做种」而重复累计做种数据
+                    record = torrent_tasks.get(torrent_hash)
+                    if record and record.downloader and name == record.downloader:
+                        presence[torrent_hash] = name
                 logger.info(f"下载器 {name} 共有 {len(seeding_dict)} 个种子参与H&R检查")
 
             # 先识别下载器之间的转移做种并标记确实被删除的种子（同时为转移后的种子补写H&R标签）
@@ -1401,16 +1410,34 @@ class HitAndRunQ(_PluginBase):
             if torrent_task.deleted:
                 continue
 
-            downloader_name = presence.get(torrent_hash)
-            if not downloader_name:
+            # 同一份种子可能同时存在于多个下载器（自动转移做种 / 辅种）：
+            # 记录里的 downloader 只是其中一份副本，真正累计的做种数据可能在另一份上
+            # （典型：qb-下载 是后来重新添加的未完成副本，tr 里那份已完成并持续做种）。
+            # 若只读首个命中的副本，会把已累计的做种时间读成 0，H&R 被误判为未达标，
+            # 种子被删除后还会误报「需要做种」。因此这里遍历全部副本，取做种时间最长的那份。
+            best_name = None
+            best_info = None
+            best_seeding = -1.0
+            for name, seeding_dict in (torrents_by_downloader or {}).items():
+                torrent = (seeding_dict or {}).get(torrent_hash)
+                if not torrent:
+                    continue
+                context = contexts.get(name)
+                if not context:
+                    continue
+                try:
+                    info = context.torrent_helper.get_torrent_info(torrent=torrent)
+                except Exception as e:
+                    logger.debug(f"读取种子状态失败：{name} / {torrent_hash}：{e}")
+                    continue
+                seeding = float(info.get("seeding_time", 0) or 0)
+                if seeding > best_seeding:
+                    best_name, best_info, best_seeding = name, info, seeding
+            if best_info is None:
                 continue
-
-            context = contexts.get(downloader_name)
-            torrent = (torrents_by_downloader.get(downloader_name) or {}).get(torrent_hash)
-            if not context or not torrent:
-                continue
-
-            torrent_info = context.torrent_helper.get_torrent_info(torrent=torrent)
+            if best_name and torrent_task.downloader and best_name != torrent_task.downloader:
+                logger.debug(f"H&R 任务 {torrent_task.identifier} 在 {best_name} 的副本做种时间更长，本轮按该副本统计")
+            torrent_info = best_info
 
             # 更新上传量、下载量、做种时间：叠加转移到其它下载器前的累计值
             seeding_time_offset = torrent_task.seeding_time_offset or 0.0
