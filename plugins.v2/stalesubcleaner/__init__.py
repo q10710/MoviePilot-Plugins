@@ -332,21 +332,35 @@ class StaleSubCleaner(_PluginBase):
 
         self._last_run = now_str
         self._total_cleaned += len(cleaned)
-        self._last_cleaned = cleaned
-        self.save_data("state", {"total_cleaned": self._total_cleaned})
+        saved_state = {
+            "total_cleaned": self._total_cleaned,
+            "last_run": now_str,
+        }
+        # 仅在本轮确有取消时更新明细，保留最近一次非空清单（重启后数据页仍能看到影视名）
+        if cleaned:
+            self._last_cleaned = cleaned
+            saved_state["cleaned"] = cleaned[:50]
+        self.save_data("state", saved_state)
 
         logger.info(f"检查完成: 取消 {len(cleaned)} 个过期订阅")
 
         if self._notify and cleaned:
-            names = "、".join(
-                f"{c['name']} S{c['season']}({c['stale_days']}天)"
-                for c in cleaned[:10]
-            )
-            suffix = f"等 {len(cleaned)} 个" if len(cleaned) > 10 else ""
             self.post_message(
                 title="过期订阅清理",
-                text=f"已取消过期订阅: {names}{suffix}",
+                text=f"已取消过期订阅: {self._format_cleaned_names(cleaned)}",
             )
+
+    @staticmethod
+    def _format_cleaned_names(cleaned: List[Dict[str, Any]], limit: int = 10) -> str:
+        """格式化取消清单（前 N 个明细 + 总数后缀），供通知复用。"""
+        if not cleaned:
+            return "无"
+        names = "、".join(
+            f"{c.get('name', '')} S{c.get('season')}({c.get('stale_days')}天)"
+            for c in cleaned[:limit]
+        )
+        suffix = f"等 {len(cleaned)} 个" if len(cleaned) > limit else ""
+        return f"{names}{suffix}"
 
     @staticmethod
     def _resolve_media_identity(sub: Any) -> Optional[Tuple[str, str]]:
