@@ -103,7 +103,7 @@ class ChannelUserBootstrap(_PluginBase):
     plugin_name = "渠道用户自动建号Q自用版"
     plugin_desc = "其他渠道账号首次发消息时，自动按渠道 userid 创建 MoviePilot 普通用户并完成绑定，使其能正常使用查询、搜索、订阅。"
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/channeluserbootstrap.png"
-    plugin_version = "1.0.0"
+    plugin_version = "1.0.1"
     plugin_label = "系统设置"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -335,8 +335,12 @@ class ChannelUserBootstrap(_PluginBase):
         if not self._enabled:
             return None
         try:
-            userid, channel_type = self._extract_userid(source=source, body=body)
+            userid, channel_type = self._extract_userid(source=source, body=body, args=args)
             if not userid or not channel_type:
+                logger.debug(
+                    f"渠道用户自动建号：未能识别渠道用户（source={source}），"
+                    f"若为加密回调请检查渠道密钥配置"
+                )
                 return None
             if self._channels and channel_type not in self._channels:
                 return None
@@ -345,12 +349,31 @@ class ChannelUserBootstrap(_PluginBase):
             logger.error(f"渠道用户自动建号处理失败：{err}")
         return None
 
-    def _extract_userid(self, source: Optional[str], body: Any) -> Tuple[Optional[str], Optional[str]]:
-        """从消息原始内容中提取 (渠道用户ID, 渠道类型)。"""
-        payload = self._load_payload(body)
-        if payload is None:
-            return None, None
+    def _extract_userid(self, source: Optional[str], body: Any,
+                        args: Any = None) -> Tuple[Optional[str], Optional[str]]:
+        """从消息原始内容中提取 (渠道用户ID, 渠道类型)。
+
+        先按明文解析（JSON / XML）；企业微信等渠道使用加密回调时，报文是密文，
+        此处按渠道密钥解密后再次解析，保证加密渠道同样能识别用户。
+        """
         channel_type = self._detect_channel_type(source)
+        payload = self._load_payload(body)
+        if payload is not None:
+            userid = self._collect_userid(payload, channel_type, source=source)
+            if userid:
+                return userid, channel_type or "unknown"
+        decrypted = self._decrypt_payload(body, args)
+        if decrypted is not None:
+            payload = self._load_payload(decrypted)
+            if payload is not None:
+                userid = self._collect_userid(payload, channel_type or "wechat", source=source)
+                if userid:
+                    return userid, channel_type or "wechat"
+        return None, None
+
+    def _collect_userid(self, payload: Any, channel_type: Optional[str],
+                        source: Optional[str] = None) -> Optional[str]:
+        """按渠道专用字段与通用字段依次尝试取出用户ID。"""
         candidates: List[Any] = []
         if channel_type and channel_type in CHANNEL_USERID_KEYS:
             for path in CHANNEL_USERID_KEYS[channel_type]:
@@ -359,8 +382,73 @@ class ChannelUserBootstrap(_PluginBase):
         for candidate in candidates:
             value = self._normalize_userid(candidate, source=source)
             if value:
-                return value, channel_type or "unknown"
-        return None, None
+                return value
+        return None
+
+    def _decrypt_payload(self, body: Any, args: Any) -> Optional[str]:
+        """按渠道密钥尝试解密加密回调报文，返回明文 XML 字符串或 None。
+
+        企业微信的接收回调是密文（<xml> 内为 Encrypt 字段），宿主的解密发生在
+        消息模块内部；插件先于宿主执行，因此需要自行解密才能拿到用户ID。
+        对每个已配置的同类渠道客户端依次尝试，任一个解密成功即返回。
+        """
+        if not body or args is None:
+            return None
+        signature = self._arg_value(args, "msg_signature")
+        timestamp = self._arg_value(args, "timestamp")
+        nonce = self._arg_value(args, "nonce")
+        if not signature or not timestamp or not nonce:
+            return None
+        payload_bytes = body if isinstance(body, (bytes, bytearray)) else str(body).encode("utf-8")
+        for conf in self._channel_configs("wechat"):
+            token = str(conf.get("WECHAT_TOKEN") or "").strip()
+            aes_key = str(conf.get("WECHAT_ENCODING_AESKEY") or "").strip()
+            corpid = str(conf.get("WECHAT_CORPID") or "").strip()
+            if not token or not aes_key or not corpid:
+                continue
+            try:
+                from app.adapters.external.wechat import WXBizMsgCrypt
+
+                crypt = WXBizMsgCrypt(sToken=token, sEncodingAESKey=aes_key, sReceiveId=corpid)
+                ret, plain = crypt.DecryptMsg(
+                    sPostData=bytes(payload_bytes),
+                    sMsgSignature=str(signature),
+                    sTimeStamp=str(timestamp),
+                    sNonce=str(nonce),
+                )
+            except Exception as err:
+                logger.debug(f"渠道用户自动建号：解密回调报文失败：{err}")
+                continue
+            if ret == 0 and plain:
+                return plain.decode("utf-8", errors="replace") if isinstance(plain, (bytes, bytearray)) else str(plain)
+        return None
+
+    def _channel_configs(self, channel_type: str) -> List[Dict[str, Any]]:
+        """返回指定渠道类型下所有通知客户端的配置字典。"""
+        try:
+            clients = self.systemconfig.get("Notifications") or []
+        except Exception as err:
+            logger.debug(f"渠道用户自动建号：读取通知配置失败：{err}")
+            return []
+        result: List[Dict[str, Any]] = []
+        for item in clients:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("type") or "").strip().lower() != channel_type:
+                continue
+            config = item.get("config")
+            if isinstance(config, dict):
+                result.append(config)
+        return result
+
+    @staticmethod
+    def _arg_value(args: Any, key: str) -> Optional[str]:
+        """从查询参数（dict 或 QueryParams）中安全取值。"""
+        try:
+            value = args.get(key)
+        except Exception:
+            return None
+        return str(value).strip() if value else None
 
     @staticmethod
     def _load_payload(body: Any) -> Optional[Any]:
