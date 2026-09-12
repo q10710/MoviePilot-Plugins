@@ -39,6 +39,7 @@ class SubscriptionCleanup:
                  get_subscribe_image_fn: Optional[Callable] = None,
                  season_of_fn: Optional[Callable] = None,
                  torrent_exists_fn: Optional[Callable] = None,
+                 protect_hr_fn: Optional[Callable] = None,
                  sleep_fn: Optional[Callable] = None,
                  cleanup_history_type: str = "no",
                  cleanup_history_scenes: Optional[list] = None):
@@ -53,6 +54,9 @@ class SubscriptionCleanup:
         self._get_subscribe_image = get_subscribe_image_fn
         self._season_of = season_of_fn
         self._torrent_exists = torrent_exists_fn
+        # protect_hr_fn(hash, source_path, subscribe) -> bool：
+        # 命中 H&R 种子时由插件接管保种（移入收容目录），调用方跳过删源文件与 DownloadFileDeleted。
+        self._protect_hr = protect_hr_fn
         self._sleep = sleep_fn or time.sleep
         self._cleanup_history_type = cleanup_history_type
         self._cleanup_history_scenes = list(cleanup_history_scenes or [])
@@ -111,19 +115,25 @@ class SubscriptionCleanup:
                 f"查询季号={season or '无'}，跳过清理"
             )
             return True
-        self.clear_transfer_src_histories(
+        protected_hashes = self.clear_transfer_src_histories(
             subscribe=subscribe,
             histories=histories,
             media_type=media_type,
             season=season,
             scene=scene,
             target_episodes=target_episodes,
-        )
+        ) or set()
         old_hashes = {
             self._field(history, "download_hash")
             for history in histories
             if self._field(history, "download_hash")
-        }
+        } - set(protected_hashes)
+        # 被保护（H&R 保种）的 hash 仍留在下载器里，不参与「等待旧任务释放」
+        if protected_hashes:
+            logger.info(
+                f"订阅清理：{format_subscribe_desc(subscribe)} {mode_label}有 "
+                f"{len(protected_hashes)} 个 H&R 种子已转入保种目录，跳过删除与等待"
+            )
         return self._wait_for_torrents_removed(subscribe=subscribe, download_hashes=old_hashes)
 
     def migrate_snapshot_identities(self) -> int:
@@ -339,16 +349,20 @@ class SubscriptionCleanup:
 
     def clear_transfer_src_histories(self, subscribe, histories, media_type: Optional[MediaType] = None,
                                      season: Optional[str] = None, scene: Optional[str] = None,
-                                     target_episodes: Optional[list[int]] = None):
+                                     target_episodes: Optional[list[int]] = None) -> set:
         """删除源文件与整理历史，并保存 TransferIntercept 阶段消费的清理快照。
 
         快照 key 按媒体身份、场景和目标集生成；旧媒体库目标文件必须等主程序整理新文件前再删，
         因此由后续 TransferIntercept 按同一媒体和集范围消费，避免同 TMDB 并发下载互相覆盖。
+
+        命中 H&R 种子时由 protect_hr_fn 接管：不删源文件、不发 DownloadFileDeleted
+        （主程序收到该事件会删除下载器里的任务，会把保种那份一并删掉），
+        返回被保护的 hash 集合，调用方据此跳过「等待旧任务释放」。
         """
         media_source = str(subscribe.media_source or "")
         media_id = str(subscribe.media_id or "")
         if not media_source or not media_id:
-            return
+            return set()
         subscribe_image = self._get_subscribe_image(subscribe) if self._get_subscribe_image else None
         media_type = media_type or resolve_subscribe_media_type(subscribe)
         season = season if season is not None else (self._history_season(subscribe) if media_type == MediaType.TV else None)
@@ -394,18 +408,39 @@ class SubscriptionCleanup:
         download_notice_sent = 0
         history_delete_total = 0
         history_deleted = 0
+        protected_hashes: set = set()
         for history in histories:
             src_fileitem = self._field(history, "src_fileitem")
+            source_path = self._fileitem_path(src_fileitem) or self._field(history, "src")
+            download_hash = self._field(history, "download_hash")
+            # H&R 种子保护：交给插件移入收容目录保种，不删文件、不发删除事件（否则会删掉保种任务）
+            protected = False
+            if download_hash and self._protect_hr:
+                try:
+                    protected = bool(self._protect_hr(download_hash, source_path, subscribe))
+                except Exception as err:
+                    logger.error(f"订阅清理：H&R 种子保护判断失败 {download_hash}：{err}", exc_info=True)
+                    protected = False
+            if protected:
+                protected_hashes.add(str(download_hash))
+                if source_path:
+                    source_paths.append(str(source_path))
+                history_id = self._field(history, "id")
+                if history_id is not None:
+                    history_delete_total += 1
+                if history_id is not None and self._delete_history:
+                    self._delete_history(history_id)
+                    history_deleted += 1
+                continue
             if src_fileitem and self._delete_media_file:
                 self._delete_media_file(src_fileitem)
                 source_file_deleted += 1
-            source_path = self._fileitem_path(src_fileitem) or self._field(history, "src")
             if source_path:
                 source_paths.append(str(source_path))
             if src_fileitem:
                 download_notice_total += 1
                 if self._send_dfd:
-                    self._send_dfd(self._field(history, "src"), self._field(history, "download_hash"))
+                    self._send_dfd(self._field(history, "src"), download_hash)
                     download_notice_sent += 1
             history_id = self._field(history, "id")
             if history_id is not None:
@@ -418,7 +453,8 @@ class SubscriptionCleanup:
             f"订阅清理：{format_subscribe_desc(subscribe)} {mode_label}源文件清理完成，"
             f"整理记录 {history_deleted}/{history_delete_total} 条，"
             f"源文件 {source_file_deleted}/{len(histories)} 个，"
-            f"下载记录通知 {download_notice_sent}/{download_notice_total} 个"
+            f"下载记录通知 {download_notice_sent}/{download_notice_total} 个，"
+            f"H&R 保种保护 {len(protected_hashes)} 个"
         )
 
         if self._notify:
@@ -428,6 +464,7 @@ class SubscriptionCleanup:
                 text=self._single_episode_cleanup_text(target_episodes, source_paths),
                 image=subscribe_image,
             )
+        return protected_hashes
 
     def handle_history_clear(self, event) -> bool:
         """TransferIntercept 阶段按清理快照删除旧媒体库目标文件，成功后消费快照。"""
