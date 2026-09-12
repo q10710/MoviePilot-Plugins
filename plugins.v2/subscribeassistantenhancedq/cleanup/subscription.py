@@ -1,4 +1,5 @@
 """订阅清理编排：下载前清源记录，整理前清旧目标文件。"""
+import os
 import re
 import time
 from typing import Callable, Optional
@@ -695,9 +696,19 @@ class SubscriptionCleanup:
         dest_paths = []
         failed_dest_paths = []
         failed_histories = []
+        skipped_fresh = 0
         for history in histories:
             dest_fileitem = history.get("dest_fileitem") if isinstance(history, dict) else None
             if dest_fileitem and self._delete_media_file:
+                # 本次清理只针对快照建立前就存在的旧文件：洗版/重下时新文件可能先落库、
+                # 随后才触发本拦截，若照样删除就会把刚入库的新文件删掉（库内只剩零星集数）。
+                if self._is_fresh_dest_file(dest_fileitem, task):
+                    skipped_fresh += 1
+                    detail(
+                        f"订阅整理拦截：{mode_label}跳过删除刚写入的媒体库文件 "
+                        f"{self._fileitem_path(dest_fileitem) or dest_fileitem}"
+                    )
+                    continue
                 try:
                     delete_state = self._delete_media_file(dest_fileitem)
                 except Exception as err:
@@ -723,7 +734,9 @@ class SubscriptionCleanup:
             return False
         logger.info(
             f"订阅整理拦截：{(task or {}).get('subscribe_desc', '订阅')} "
-            f"{mode_label}媒体库文件清理完成，目标文件 {dest_file_total}/{len(histories)} 个"
+            f"{mode_label}媒体库文件清理完成，目标文件 {dest_file_total - skipped_fresh}/"
+            f"{len(histories)} 个"
+            + (f"，跳过刚写入 {skipped_fresh} 个" if skipped_fresh else "")
         )
         if self._notify:
             self._notify(
@@ -740,6 +753,31 @@ class SubscriptionCleanup:
         if isinstance(fileitem, dict):
             return fileitem.get("path")
         return None
+
+    @staticmethod
+    def _is_fresh_dest_file(fileitem, task) -> bool:
+        """判断媒体库目标文件是否为本次清理开始之后新写入的文件（是则不删除）。
+
+        判据：文件修改时间晚于清理事务创建时间。旧文件必然早于快照建立时间，因此不会误伤；
+        取不到时间（远端存储、文件不存在）时返回 False，保持原有删除行为。
+        """
+        created_at = (task or {}).get("time")
+        if not isinstance(created_at, (int, float)):
+            return False
+        path = SubscriptionCleanup._fileitem_path(fileitem)
+        modify_time = fileitem.get("modify_time") if isinstance(fileitem, dict) else None
+        newest = None
+        if path:
+            try:
+                if os.path.exists(path):
+                    newest = os.path.getmtime(path)
+            except Exception as err:
+                logger.debug(f"订阅整理拦截：读取媒体库文件时间失败 {path}：{err}")
+        if newest is None and isinstance(modify_time, (int, float)) and modify_time > 0:
+            newest = float(modify_time)
+        if newest is None:
+            return False
+        return newest > float(created_at)
 
     @classmethod
     def _single_episode_cleanup_text(cls, target_episodes, paths: list[str]) -> Optional[str]:
