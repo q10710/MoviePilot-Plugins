@@ -10,8 +10,13 @@ from ..shared.log import detail
 from ..shared.subscribe import format_subscribe, resolve_subscribe_media_type
 from ..shared.update import update_subscribe
 
-# 收容回调的三态返回值：relocated=已收容；retained=H&R 种子收容失败（保留不删）；skip=未收容，走原删除逻辑
+# 收容回调的返回值：relocated=已收容；restored=已从收容目录搬回影视目录；
+# kept_final=已达收容往返次数上限，保留在影视目录并停手；
+# retained=H&R 种子收容失败（保留不删）；skip=未收容，走原删除逻辑
 RELOCATE_RELOCATED = "relocated"
+RELOCATE_RESTORED = "restored"
+RELOCATE_KEPT_FINAL = "kept_final"
+RELOCATE_FINAL_KEEP = "final_keep"
 RELOCATE_RETAINED = "retained"
 RELOCATE_SKIP = "skip"
 
@@ -64,9 +69,11 @@ class TorrentCleanup:
         收容回调返回 retained 时只保留种子（H&R 收容失败），不执行删除，等下一轮重试。
         """
         sid = subscribe.id
-        # 收容与删除两种结果要给出不同通知文案，避免用户误以为种子被删除
+        # 收容、搬回影视目录、保留停手与删除要给出不同通知文案，避免用户误以为种子被删除
         relocated = False
         retained = False
+        restored = False
+        kept_final = False
         detail(
             f"种子删除处理：{format_subscribe(subscribe)} 开始处理 hash={torrent_hash}"
             f"（reason={reason}, delete_from_downloader={delete_from_downloader}）"
@@ -82,6 +89,14 @@ class TorrentCleanup:
             outcome = self._relocate_torrent(downloader, torrent_hash, subscribe, torrent_task) or ""
         if outcome == RELOCATE_RELOCATED:
             relocated = True
+        elif outcome == RELOCATE_RESTORED:
+            restored = True
+        elif outcome == RELOCATE_KEPT_FINAL:
+            kept_final = True
+        elif outcome == RELOCATE_FINAL_KEEP:
+            # 已达收容往返上限且已保留在影视目录：静默保留，不再写指纹、不回滚、不补搜、不通知
+            detail(f"种子删除处理：{torrent_hash} 已达收容往返上限，保留在影视目录，本轮静默跳过")
+            return
         elif outcome == RELOCATE_RETAINED:
             retained = True
 
@@ -108,8 +123,10 @@ class TorrentCleanup:
         # 3. 下载器主动删除场景处理种子；用户手动删除场景种子已不存在。
         #    Q 版改造：超时（timeout）不再直接删除，优先收容到独立目录保留做种，
         #    已收容的种子留在收容目录继续做种，只有未收容的普通种子才按原逻辑删除。
+        #    收容往返（restored / kept_final）同样不删除：种子同一份，只改保存目录，
+        #    保证它有机会下完并被正常整理入库，同时 H&R 做种不中断。
         if (delete_from_downloader and downloader and torrent_hash
-                and not relocated and self._delete_torrent):
+                and not relocated and not restored and not kept_final and self._delete_torrent):
             self._delete_torrent(downloader, torrent_hash)
 
         # 4. 洗版按 enclosure 归属回滚，隔离并行洗版；旧数据无归属时退回整体基线。
@@ -139,6 +156,8 @@ class TorrentCleanup:
             search_delay_seconds=search_delay_seconds,
             relocated=relocated,
             retained=retained,
+            restored=restored,
+            kept_final=kept_final,
         )
 
     def handle_timeout_manual_review(self, subscribe, torrent_hash: str,
@@ -252,7 +271,8 @@ class TorrentCleanup:
     def _notify_deleted(self, subscribe, torrent_task: Optional[dict], reason: str,
                         reason_detail: Optional[str] = None,
                         search_delay_seconds: Optional[float] = None,
-                        relocated: bool = False, retained: bool = False):
+                        relocated: bool = False, retained: bool = False,
+                        restored: bool = False, kept_final: bool = False):
         """发送种子处理通知，标题包含订阅、原因和最终动作（收容 / 保留 / 删除）。"""
         if not self._notify:
             return
@@ -271,7 +291,11 @@ class TorrentCleanup:
         follow_up = None
         if search_delay_seconds is not None:
             follow_up = f"将在 {search_delay_seconds / 60:.2f} 分钟后触发搜索补全"
-        if relocated:
+        if restored:
+            action_text = "已搬回影视目录（同一份种子继续下载，完成后自动整理入库）"
+        elif kept_final:
+            action_text = "已保留在影视目录（已达配置的收容往返次数，不再自动搬动或删除）"
+        elif relocated:
             action_text = "已收容（移入收容目录继续做种，到期后自动删除）"
         elif retained:
             action_text = "已保留（收容未成功，本轮不删除，下一轮继续尝试）"
