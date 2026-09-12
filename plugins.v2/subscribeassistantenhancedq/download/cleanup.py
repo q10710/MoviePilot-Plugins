@@ -163,6 +163,48 @@ class TorrentCleanup:
     def handle_timeout_manual_review(self, subscribe, torrent_hash: str,
                                      reason_detail: str, ignore_hours: int = 48):
         """连续低进度达到保护上限时保留种子，并通知用户人工判断。"""
+        self._notify_manual_review(subscribe, torrent_hash, reason_detail, ignore_hours)
+
+    def handle_timeout_limit(self, subscribe, torrent_hash: str, reason_detail: str,
+                             ignore_hours: int = 24, downloader: Optional[str] = None):
+        """连续低进度达到上限时的处置入口：H&R 种子交给收容往返链路，其余沿用原有「保留 + 通知」。
+
+        收容往返由回调决定本次动作（收容 / 搬回影视目录 / 达上限保留停手），
+        因此配置的次数对 H&R 种子按「往返轮次」精确生效，不再受低进度计数窗口影响；
+        非 H&R 种子或收容不可用时回退到原有行为，保证普通种子的处置不变。
+        """
+        torrent_task = self._read_torrent_task(torrent_hash) or {}
+        outcome = ""
+        if self._relocate_torrent and downloader and torrent_hash:
+            outcome = self._relocate_torrent(downloader, torrent_hash, subscribe, torrent_task) or ""
+        if outcome == RELOCATE_FINAL_KEEP:
+            detail(f"种子删除处理：{torrent_hash} 已达收容往返上限并保留停手，本轮静默跳过")
+            return
+        if outcome in (RELOCATE_RELOCATED, RELOCATE_RESTORED, RELOCATE_KEPT_FINAL):
+            # 收容往返链路已完成搬动：按本次动作发送通知，不重复走「保留」文案
+            self._notify_deleted(
+                subscribe, torrent_task, "timeout",
+                reason_detail=reason_detail,
+                relocated=outcome == RELOCATE_RELOCATED,
+                restored=outcome == RELOCATE_RESTORED,
+                kept_final=outcome == RELOCATE_KEPT_FINAL,
+            )
+            return
+        if outcome == RELOCATE_RETAINED:
+            if self._should_notify_retained(torrent_hash):
+                self._notify(
+                    f"{format_subscribe(subscribe)} H&R 种子收容未成功，本轮已保留种子",
+                    "收容目录或下载器暂不可用，种子保留继续做种，下一轮巡检会再次尝试收容",
+                    image=self._subscribe_image(subscribe),
+                    diagnostic=True,
+                )
+            return
+        # 非 H&R 种子或收容未启用：维持原有的「保留种子 + 通知 + 保护期」
+        self._notify_manual_review(subscribe, torrent_hash, reason_detail, ignore_hours)
+
+    def _notify_manual_review(self, subscribe, torrent_hash: str,
+                              reason_detail: str, ignore_hours: int = 48):
+        """原有「保留种子并通知人工判断」文案。"""
         if not self._notify:
             return
         torrent_task = self._read_torrent_task(torrent_hash) or {}
