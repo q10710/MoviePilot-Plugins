@@ -189,29 +189,30 @@ class PausedProbeCoordinator:
                 logger.info(f"暂停补搜：{format_subscribe_label(subscribe, sid)} 执行前跳过：{skip_reason}")
                 if skip_reason == "调度已失效":
                     stale_generation = True
-                    return
-                if subscribe:
+                elif subscribe:
                     cleanup_last = skip_reason in {
                         "配置已关闭", "未配置补搜场景", "暂停满天数为 0", "当前原因未配置", "暂停原因变化"
                     }
                     self._pause_manager.clear_probe_schedule(subscribe, include_last=cleanup_last)
                 else:
                     self._clear_probe_schedule_by_sid(sid, include_last=False)
-                return
-            logger.info(f"暂停补搜：{format_subscribe(subscribe)} 开始执行单订阅搜索")
-            self._subscribe_chain.search(sid=subscribe.id)
+            else:
+                logger.info(f"暂停补搜：{format_subscribe(subscribe)} 开始执行单订阅搜索")
+                self._subscribe_chain.search(sid=subscribe.id)
         except Exception as err:
             logger.error(f"暂停补搜：订阅 {sid} 执行失败，本次已计入间隔：{err}", exc_info=True)
         finally:
+            # finally 只负责清理定时器：Python 3.15 起 finally 里的 return 是语法错误
+            # （3.14 仅告警），且会吞掉未捕获异常，因此后续清理移到 finally 之后按正常路径执行。
             with self._lock:
                 self._timers.pop(sid, None)
-            if stale_generation:
-                return
-            subscribe = self._subscribe_oper.get(int(sid)) if self._subscribe_oper else None
-            if subscribe:
-                self._pause_manager.clear_probe_schedule(subscribe, include_last=False)
-            else:
-                self._clear_probe_schedule_by_sid(sid, include_last=False)
+        if stale_generation:
+            return
+        subscribe = self._subscribe_oper.get(int(sid)) if self._subscribe_oper else None
+        if subscribe:
+            self._pause_manager.clear_probe_schedule(subscribe, include_last=False)
+        else:
+            self._clear_probe_schedule_by_sid(sid, include_last=False)
 
     def _clear_probe_schedule_by_sid(self, sid: str, include_last: bool = False):
         """订阅对象不可用时按 sid 清理本轮调度字段。"""
