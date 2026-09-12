@@ -118,7 +118,7 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/subscribeassistantenhancedq.png"
     # 插件版本
-    plugin_version = "0.10.7"
+    plugin_version = "0.10.8"
     _site_cache_candidate_helper_warned = False
     # 插件作者
     plugin_author = "Q"
@@ -2065,13 +2065,16 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
             if not self._move_torrent_location(instance, torrent_hash, media_dir):
                 logger.warning(f"订阅收容：{record_title} 搬回影视目录 {media_dir} 未成功，本轮保留种子")
                 return RELOCATE_RETAINED
-            self._remove_relocate_record(torrent_hash)
             if last_round:
+                # 先进观察期再清收容记录：观察期记录要续用原收容时间与到期点，
+                # 否则期满搬回收容目录时会把「未完成清理」14 天计时重置。
                 self._hr_round_enter_grace(torrent_hash, subscribe, torrent_task)
+                self._remove_relocate_record(torrent_hash)
                 logger.info(f"订阅收容：{record_title} 第 {round_no}/{round_limit} 轮命中（最后一轮），"
                             f"已搬回影视目录 {media_dir} 并进入 {HR_ROUND_GRACE_HOURS} 小时观察期"
                             f"（期满仍未完成再搬回收容目录保种）")
                 return RELOCATE_KEPT_FINAL
+            self._remove_relocate_record(torrent_hash)
             logger.info(f"订阅收容：{record_title} 第 {round_no}/{round_limit} 轮命中，"
                         f"已从收容目录搬回影视目录 {media_dir}（同一份种子继续下载）")
             return RELOCATE_RESTORED
