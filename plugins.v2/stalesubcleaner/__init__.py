@@ -23,7 +23,7 @@ class StaleSubCleaner(_PluginBase):
     plugin_name = "过期订阅清理Q自用版"
     plugin_desc = "检查电视剧订阅，超过指定天数未下载新剧集则自动取消订阅。"
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/stalesubcleaner.png"
-    plugin_version = "1.1.7"
+    plugin_version = "1.1.8"
     plugin_label = "订阅"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -49,6 +49,9 @@ class StaleSubCleaner(_PluginBase):
         self._download_oper = DownloadHistoryOper()
         saved = self.get_data("state") or {}
         self._total_cleaned = saved.get("total_cleaned", 0)
+        # 最近一次取消明细需持久化：否则重启后数据页只显示累计数量、看不到具体影视名
+        self._last_run = saved.get("last_run") or self._last_run
+        self._last_cleaned = saved.get("cleaned") or []
         if not config:
             self._enabled = False
             return
@@ -431,7 +434,11 @@ class StaleSubCleaner(_PluginBase):
             return
         logger.info("收到手动检查命令")
         self._do_check()
+        if self._last_cleaned:
+            detail = f"取消过期订阅 {len(self._last_cleaned)} 个: {self._format_cleaned_names(self._last_cleaned)}"
+        else:
+            detail = "取消过期订阅: 0 个"
         self.post_message(
             title="过期订阅清理",
-            text=f"检查完成\n取消过期订阅: {len(self._last_cleaned)} 个",
+            text=f"检查完成\n{detail}",
         )
