@@ -6,6 +6,7 @@
 
 判断逻辑：
 1. 媒体库中该季已全集入库 → 视为已完结，保留洗版
+   （媒体库检查用「媒体身份 + 本地索引条目 ID」定位，条目名与 TMDB 中文名不一致时也能命中）
 2. TMDB status=Ended 且 lack=0 → 视为已完结，保留洗版
 3. 其他情况（Returning Series / in_production / lack>0）→ 取消洗版
 """
@@ -23,10 +24,17 @@ from app.core.config import settings
 from app.core.event import eventmanager, Event
 from app.db.subscribe_oper import SubscribeOper
 from app.plugins import _PluginBase
-from app.schemas.types import EventType, MediaType
+from app.schemas.types import EventType, MediaSource, MediaType
 # 统一用插件 SDK 暴露的领域 MediaInfo：app.schemas 里还有一个同名 pydantic 模型，
 # 缺 get_poster_image 等方法，传给主程序媒体库接口会抛 AttributeError。
 from app.sdk.media import MediaInfo
+
+# 本地媒体库索引（数据库）查询入口：用于按媒体身份取媒体服务器的条目 ID。
+# 主程序版本不同路径可能变化，取不到时降级为「不带条目 ID」查询，插件仍可正常加载运行。
+try:
+    from app.db.oper.mediaserver import MediaServerOper
+except Exception:  # pragma: no cover - 兼容旧版主程序路径
+    MediaServerOper = None
 
 
 # TMDB 身份来源标识：新版 MoviePilot 的订阅/媒体条目用 media_source + media_id 描述媒体身份
@@ -40,7 +48,7 @@ class BestVersionGuard(_PluginBase):
     plugin_name = "洗版守护Q自用版"
     plugin_desc = "定时检查电视剧订阅：未完结的误标洗版自动取消，恢复普通订阅继续追更。"
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/bestversionguard.png"
-    plugin_version = "2.5.4"
+    plugin_version = "2.5.5"
     plugin_label = "订阅"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -348,16 +356,47 @@ class BestVersionGuard(_PluginBase):
         except (TypeError, ValueError):
             return None
 
-    def _get_library_episodes(self, tmdbid: int, season: int, title: str, year: str) -> Set[int]:
+    def _resolve_library_item_id(self, season: int, title: str, year: str,
+                                 media_id: Optional[str]) -> Optional[str]:
+        """按媒体身份从本地媒体库索引取媒体服务器条目 ID（与主程序查库口径一致）。
+
+        只按标题查询时，媒体服务器模块在拿不到条目 ID 的前提下会退回「标题严格相等」匹配；
+        库内条目名与 TMDB 中文名不一致时（例如库内为英文名 The Agency、TMDB 中文名「传奇办公室」）
+        该匹配必然失败，导致「库内已全集」被误判为「库内没有」。带条目 ID 后再查可精确命中。
+        """
+        if MediaServerOper is None or not media_id:
+            return None
+        try:
+            return MediaServerOper().get_item_id(
+                title=title,
+                year=year,
+                mtype=MediaType.TV.value,
+                media_source=TMDB_MEDIA_SOURCE,
+                media_id=str(media_id),
+                season=season,
+            )
+        except Exception as e:
+            logger.debug(f"查询媒体库索引失败: {title} S{season} - {e}")
+            return None
+
+    def _query_media_exists(self, season: int, title: str, year: str,
+                            media_id: Optional[str] = None,
+                            itemid: Optional[str] = None) -> Set[int]:
+        """查询媒体服务器中该季已入库的集号；media_id 为空表示不按媒体身份查询。"""
         try:
             mi = MediaInfo()
-            mi.tmdb_id = tmdbid
             mi.type = MediaType.TV
             mi.season = season
             mi.title = title
             mi.year = year
+            if media_id:
+                mi.media_source = MediaSource.TMDB
+                mi.media_id = str(media_id)
+                if str(media_id).isdigit():
+                    mi.tmdb_id = int(media_id)
             chain = MediaServerChain()
-            exists = chain.media_exists(mediainfo=mi)
+            # 不传 server：主程序会遍历全部已配置的媒体服务器（本机 Emby、飞牛影视等）
+            exists = chain.media_exists(mediainfo=mi, itemid=itemid)
             if exists and exists.seasons:
                 eps = exists.seasons.get(season) or exists.seasons.get(str(season))
                 if eps:
@@ -365,6 +404,21 @@ class BestVersionGuard(_PluginBase):
         except Exception as e:
             logger.debug(f"查询媒体库失败: {title} S{season} - {e}")
         return set()
+
+    def _get_library_episodes(self, tmdbid: int, season: int, title: str, year: str,
+                              media_id: Optional[str] = None) -> Set[int]:
+        """取媒体库中该季已入库的集号。
+
+        主口径：完整媒体身份 + 本地索引条目 ID（条目名不一致也能命中）；
+        兜底：不带条目 ID 按原方式再查一次，覆盖本地索引中没有身份记录的媒体服务器。
+        """
+        resolved_id = str(media_id or tmdbid)
+        itemid = self._resolve_library_item_id(season, title, year, resolved_id)
+        episodes = self._query_media_exists(season, title, year,
+                                            media_id=resolved_id, itemid=itemid)
+        if not episodes:
+            episodes = self._query_media_exists(season, title, year)
+        return episodes
 
     def _get_tmdb_season_total(self, tmdbid: int, season: int) -> int:
         try:
@@ -379,17 +433,24 @@ class BestVersionGuard(_PluginBase):
             pass
         return 0
 
-    def _is_season_complete(self, tmdbid: int, season: int, total: int, title: str, year: str) -> bool:
-        """判断指定季是否已完结（媒体库全集入库）。"""
+    def _missing_library_episodes(self, tmdbid: int, season: int, total: int,
+                                  title: str, year: str,
+                                  media_id: Optional[str] = None) -> List[int]:
+        """返回媒体库中该季缺失的集号；库内全集时返回空列表。"""
         if total <= 0:
-            return False
-        lib_eps = self._get_library_episodes(tmdbid, season, title, year)
-        if not lib_eps:
-            return False
-        for ep in range(1, total + 1):
-            if ep not in lib_eps:
-                return False
-        return True
+            return []
+        lib_eps = self._get_library_episodes(tmdbid, season, title, year, media_id)
+        return [ep for ep in range(1, total + 1) if ep not in lib_eps]
+
+    @staticmethod
+    def _format_missing_episodes(missing_eps: List[int], max_show: int = 12) -> str:
+        """把缺失集号格式化为可读文本；缺失较少时列出具体集号。"""
+        if not missing_eps:
+            return "0 集"
+        if len(missing_eps) <= max_show:
+            detail = "、".join(f"E{ep:02d}" for ep in missing_eps)
+            return f"{len(missing_eps)} 集（{detail}）"
+        return f"{len(missing_eps)} 集"
 
     # ── 核心逻辑 ──────────────────────────────────────────────
 
@@ -449,9 +510,13 @@ class BestVersionGuard(_PluginBase):
 
             # 获取该季 TMDB 总集数，判断媒体库是否全集入库
             season_total = self._get_tmdb_season_total(tmdbid, sub.season)
-            lib_complete = self._is_season_complete(
-                tmdbid, sub.season, season_total, sub.name, sub.year
-            ) if season_total > 0 else False
+            missing_eps: List[int] = []
+            if season_total > 0:
+                missing_eps = self._missing_library_episodes(
+                    tmdbid, sub.season, season_total, sub.name, sub.year,
+                    getattr(sub, "media_id", None),
+                )
+            lib_complete = season_total > 0 and not missing_eps
 
             # 判断该季是否已完结
             season_ended = lib_complete or (
@@ -476,12 +541,13 @@ class BestVersionGuard(_PluginBase):
                     logger.info(f"库缺集但处于重置限频期（{self._reset_cooldown_days} 天），跳过: "
                                 f"{sub.name} S{sub.season}")
                     continue
+                missing_text = self._format_missing_episodes(missing_eps)
                 if self._reset_subscribe(sub):
                     logger.info(f"库缺集重置订阅: {sub.name} S{sub.season} "
-                                f"(媒体库缺 {season_total} 集，等待重新下载)")
+                                f"(媒体库缺 {missing_text}，等待重新下载)")
                     reset_list.append({
                         "name": sub.name, "year": sub.year, "season": sub.season,
-                        "reason": f"媒体库缺 {season_total} 集但订阅认为已下完",
+                        "reason": f"媒体库缺 {missing_text}但订阅认为已下完",
                         "reset_time": now_str,
                     })
                     continue
