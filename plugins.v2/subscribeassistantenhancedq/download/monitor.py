@@ -253,11 +253,15 @@ class DownloadMonitor:
                 elif action == "manual_review" and cleanup:
                     subscribe = self._resolve_subscribe(task.get("subscribe_id"))
                     if subscribe is not None:
-                        cleanup.handle_timeout_manual_review(
+                        # 达到配置上限时把处置权交给收容往返链路：
+                        # H&R 种子按「往返轮次」在影视目录与收容目录之间搬动，末轮搬回影视目录并保留通知；
+                        # 非 H&R 种子仍走原有「保留种子 + 通知 + 保护期」。
+                        cleanup.handle_timeout_limit(
                             subscribe,
                             torrent_hash,
                             self.get_timeout_reason(task.get("subscribe_id"), task, info),
                             ignore_hours=TIMEOUT_MANUAL_REVIEW_IGNORE_HOURS,
+                            downloader=downloader,
                         )
                 continue
             # 拿不到实时状态时，只有下载器可达且连续确认种子不存在，才按用户手动删除处理。
