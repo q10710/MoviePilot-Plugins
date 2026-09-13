@@ -6,6 +6,7 @@ from typing import Optional
 from app.schemas.types import MediaType
 
 from ..engine.types import CompletionSignal, PauseRecord
+from ..shared.airdate import lookup_tmdb_air_date
 from ..shared.media import (
     episode_candidates_after,
     episode_field,
@@ -41,6 +42,11 @@ class AiringPauseChecker:
                 return None
             release_date = parse_date(mediainfo.release_date)
             if release_date is None:
+                # 识别结果不含上映日期（如 imdb 来源）时按外部ID回查 TMDB 补齐
+                release_date = lookup_tmdb_air_date(
+                    subscribe, mediainfo, is_movie=True
+                )
+            if release_date is None:
                 # 上映日期无法解析时默认暂停，避免在不明窗口期下载
                 return PauseRecord(
                     reason="pre_air",
@@ -66,6 +72,16 @@ class AiringPauseChecker:
         ))
         if air_date is None:
             air_date = first_available_scope_episode_air_date(subscribe, episodes or [])
+        if air_date is None:
+            # 识别结果不含季排期（如 imdb 来源）时，先用其自带的首播/上映日期兜底
+            air_date = parse_date(mediainfo.first_air_date) or parse_date(
+                mediainfo.release_date
+            )
+        if air_date is None:
+            # 仍无日期时按外部ID回查 TMDB 补齐，避免 imdb / 豆瓣来源永久判为未知
+            air_date = lookup_tmdb_air_date(
+                subscribe, mediainfo, season=subscribe.season, is_movie=False
+            )
         if air_date is None:
             # 剧集没有任何可用排期时保持暂停，避免未知开播窗口被集数待定提前接管。
             return PauseRecord(
