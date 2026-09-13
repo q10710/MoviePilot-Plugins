@@ -90,6 +90,11 @@ from .shared.subscribe import format_subscribe
 # 期满仍未完成才搬回收容目录继续保种（沿用上游「保留 + 保护期」的思路）。
 HR_ROUND_GRACE_HOURS = 24
 
+# 收容记录锁的单次获取超时（秒）：拿不到只跳过本轮并记日志，绝不无限等待。
+# 同时禁止在持锁期间再调用会取同一把锁的方法——旧版在删除收容种子后调用
+# _hr_round_clear 属于锁重入（threading.Lock 不可重入），会导致整轮永久卡死。
+RELOCATE_LOCK_TIMEOUT = 30
+
 
 class SummaryPayload(BaseModel):
     """订阅助手概览接口的业务数据模型。"""
@@ -118,7 +123,7 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/subscribeassistantenhancedq.png"
     # 插件版本
-    plugin_version = "0.10.10"
+    plugin_version = "0.10.13"
     _site_cache_candidate_helper_warned = False
     # 插件作者
     plugin_author = "Q"
@@ -2319,7 +2324,8 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
         if torrent_hash in records:
             logger.info(f"订阅清理：{torrent_hash} 已在收容记录中，跳过删除源文件（保种由收容到期清理管理）")
             return True
-        downloader, conclusive, raw = self._locate_torrent_downloader(torrent_hash)
+        # 这里只需「找到任一副本」判断是否 H&R，不做已完成选优，避免把正在保种的已完成副本搬走
+        downloader, conclusive, raw = self._locate_torrent_downloader(torrent_hash, prefer_finished=False)
         if not downloader:
             # 找不到种子时按原逻辑处理：没有可保护的做种任务
             return False
@@ -2503,29 +2509,56 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
                 return download_path
         return ""
 
-    def _locate_torrent_downloader(self, torrent_hash: str, preferred: Optional[str] = None) -> Tuple[
+    def _locate_torrent_downloader(self, torrent_hash: str, preferred: Optional[str] = None,
+                                   prefer_finished: bool = True) -> Tuple[
             Optional[str], bool, Optional[Any]]:
         """定位种子所在的下载器，返回 (下载器名, 结论是否确定, 命中的原始种子对象)。
 
+        同一份种子可能同时存在于多个下载器（自动转移做种 / 辅种），此时**优先返回已完成的那份**，
+        保证收容到期按「完成时间 + 站点 H&R 时长」计算，而不是把已完成副本当成未完成走 14 天分支。
         结论确定=True：已遍历全部已配置下载器且没有任何一个报错，可据此认定种子确实不存在；
         有下载器报错或不可用时为 False（不可判定），调用方应保留记录等下一轮重试，
         避免把「下载器瞬断」当成「种子已被删除」。
         命中的原始种子对象供调用方复用，避免同一轮对同一 hash 重复查询下载器。
         """
+        copies, conclusive = self._collect_torrent_copies(torrent_hash, preferred=preferred)
+        if not copies:
+            return None, conclusive, None
+        name, raw, _, _, _ = self._pick_torrent_copy(copies, prefer_finished=prefer_finished)
+        if not name:
+            return None, conclusive, None
+        return name, True, raw
+
+    def _collect_torrent_copies(self, torrent_hash: str, preferred: Optional[str] = None,
+                                only_preferred: bool = False) -> Tuple[
+            List[Tuple[str, Any, Any]], bool]:
+        """遍历全部已配置下载器，收集该 hash 的所有副本。
+
+        only_preferred=True 时只查记录里的下载器（快路径）：下载器种子量大时遍历全部下载器很慢，
+        调用方在「快路径足够判断」的场景下应使用它以控制单轮耗时。
+        返回 ([(下载器名, 原始种子, 下载器实例)], 结论是否确定)。
+        同一份种子可能同时存在于多个下载器（自动转移做种 / 辅种），调用方据此选优并一并清理。
+        """
         if not self._downloader_helper or not torrent_hash:
-            return None, False, None
+            return [], False
         candidates: List[str] = []
         if preferred:
             candidates.append(str(preferred))
-        try:
-            services = self._downloader_helper.get_services() or {}
-        except Exception as err:
-            logger.debug(f"订阅收容：获取下载器列表失败：{err}")
-            services = {}
-        for name in services.keys():
-            if name not in candidates:
-                candidates.append(name)
-        conclusive = bool(services)
+        services = {}
+        if not only_preferred:
+            try:
+                services = self._downloader_helper.get_services() or {}
+            except Exception as err:
+                logger.debug(f"订阅收容：获取下载器列表失败：{err}")
+                services = {}
+            for name in services.keys():
+                if name not in candidates:
+                    candidates.append(name)
+        if not candidates:
+            return [], False
+        # 只查记录里的下载器时，结论本身不足以断定种子不存在，因此不置为确定
+        conclusive = bool(services) and not only_preferred
+        copies: List[Tuple[str, Any, Any]] = []
         for name in candidates:
             try:
                 service = self._downloader_helper.get_service(name=name)
@@ -2538,12 +2571,70 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
                     conclusive = False
                     continue
                 if torrents:
-                    return name, True, torrents[0]
+                    copies.append((name, torrents[0], instance))
             except Exception as err:
                 logger.debug(f"订阅收容：查询下载器 {name} 中的种子失败 {torrent_hash}：{err}")
                 conclusive = False
                 continue
-        return None, conclusive, None
+        return copies, conclusive
+
+    def _torrent_copy_state(self, downloader: str, raw) -> Tuple[bool, bool, Optional[datetime.datetime]]:
+        """读取某份副本的完成状态，返回 (是否取到, 是否已完成, 完成时间)。"""
+        try:
+            service = self._downloader_helper.get_service(name=downloader)
+            from .download.torrent import TorrentAdapter
+            info = TorrentAdapter.get_info(raw, getattr(service, "type", None))
+            return True, bool(info.finished), self._torrent_completion_time(raw)
+        except Exception as err:
+            logger.debug(f"订阅收容：读取副本完成状态失败 {downloader}：{err}")
+            return False, False, None
+
+    def _pick_torrent_copy(self, copies: List[Tuple[str, Any, Any]], prefer_finished: bool = True) -> Tuple[
+            Optional[str], Optional[Any], Optional[Any], bool, Optional[datetime.datetime]]:
+        """从多份副本里选一份，返回 (下载器名, 原始种子, 下载器实例, 是否已完成, 完成时间)。
+
+        prefer_finished=True（默认）：优先已完成副本（保证到期按完成时间计算），否则取第一个命中；
+        prefer_finished=False：始终取第一个命中（订阅清理保护等只需「找到任一副本」的场景）。
+        取不到完成状态（解析异常）的副本被跳过；全部取不到时返回全 None，由调用方保留记录等下一轮。
+        """
+        first = None
+        for name, raw, instance in copies:
+            present, finished, completed_at = self._torrent_copy_state(name, raw)
+            if not present:
+                continue
+            if first is None:
+                first = (name, raw, instance, False, completed_at)
+            if finished and prefer_finished:
+                return name, raw, instance, True, completed_at
+        if first is None:
+            return None, None, None, False, None
+        return first
+
+    def _all_copies_for_delete(self, torrent_hash: str, preferred: Optional[str],
+                               known: List[Tuple[str, Any, Any]]) -> List[Tuple[str, Any, Any]]:
+        """删除前取全部副本：只查记录里的下载器会漏掉转移到其它下载器的那份，这里补一次全量核对。
+
+        删除属低频动作，代价可接受；全量查不到时报错即回退到已知副本，绝不因为查询失败而漏删。
+        """
+        all_copies, _conclusive = self._collect_torrent_copies(torrent_hash, preferred=preferred)
+        return all_copies or known
+
+    @staticmethod
+    def _delete_torrent_copies(copies: List[Tuple[str, Any, Any]], torrent_hash: str,
+                               delete_files: bool) -> List[str]:
+        """删除该 hash 的全部副本，返回成功删除的下载器名列表。
+
+        单个下载器删除失败只记日志、不影响其它副本与整轮清理；
+        是否保留文件由调用方按「到期删除源文件」配置传入。
+        """
+        removed: List[str] = []
+        for name, _raw, instance in copies:
+            try:
+                instance.delete_torrents(ids=torrent_hash, delete_file=delete_files)
+                removed.append(name)
+            except Exception as err:
+                logger.error(f"订阅收容：删除 {torrent_hash} 失败（{name}）：{err}")
+        return removed
 
     def _find_torrent_downloader(self, torrent_hash: str, preferred: Optional[str] = None) -> Optional[str]:
         """定位种子的当前所在下载器：优先给定下载器，其次遍历全部已配置下载器。
@@ -2644,127 +2735,212 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
         完成后按「完成时间 + 站点 H&R 时长」计算到期点，缺完成时间时回退收容时的预估到期值。
         种子可能因「自动转移做种」被搬到其它下载器，所以每轮先跨下载器定位当前位置并更新记录，
         所有下载器都找不到时视为已不存在，移出收容记录。
-        整轮读-改-写用收容锁串行化，避免与超时收容入口并发覆盖收容记录。
+        记录读-改-写改为「每条记录一次」在收容锁内合并提交（取锁带超时），
+        下载器查询、通知发送等外部调用全部移到锁外，且锁内不再调用会取同一把锁的方法，
+        避免整轮持锁时一处阻塞（或锁重入）拖死其它同样需要该锁的定时任务。
         """
         if not self._downloader_helper:
             return
-        with self._relocate_lock:
-            records = self.get_data("relocate_records") or {}
-            if not records:
+        records = self._relocate_records_snapshot()
+        if not records:
+            return
+        now = datetime.datetime.now()
+        for torrent_hash, record in list(records.items()):
+            if not isinstance(record, dict):
+                continue
+            self._relocate_expired_one(torrent_hash, record, now)
+
+    def _relocate_expired_one(self, torrent_hash: str, record: dict,
+                              now: datetime.datetime) -> None:
+        """处理单条收容记录：下载器查询等外部调用在收容锁之外执行。
+
+        记录变更先记在副本与脏字段集合上，最后由 _relocate_record_commit 在锁内合并提交；
+        所有返回路径（含异常）都由 finally 保证提交，判定口径、删除条件与通知内容
+        与改造前完全一致；锁内也不再调用任何会取同一把锁的方法（旧版会因此死锁）。
+        """
+        record = dict(record)
+        dirty: set = set()
+        drop_record = False
+        try:
+            preferred = record.get("downloader")
+            # 快路径：先只查记录里的下载器（下载器种子量大时遍历全部下载器很慢，必须避免每轮全扫）
+            copies, conclusive = self._collect_torrent_copies(
+                torrent_hash, preferred=preferred, only_preferred=True)
+            picked = self._pick_torrent_copy(copies) if copies else (None, None, None, False, None)
+            # 仅在「快路径没找到」或「找到但未完成且本记录从未全量核对过」时遍历全部下载器，
+            # 兼顾正确性（发现转移到别的下载器、找已完成副本）与单轮耗时。
+            need_full_scan = (not copies) or (
+                not picked[3] and not record.get("copies_checked_at"))
+            if need_full_scan:
+                full_copies, full_conclusive = self._collect_torrent_copies(
+                    torrent_hash, preferred=preferred)
+                conclusive = conclusive and full_conclusive
+                if full_copies:
+                    copies = full_copies
+                    picked = self._pick_torrent_copy(copies)
+                if not record.get("copies_checked_at"):
+                    # 标记已全量核对（7 天内不再重复全扫），避免未完成记录每轮都遍历全部下载器
+                    record["copies_checked_at"] = now.strftime("%Y-%m-%d %H:%M:%S")
+                    dirty.add("copies_checked_at")
+            if not copies:
+                # 未到期时可能是下载器临时不可用，先保留；到期后仍找不到才移出记录，
+                # 且只有「遍历全部下载器都无报错」才认定种子已不存在，否则保留等下一轮
+                deadline_missing = self._parse_datetime_text(record.get("deadline"))
+                if deadline_missing and now >= deadline_missing:
+                    if conclusive:
+                        logger.info(f"订阅收容：{record.get('title') or torrent_hash} "
+                                    f"已不在任何下载器，移出收容记录")
+                        drop_record = True
+                    else:
+                        logger.warning(f"订阅收容：{record.get('title') or torrent_hash} 已到期但"
+                                       f"下载器状态不可判定，保留收容记录等下一轮重试")
                 return
-            now = datetime.datetime.now()
-            changed = False
-            for torrent_hash, record in list(records.items()):
-                downloader, conclusive, raw = self._locate_torrent_downloader(
-                    torrent_hash, preferred=record.get("downloader"))
+            # 同一份种子可能有多份副本（自动转移做种 / 辅种）：优先取已完成的那份，
+            # 到期按「完成时间 + 站点 H&R 时长」计算；清理时把全部副本一并删除，不留孤儿。
+            downloader, raw, _instance, finished, completed_at = picked
+            if not downloader:
+                # 有副本但本轮取不到状态（下载器瞬断等），保留记录等下一轮
+                return
+            # 全量核对已过期（7 天）时再补一次，避免长期只按快路径判断而漏掉新转移的副本
+            checked_at = self._parse_datetime_text(record.get("copies_checked_at"))
+            if checked_at and (now - checked_at).days >= 7:
+                extra_copies, extra_conclusive = self._collect_torrent_copies(
+                    torrent_hash, preferred=preferred)
+                conclusive = conclusive and extra_conclusive
+                if extra_copies:
+                    copies = extra_copies
+                    downloader, raw, _instance, finished, completed_at = self._pick_torrent_copy(copies)
+                record["copies_checked_at"] = now.strftime("%Y-%m-%d %H:%M:%S")
+                dirty.add("copies_checked_at")
                 if not downloader:
-                    # 未到期时可能是下载器临时不可用，先保留；到期后仍找不到才移出记录，
-                    # 且只有「遍历全部下载器都无报错」才认定种子已不存在，否则保留等下一轮
-                    deadline_missing = self._parse_datetime_text(record.get("deadline"))
-                    if deadline_missing and now >= deadline_missing:
-                        if conclusive:
-                            logger.info(f"订阅收容：{record.get('title') or torrent_hash} "
-                                        f"已不在任何下载器，移出收容记录")
-                            records.pop(torrent_hash, None)
-                            changed = True
-                        else:
-                            logger.warning(f"订阅收容：{record.get('title') or torrent_hash} 已到期但"
-                                           f"下载器状态不可判定，保留收容记录等下一轮重试")
-                    continue
-                if downloader != record.get("downloader"):
-                    logger.info(f"订阅收容：{record.get('title') or torrent_hash} 已转移到下载器 "
-                                f"{downloader}，更新收容记录")
-                    record["downloader"] = downloader
-                    records[torrent_hash] = record
-                    changed = True
-                present, finished, completed_at = self._relocate_completion_state(
-                    downloader, torrent_hash, raw=raw)
-                if not present:
-                    # 本轮取不到种子状态（下载器瞬断等），保留记录等下一轮
-                    continue
-                if not finished:
-                    # 站点 H&R 从下载完成才开始考察，一直下不完的种子不会进入考察，
-                    # 因此超过「未完成清理天数」后按「站点不计 H&R」删除任务与文件；未到阈值只跳过
-                    limit_days = int(getattr(self._config, "relocate_incomplete_days", 0) or 0)
-                    relocated_at = self._parse_datetime_text(record.get("relocated_at"))
-                    waited_days = (now - relocated_at).days if relocated_at else 0
-                    if limit_days <= 0 or waited_days < limit_days:
-                        continue
-                    service = self._downloader_helper.get_service(name=downloader)
-                    instance = getattr(service, "instance", None) if service else None
-                    if not instance:
-                        continue
-                    try:
-                        # 是否保留文件沿用「到期删除源文件」配置，避免同一插件内两处口径不一致
-                        instance.delete_torrents(
-                            ids=torrent_hash,
-                            delete_file=bool(record.get("delete_files", True)))
-                    except Exception as err:
-                        logger.error(f"订阅收容：未完成清理删除 {torrent_hash} 失败（{downloader}）：{err}")
-                        continue
-                    logger.info(f"订阅收容未完成清理：已在 {downloader} 删除 "
-                                f"{record.get('title') or torrent_hash}"
-                                f"（收容于 {record.get('relocated_at')}，已 {waited_days} 天未完成）")
-                    if getattr(self._config, "notify", True):
-                        try:
-                            self.post_message(
-                                title="【订阅收容未完成清理】",
-                                text=(f"收容后 {waited_days} 天仍未下载完成，按「站点不计 H&R」清理："
-                                      f"{record.get('title') or torrent_hash}"
-                                      f"（站点 {record.get('site_name') or '-'}，任务与文件已删除）"),
-                            )
-                        except Exception as err:
-                            logger.debug(f"订阅收容：未完成清理通知发送失败：{err}")
-                    records.pop(torrent_hash, None)
-                    changed = True
-                    self._hr_round_clear(torrent_hash)
-                    continue
-                if completed_at:
-                    completed_text = completed_at.strftime("%Y-%m-%d %H:%M:%S")
-                    if record.get("completed_at") != completed_text:
-                        record["completed_at"] = completed_text
-                        records[torrent_hash] = record
-                        changed = True
-                deadline = self._relocate_deadline(record, completed_at)
-                if not deadline:
-                    continue
-                deadline_text = deadline.strftime("%Y-%m-%d %H:%M:%S")
-                if record.get("deadline") != deadline_text:
-                    # 以完成时间为基准刷新到期点，收容清单页展示同一口径
-                    record["deadline"] = deadline_text
-                    records[torrent_hash] = record
-                    changed = True
-                if now < deadline:
-                    continue
-                service = self._downloader_helper.get_service(name=downloader)
-                instance = getattr(service, "instance", None) if service else None
-                if not instance:
-                    continue
-                try:
-                    instance.delete_torrents(ids=torrent_hash,
-                                             delete_file=bool(record.get("delete_files", True)))
-                except Exception as err:
-                    logger.error(f"订阅收容：到期删除 {torrent_hash} 失败（{downloader}）：{err}")
-                    continue
-                logger.info(f"订阅收容到期：已在 {downloader} 删除 {record.get('title') or torrent_hash}"
-                            f"（收容于 {record.get('relocated_at')}，"
-                            f"完成于 {record.get('completed_at') or '-'}，到期 {deadline_text}）")
-                self._hr_round_clear(torrent_hash)
+                    return
+            if downloader != record.get("downloader"):
+                logger.info(f"订阅收容：{record.get('title') or torrent_hash} 已转移到下载器 "
+                            f"{downloader}（{'已完成' if finished else '未完成'}），更新收容记录")
+                record["downloader"] = downloader
+                dirty.add("downloader")
+            if len(copies) > 1:
+                detail(f"订阅收容：{record.get('title') or torrent_hash} 在 "
+                       f"{len(copies)} 个下载器均有副本（{'/'.join(name for name, _, _ in copies)}），"
+                       f"按{'已完成' if finished else '未完成'}副本计算到期")
+            if not finished:
+                # 站点 H&R 从下载完成才开始考察，一直下不完的种子不会进入考察，
+                # 因此超过「未完成清理天数」后按「站点不计 H&R」删除任务与文件；未到阈值只跳过
+                limit_days = int(getattr(self._config, "relocate_incomplete_days", 0) or 0)
+                relocated_at = self._parse_datetime_text(record.get("relocated_at"))
+                waited_days = (now - relocated_at).days if relocated_at else 0
+                if limit_days <= 0 or waited_days < limit_days:
+                    return
+                # 是否保留文件沿用「到期删除源文件」配置，避免同一插件内两处口径不一致
+                delete_files = bool(record.get("delete_files", True))
+                removed_downloaders = self._delete_torrent_copies(
+                    self._all_copies_for_delete(torrent_hash, preferred, copies),
+                    torrent_hash, delete_files)
+                if not removed_downloaders:
+                    return
+                logger.info(f"订阅收容未完成清理：已在 {'/'.join(removed_downloaders)} 删除 "
+                            f"{record.get('title') or torrent_hash}"
+                            f"（收容于 {record.get('relocated_at')}，已 {waited_days} 天未完成）")
                 if getattr(self._config, "notify", True):
                     try:
                         self.post_message(
-                            title="【订阅收容到期】",
-                            text=(f"已删除收容种子：{record.get('title') or torrent_hash}"
-                                  f"（站点 {record.get('site_name') or '-'}，"
-                                  f"完成于 {record.get('completed_at') or '-'}，"
-                                  f"已做满 {record.get('hr_hours') or '-'} 小时）"),
+                            title="【订阅收容未完成清理】",
+                            text=(f"收容后 {waited_days} 天仍未下载完成，按「站点不计 H&R」清理："
+                                  f"{record.get('title') or torrent_hash}"
+                                  f"（站点 {record.get('site_name') or '-'}，任务与文件已删除）"),
                         )
                     except Exception as err:
-                        logger.debug(f"订阅收容：到期通知发送失败：{err}")
-                records.pop(torrent_hash, None)
-                changed = True
+                        logger.debug(f"订阅收容：未完成清理通知发送失败：{err}")
+                self._hr_round_clear(torrent_hash)
+                drop_record = True
+                return
+            if completed_at:
+                completed_text = completed_at.strftime("%Y-%m-%d %H:%M:%S")
+                if record.get("completed_at") != completed_text:
+                    record["completed_at"] = completed_text
+                    dirty.add("completed_at")
+            deadline = self._relocate_deadline(record, completed_at)
+            if not deadline:
+                return
+            deadline_text = deadline.strftime("%Y-%m-%d %H:%M:%S")
+            if record.get("deadline") != deadline_text:
+                # 以完成时间为基准刷新到期点，收容清单页展示同一口径
+                record["deadline"] = deadline_text
+                dirty.add("deadline")
+            if now < deadline:
+                return
+            removed_downloaders = self._delete_torrent_copies(
+                self._all_copies_for_delete(torrent_hash, preferred, copies),
+                torrent_hash, bool(record.get("delete_files", True)))
+            if not removed_downloaders:
+                return
+            logger.info(f"订阅收容到期：已在 {'/'.join(removed_downloaders)} 删除 "
+                        f"{record.get('title') or torrent_hash}"
+                        f"（收容于 {record.get('relocated_at')}，"
+                        f"完成于 {record.get('completed_at') or '-'}，到期 {deadline_text}）")
+            self._hr_round_clear(torrent_hash)
+            if getattr(self._config, "notify", True):
+                try:
+                    self.post_message(
+                        title="【订阅收容到期】",
+                        text=(f"已删除收容种子：{record.get('title') or torrent_hash}"
+                              f"（站点 {record.get('site_name') or '-'}，"
+                              f"完成于 {record.get('completed_at') or '-'}，"
+                              f"已做满 {record.get('hr_hours') or '-'} 小时）"),
+                    )
+                except Exception as err:
+                    logger.debug(f"订阅收容：到期通知发送失败：{err}")
+            drop_record = True
+        finally:
+            self._relocate_record_commit(
+                torrent_hash, {key: record[key] for key in dirty}, drop_record)
+
+    def _relocate_records_snapshot(self) -> dict:
+        """在收容锁内取收容记录快照；取锁超时返回空字典（本轮跳过）。"""
+        if not self._acquire_relocate_lock():
+            return {}
+        try:
+            records = self.get_data("relocate_records") or {}
+            return dict(records) if isinstance(records, dict) else {}
+        finally:
+            self._relocate_lock.release()
+
+    def _relocate_record_commit(self, torrent_hash: str, fields: Optional[dict],
+                                drop: bool = False) -> None:
+        """在收容锁内合并提交单条收容记录的字段变更；取锁超时则本轮放弃（下一轮重算）。"""
+        if not fields and not drop:
+            return
+        if not self._acquire_relocate_lock():
+            return
+        try:
+            records = self.get_data("relocate_records") or {}
+            if not isinstance(records, dict):
+                records = {}
+            changed = False
+            if drop:
+                if records.pop(torrent_hash, None) is not None:
+                    changed = True
+            else:
+                current = records.get(torrent_hash)
+                if isinstance(current, dict):
+                    for key, value in (fields or {}).items():
+                        if current.get(key) != value:
+                            current[key] = value
+                            changed = True
             if changed:
                 self.save_data("relocate_records", records)
+        finally:
+            self._relocate_lock.release()
+
+    def _acquire_relocate_lock(self, timeout: float = RELOCATE_LOCK_TIMEOUT) -> bool:
+        """带超时获取收容锁：拿不到只记日志并返回 False，绝不无限等待。"""
+        try:
+            acquired = self._relocate_lock.acquire(timeout=timeout)
+        except TypeError:
+            acquired = self._relocate_lock.acquire(False)
+        if not acquired:
+            logger.warning(f"订阅收容：收容记录锁被占用超过 {timeout} 秒，本轮跳过收容记录变更")
+        return acquired
 
     def _fetch_downloader_torrent(self, downloader, torrent_hash):
         """连下载器取单个种子并映射为 TorrentInfo；取不到或下载器出错返回 None。
