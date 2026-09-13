@@ -123,7 +123,7 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/subscribeassistantenhancedq.png"
     # 插件版本
-    plugin_version = "0.10.13"
+    plugin_version = "0.10.14"
     _site_cache_candidate_helper_warned = False
     # 插件作者
     plugin_author = "Q"
@@ -2764,9 +2764,14 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
         try:
             preferred = record.get("downloader")
             # 快路径：先只查记录里的下载器（下载器种子量大时遍历全部下载器很慢，必须避免每轮全扫）
-            copies, conclusive = self._collect_torrent_copies(
+            copies, _fast_conclusive = self._collect_torrent_copies(
                 torrent_hash, preferred=preferred, only_preferred=True)
             picked = self._pick_torrent_copy(copies) if copies else (None, None, None, False, None)
+            # 快路径只查了记录里的那个下载器，其结论本身不足以断定「种子已不存在」，
+            # 因此最终结论只取全量扫描的结果。旧写法 `conclusive = conclusive and full_conclusive`
+            # 会因快路径恒为 False 而恒为 False，导致「种子已不在任何下载器 → 移出收容记录」
+            # 这条分支永远无法触发，收容记录只会每轮重复查询、永不清理。
+            conclusive = False
             # 仅在「快路径没找到」或「找到但未完成且本记录从未全量核对过」时遍历全部下载器，
             # 兼顾正确性（发现转移到别的下载器、找已完成副本）与单轮耗时。
             need_full_scan = (not copies) or (
@@ -2774,7 +2779,7 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
             if need_full_scan:
                 full_copies, full_conclusive = self._collect_torrent_copies(
                     torrent_hash, preferred=preferred)
-                conclusive = conclusive and full_conclusive
+                conclusive = full_conclusive
                 if full_copies:
                     copies = full_copies
                     picked = self._pick_torrent_copy(copies)
