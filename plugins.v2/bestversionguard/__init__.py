@@ -48,7 +48,7 @@ class BestVersionGuard(_PluginBase):
     plugin_name = "洗版守护Q自用版"
     plugin_desc = "定时检查电视剧订阅：未完结的误标洗版自动取消，恢复普通订阅继续追更。"
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/bestversionguard.png"
-    plugin_version = "2.5.6"
+    plugin_version = "2.5.7"
     plugin_label = "订阅"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -526,9 +526,12 @@ class BestVersionGuard(_PluginBase):
             lib_complete = season_total > 0 and not missing_eps
 
             # 判断该季是否已完结
-            season_ended = lib_complete or (
-                tmdb_status == "Ended" and (not sub.lack_episode or sub.lack_episode <= 0)
-            )
+            # TMDB 已完结即视为已完结：即使媒体库缺集也不取消洗版，只确保整季洗版（best_version_full=1）。
+            # 旧的「Ended 且不缺集才算完结」判据，会把「已完结 + 库缺集 + 正在等下完（lack>0）」误判成
+            # 「未完结却误标洗版」而取消洗版，与「缺集 → 重置订阅 → 重下 → 洗版入库」的自愈闭环冲突
+            # （实例：订阅 3252 飞到我心上 S1，日志报「TMDB 已完结但缺 24 集」）。
+            # 仅当 TMDB 仍在制作中/连载中且库内不全时才取消洗版，原有能力保持不变。
+            season_ended = tmdb_status == "Ended" or lib_complete
 
             # ── 媒体库文件丢失：库确实缺集，但订阅认为已下完（lack_episode<=0） ──
             # 说明媒体库那份被删了（如硬链接断开后被清理），主程序不会自动补下，
