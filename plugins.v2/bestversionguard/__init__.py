@@ -57,7 +57,7 @@ class BestVersionGuard(_PluginBase):
     plugin_desc = ("只看订阅那一季：该季已播完的保留整季洗版（库缺集时重置洗版进度重新补集），"
                    "该季未播完的取消洗版恢复普通订阅；订阅一建立即判定。")
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/bestversionguard.png"
-    plugin_version = "2.6.2"
+    plugin_version = "2.6.3"
     plugin_label = "订阅"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -684,7 +684,11 @@ class BestVersionGuard(_PluginBase):
                 # 库缺集也不会再搜索 → 内容缺了却补不回来，必须清掉进度标记。
                 if self._reset_missing_enabled and season_total > 0 and not lib_complete \
                         and sub.current_priority:
-                    if not self._can_reset(sub.id):
+                    if sub.state == "P":
+                        # 已有下载在进行，不打扰：等它下完再由后续轮次判断，避免重复搜索与重复通知。
+                        # 与「整订阅重置」保持同一道安全边界（下载中一律跳过）。
+                        logger.info(f"库缺集但当前有下载进行中，暂不重置洗版进度: {sub.name} S{sub.season}")
+                    elif not self._can_reset(sub.id):
                         logger.info(f"库缺集但处于重置限频期（{self._reset_cooldown_days} 天），跳过: "
                                     f"{sub.name} S{sub.season}")
                     elif self._reset_best_version_progress(sub):
