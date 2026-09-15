@@ -57,7 +57,7 @@ class BestVersionGuard(_PluginBase):
     plugin_desc = ("只看订阅那一季：该季已播完的保留整季洗版（库缺集时重置洗版进度重新补集），"
                    "该季未播完的取消洗版恢复普通订阅；订阅一建立即判定。")
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/bestversionguard.png"
-    plugin_version = "2.6.1"
+    plugin_version = "2.6.2"
     plugin_label = "订阅"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -82,6 +82,11 @@ class BestVersionGuard(_PluginBase):
     _fixed_ids: Set[str] = set()
     # 持久化：已重置订阅 ID -> 上次重置时间戳（用于限频）
     _reset_records: Dict[str, float] = {}
+    # 即时判定（订阅新增事件）串行化：事件可能在短时间内大量触发（如榜单插件批量建订阅），
+    # 若并发执行会同时改插件数据、并按条数放大 TMDB 与媒体库查询压力。
+    _single_check_lock = threading.Lock()
+    # 插件状态落盘互斥：避免并发写入时后写覆盖先写（丢失限频记录/取消记录）
+    _state_lock = threading.Lock()
 
     def init_plugin(self, config: dict = None) -> None:
         self.stop_service()
@@ -296,14 +301,16 @@ class BestVersionGuard(_PluginBase):
     # ── 辅助方法 ──────────────────────────────────────────────
 
     def _save_state(self) -> None:
-        self.save_data("state", {
-            "fixed_ids": list(self._fixed_ids),
-            "fixed_count": self._fixed_count,
-            "reset_records": self._reset_records,
-            "last_run": self._last_run,
-            "last_fixed": (self._last_fixed or [])[:50],
-            "last_reset": (self._last_reset or [])[:50],
-        })
+        # 加锁后再取快照：保证写入的是当前内存状态的完整视图，避免并发写互相覆盖
+        with self._state_lock:
+            self.save_data("state", {
+                "fixed_ids": list(self._fixed_ids),
+                "fixed_count": self._fixed_count,
+                "reset_records": dict(self._reset_records),
+                "last_run": self._last_run,
+                "last_fixed": (self._last_fixed or [])[:50],
+                "last_reset": (self._last_reset or [])[:50],
+            })
 
     def _can_reset(self, subscribe_id: Any) -> bool:
         """判断该订阅当前是否允许重置（按限频天数去抖，0 表示不限频）。"""
@@ -339,6 +346,8 @@ class BestVersionGuard(_PluginBase):
         except Exception as e:
             logger.info(f"重置订阅失败: {sub.name} - {e}")
             return False
+        # 字典项写入是原子操作；随后 _save_state() 会持锁取快照并落盘。
+        # 注意不要在此处再加 _state_lock：_save_state 内部已持同一把不可重入锁，会死锁。
         self._reset_records[str(sub.id)] = time.time()
         self._save_state()
         return True
@@ -365,6 +374,7 @@ class BestVersionGuard(_PluginBase):
         except Exception as e:
             logger.info(f"重置洗版进度失败: {sub.name} - {e}")
             return False
+        # 同上：不要在此处取 _state_lock，避免与 _save_state 内的锁重入死锁。
         self._reset_records[str(sub.id)] = time.time()
         self._save_state()
         return True
@@ -799,8 +809,18 @@ class BestVersionGuard(_PluginBase):
         ).start()
 
     def _check_added_subscribe(self, subscribe_id: int) -> None:
-        """订阅新增后的即时判定（异常只记日志，绝不中断主流程）。"""
+        """订阅新增后的即时判定（异常只记日志，绝不中断主流程）。
+
+        用锁串行执行：批量建订阅时不会同时压测 TMDB/媒体库，也不会并发改写插件数据。
+        等锁超时则跳过本轮（整点巡检会覆盖该订阅），不堆积线程。
+        """
+        acquired = self._single_check_lock.acquire(timeout=120)
+        if not acquired:
+            logger.warning(f"已有即时检查在运行，本次跳过（整点巡检会覆盖）: id={subscribe_id}")
+            return
         try:
             self._guard_check(subscribe_id=subscribe_id)
         except Exception as e:
             logger.error(f"订阅新增即时检查失败: id={subscribe_id} - {e}")
+        finally:
+            self._single_check_lock.release()
