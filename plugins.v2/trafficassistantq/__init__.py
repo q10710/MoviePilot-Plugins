@@ -46,7 +46,7 @@ class TrafficAssistantQ(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/trafficassistantq.png"
     # 插件版本
-    plugin_version = "2.0.4"
+    plugin_version = "2.0.5"
     # 插件作者
     plugin_author = "Q"
     # 作者主页
@@ -780,11 +780,13 @@ class TrafficAssistantQ(_PluginBase):
         actions = []
 
         any_action_taken = False  # 初始化操作跟踪标志
+        any_action_enabled = False  # 初始化"是否有任一动作开关启用"标志
 
         # 处理搜索和订阅站点
         search_condition = (
             traffic_config.remove_from_search_if_below if is_low else traffic_config.add_to_search_if_above)
         if search_condition:
+            any_action_enabled = True
             success, action_msg = self.__update_search_sites(site_id=site_id, remove=is_low)
             actions.append(f"- {action_msg}")
             if success:
@@ -793,6 +795,7 @@ class TrafficAssistantQ(_PluginBase):
         subscription_condition = (
             traffic_config.remove_from_subscription_if_below if is_low else traffic_config.add_to_subscription_if_above)
         if subscription_condition:
+            any_action_enabled = True
             success, action_msg = self.__update_subscription_sites(site_id=site_id, remove=is_low)
             actions.append(f"- {action_msg}")
             if success:
@@ -802,6 +805,7 @@ class TrafficAssistantQ(_PluginBase):
         brush_condition = (
             traffic_config.enable_auto_brush_if_below if is_low else traffic_config.disable_auto_brush_if_above)
         if brush_condition:
+            any_action_enabled = True
             success, action_msg = self.__update_brush_sites(site_id=site_id, enable=is_low,
                                                             plugin_id=self._traffic_config.brush_plugin)
             actions.append(f"- {action_msg}")
@@ -811,7 +815,14 @@ class TrafficAssistantQ(_PluginBase):
 
         if not any_action_taken:
             actions.clear()
-            actions.append("- 配置项符合预期，无需调整")
+            if any_action_enabled:
+                actions.append("- 配置项符合预期，无需调整")
+            else:
+                actions.append("- 相关动作开关均未开启，未执行任何调整")
+
+        # 低分享率但自动刷流开关关闭时给出事实提示，避免与"无需调整"混淆
+        if is_low and not traffic_config.enable_auto_brush_if_below:
+            actions.append("- 自动刷流未启用（开关关闭），本次低分享率不会触发刷流")
 
         return "\n".join([traffic_summary] + actions)
 
