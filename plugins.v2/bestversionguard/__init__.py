@@ -5,7 +5,8 @@
 - 该季尚未播完 → 取消洗版，恢复普通订阅继续追更
 
 判断逻辑：
-1. 该季是否播完：取该季全部分集的 air_date，全部已过才算播完（只考虑单季）
+1. 该季是否播完：取该季全部分集的 air_date，全部已过才算播完（只考虑单季）；
+   若媒体库该季已齐全，同样按「已播完」处理，并兜住 TMDB 分集日期缺失/异常的情况
 2. 该季已播完但媒体库缺集（整季缺或个别集缺）→ 重置洗版进度（清 current_priority），
    让主程序重新搜索补集 —— 顶档（current_priority=100）会被主程序视为「洗版完成」而不再搜索，
    库缺集也补不回来
@@ -53,7 +54,7 @@ class BestVersionGuard(_PluginBase):
     plugin_name = "洗版守护Q自用版"
     plugin_desc = "定时检查电视剧订阅：未完结的误标洗版自动取消，恢复普通订阅继续追更。"
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/bestversionguard.png"
-    plugin_version = "2.5.8"
+    plugin_version = "2.5.9"
     plugin_label = "订阅"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -605,7 +606,10 @@ class BestVersionGuard(_PluginBase):
             if season_finished is None:
                 logger.warning(f"取不到 TMDB 季分集信息，本轮跳过: {sub.name} S{sub.season}")
                 continue
-            season_ended = season_finished
+            # 库内该季已齐全时同样按「已播完」处理：内容都在库里了，本季没有可追的；
+            # 同时兜住 TMDB 分集播出日期缺失/异常（实测有剧库内 190 集齐全，
+            # 但 TMDB 分集日期异常被判「已播 50/190」，仅凭日期会误判成未播完）。
+            season_ended = season_finished or lib_complete
 
             # ── 媒体库文件丢失：库确实缺集，但订阅认为已下完（lack_episode<=0） ──
             # 说明媒体库那份被删了（如硬链接断开后被清理），主程序不会自动补下，
