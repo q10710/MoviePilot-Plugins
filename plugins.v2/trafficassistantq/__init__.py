@@ -46,7 +46,7 @@ class TrafficAssistantQ(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/trafficassistantq.png"
     # 插件版本
-    plugin_version = "2.0.5"
+    plugin_version = "2.0.6"
     # 插件作者
     plugin_author = "Q"
     # 作者主页
@@ -778,6 +778,7 @@ class TrafficAssistantQ(_PluginBase):
         threshold_value = traffic_config.ratio_lower_limit if is_low else traffic_config.ratio_upper_limit
         traffic_summary = f"分享率：{ratio} ({threshold_type}{threshold_value})"
         actions = []
+        failure_messages = []  # 真失败/无法执行的说明，需单独保留，避免被"无需调整"掩盖
 
         any_action_taken = False  # 初始化操作跟踪标志
         any_action_enabled = False  # 初始化"是否有任一动作开关启用"标志
@@ -812,10 +813,15 @@ class TrafficAssistantQ(_PluginBase):
             if success:
                 any_action_taken = True  # 更新操作执行标志
                 self._plugin_reload_if_need = True  # 标记需要进行插件的热加载
+            elif "无需调整" not in action_msg:
+                # 真失败（如刷流插件配置获取失败、无最终配置模板无法创建）：单独保留原因
+                failure_messages.append(f"- {action_msg}")
 
         if not any_action_taken:
             actions.clear()
-            if any_action_enabled:
+            if failure_messages:
+                actions.extend(failure_messages)
+            elif any_action_enabled:
                 actions.append("- 配置项符合预期，无需调整")
             else:
                 actions.append("- 相关动作开关均未开启，未执行任何调整")
