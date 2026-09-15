@@ -1,14 +1,19 @@
 """洗版订阅守护插件。
 
-定时检查所有电视剧订阅的洗版状态：
-- 未完结但被误标为洗版的 → 取消洗版，恢复普通订阅
-- 已完结的洗版订阅保留不动（由订阅助手魔改版负责创建洗版订阅）
+定时检查所有电视剧订阅的洗版状态，**只看订阅指向的那一季**，不看整剧状态：
+- 该季已播完 → 保留并确保整季洗版（best_version / best_version_full = 1）
+- 该季尚未播完 → 取消洗版，恢复普通订阅继续追更
 
 判断逻辑：
-1. 媒体库中该季已全集入库 → 视为已完结，保留洗版
-   （媒体库检查用「媒体身份 + 本地索引条目 ID」定位，条目名与 TMDB 中文名不一致时也能命中）
-2. TMDB status=Ended 且 lack=0 → 视为已完结，保留洗版
-3. 其他情况（Returning Series / in_production / lack>0）→ 取消洗版
+1. 该季是否播完：取该季全部分集的 air_date，全部已过才算播完（只考虑单季）
+2. 该季已播完但媒体库缺集（整季缺或个别集缺）→ 重置洗版进度（清 current_priority），
+   让主程序重新搜索补集 —— 顶档（current_priority=100）会被主程序视为「洗版完成」而不再搜索，
+   库缺集也补不回来
+3. 该季尚未播完 → 取消洗版
+4. 库缺集且订阅却认为已下完（lack_episode<=0）→ 重置订阅触发重新下载（原有能力）
+5. 取不到该季分集信息 → 保守跳过本轮，不做任何改动
+
+媒体库检查用「媒体身份 + 本地索引条目 ID」定位，条目名与 TMDB 中文名不一致时也能命中。
 """
 
 import time
@@ -48,7 +53,7 @@ class BestVersionGuard(_PluginBase):
     plugin_name = "洗版守护Q自用版"
     plugin_desc = "定时检查电视剧订阅：未完结的误标洗版自动取消，恢复普通订阅继续追更。"
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/bestversionguard.png"
-    plugin_version = "2.5.7"
+    plugin_version = "2.5.8"
     plugin_label = "订阅"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -334,6 +339,32 @@ class BestVersionGuard(_PluginBase):
         self._save_state()
         return True
 
+    def _reset_best_version_progress(self, sub: Any) -> bool:
+        """只重置「洗版进度标记」，让主程序重新搜索补集。
+
+        与 _reset_subscribe 的区别：不改 lack_episode / note / state，
+        因此不会干扰正在进行的普通补集下载，只清掉「已洗版到的档位」这类完成标记。
+        场景：该季已播完、媒体库却缺集，而 current_priority 已达顶档被主程序当成「洗版完成」。
+        """
+        if not self._subscribe_oper:
+            return False
+        payload = {
+            "current_priority": None,
+            "current_audio_format": None,
+            "current_bitrate": None,
+            "current_bit_depth": None,
+            "current_sample_rate": None,
+            "episode_priority": {},
+        }
+        try:
+            self._subscribe_oper.update(sid=sub.id, payload=payload)
+        except Exception as e:
+            logger.info(f"重置洗版进度失败: {sub.name} - {e}")
+            return False
+        self._reset_records[str(sub.id)] = time.time()
+        self._save_state()
+        return True
+
     @staticmethod
     def _resolve_tmdbid(sub: Any) -> Optional[int]:
         """从订阅对象解析 TMDB ID。
@@ -440,6 +471,51 @@ class BestVersionGuard(_PluginBase):
             pass
         return 0
 
+    def _get_season_air_status(self, tmdbid: int, season: int
+                               ) -> Tuple[Optional[bool], int, int, List[int]]:
+        """判断目标单季是否已播完（只考虑这一季，不看整剧状态）。
+
+        返回 (该季是否已播完, 该季总集数, 已播出集数, 尚未播出的集号)。
+        首项为 None 表示取不到分集数据，调用方应保守跳过本轮、不做任何改动。
+
+        判定口径：
+        - 以该季分集的 air_date 为准，全部已过（含今天）才算播完；
+        - air_date 缺失或格式非法的集视为「尚未播出」，宁可判未播完，也不提前判播完；
+        - 分集条数少于 TMDB 报告的该季集数时视为数据不全，同样不判播完。
+        """
+        try:
+            episodes = TmdbChain().tmdb_episodes(tmdbid=tmdbid, season=season)
+        except Exception as e:
+            logger.debug(f"查询 TMDB 季分集失败: {tmdbid} S{season} - {e}")
+            episodes = []
+        if not episodes:
+            return None, 0, 0, []
+
+        today = datetime.now().date()
+        pending: List[int] = []
+        aired = 0
+        for ep in episodes:
+            ep_no = getattr(ep, "episode_number", None) or 0
+            air_date = (getattr(ep, "air_date", None) or "").strip()
+            if not air_date:
+                pending.append(ep_no)
+                continue
+            try:
+                aired_date = datetime.strptime(air_date, "%Y-%m-%d").date()
+            except ValueError:
+                pending.append(ep_no)
+                continue
+            if aired_date > today:
+                pending.append(ep_no)
+            else:
+                aired += 1
+
+        season_total = self._get_tmdb_season_total(tmdbid, season)
+        if season_total > len(episodes):
+            # TMDB 报告的该季集数多于已录入的分集，数据不全，不判播完
+            return False, season_total, aired, pending
+        return (len(pending) == 0), (season_total or len(episodes)), aired, pending
+
     def _missing_library_episodes(self, tmdbid: int, season: int, total: int,
                                   title: str, year: str,
                                   media_id: Optional[str] = None) -> List[int]:
@@ -509,11 +585,7 @@ class BestVersionGuard(_PluginBase):
                 continue
 
             tmdb_info = _get_tmdb(tmdbid)
-            if not tmdb_info:
-                continue
-
-            tmdb_status = tmdb_info.get("status", "")
-            in_production = tmdb_info.get("in_production", True)
+            tmdb_status = (tmdb_info or {}).get("status", "")
 
             # 获取该季 TMDB 总集数，判断媒体库是否全集入库
             season_total = self._get_tmdb_season_total(tmdbid, sub.season)
@@ -525,13 +597,15 @@ class BestVersionGuard(_PluginBase):
                 )
             lib_complete = season_total > 0 and not missing_eps
 
-            # 判断该季是否已完结
-            # TMDB 已完结即视为已完结：即使媒体库缺集也不取消洗版，只确保整季洗版（best_version_full=1）。
-            # 旧的「Ended 且不缺集才算完结」判据，会把「已完结 + 库缺集 + 正在等下完（lack>0）」误判成
-            # 「未完结却误标洗版」而取消洗版，与「缺集 → 重置订阅 → 重下 → 洗版入库」的自愈闭环冲突
-            # （实例：订阅 3252 飞到我心上 S1，日志报「TMDB 已完结但缺 24 集」）。
-            # 仅当 TMDB 仍在制作中/连载中且库内不全时才取消洗版，原有能力保持不变。
-            season_ended = tmdb_status == "Ended" or lib_complete
+            # 判断「这一季」是否已播完：只考虑单季，不看整剧状态。
+            # 整剧 Returning Series 只代表还会有下一季，本季是否播完要看本季分集的播出日期。
+            # 取不到分集信息时保守跳过本轮（不取消、不重置），避免 TMDB 数据缺失导致误判。
+            season_finished, season_tmdb_total, aired_count, _pending_eps = \
+                self._get_season_air_status(tmdbid, sub.season)
+            if season_finished is None:
+                logger.warning(f"取不到 TMDB 季分集信息，本轮跳过: {sub.name} S{sub.season}")
+                continue
+            season_ended = season_finished
 
             # ── 媒体库文件丢失：库确实缺集，但订阅认为已下完（lack_episode<=0） ──
             # 说明媒体库那份被删了（如硬链接断开后被清理），主程序不会自动补下，
@@ -567,27 +641,46 @@ class BestVersionGuard(_PluginBase):
                 if fix_key in self._fixed_ids:
                     self._fixed_ids.discard(fix_key)
                     self._save_state()
-                # 已完结的洗版订阅，确保只下载整季合集而非散装
+                # 该季已播完：确保处于整季洗版状态（单季播完就洗版）
+                payload: Dict[str, Any] = {}
+                if not sub.best_version:
+                    payload["best_version"] = 1
                 if not sub.best_version_full:
+                    payload["best_version_full"] = 1
+                if payload:
                     try:
-                        self._subscribe_oper.update(sid=sub.id, payload={"best_version_full": 1})
-                        logger.info(f"设置整季洗版: {sub.name} S{sub.season}")
+                        self._subscribe_oper.update(sid=sub.id, payload=payload)
+                        logger.info(f"该季已播完，开启整季洗版: {sub.name} S{sub.season}")
                     except Exception as e:
-                        logger.info(f"设置整季洗版失败: {sub.name} - {e}")
+                        logger.info(f"开启整季洗版失败: {sub.name} - {e}")
+                # 该季已播完但媒体库缺集 → 重置洗版进度，让主程序重新搜索补集。
+                # 主程序把 current_priority 当作「已洗版到的档位」，顶档（100）视为洗版完成，
+                # 库缺集也不会再搜索 → 内容缺了却补不回来，必须清掉进度标记。
+                if self._reset_missing_enabled and season_total > 0 and not lib_complete \
+                        and sub.current_priority:
+                    if not self._can_reset(sub.id):
+                        logger.info(f"库缺集但处于重置限频期（{self._reset_cooldown_days} 天），跳过: "
+                                    f"{sub.name} S{sub.season}")
+                    elif self._reset_best_version_progress(sub):
+                        missing_text = self._format_missing_episodes(missing_eps)
+                        logger.info(f"该季已播完但媒体库缺 {missing_text}，已重置洗版进度等待重新下载: "
+                                    f"{sub.name} S{sub.season}")
+                        reset_list.append({
+                            "name": sub.name, "year": sub.year, "season": sub.season,
+                            "reason": f"该季已播完但媒体库缺 {missing_text}，已重置洗版进度",
+                            "reset_time": now_str,
+                        })
                 continue
 
-            # ── 未完结，需要处理 ──
+            # ── 该季尚未播完，取消洗版 ──
             fix_key = str(sub.id)
             if fix_key in self._fixed_ids:
                 # 之前取消过洗版但被重新开启了，清除记录重新处理
                 self._fixed_ids.discard(fix_key)
 
-            if in_production:
-                reason = "TMDB 制作中"
-            elif tmdb_status == "Ended":
-                reason = f"TMDB 已完结但缺 {sub.lack_episode} 集"
-            else:
-                reason = f"TMDB {tmdb_status}"
+            reason = f"单季未播完（已播 {aired_count}/{season_tmdb_total} 集）"
+            if tmdb_status:
+                reason = f"{reason}，TMDB {tmdb_status}"
 
             if is_assistant_best:
                 # 订阅助手魔改版创建的洗版订阅，取消洗版标记（不删除，保留订阅继续追更）
@@ -625,7 +718,7 @@ class BestVersionGuard(_PluginBase):
             self._last_reset = reset_list
         self._save_state()
 
-        logger.info(f"检查完成: 取消 {len(fixed_list)} 个，库缺集重置 {len(reset_list)} 个")
+        logger.info(f"检查完成: 取消洗版 {len(fixed_list)} 个，重置 {len(reset_list)} 个")
 
         if self._notify and (fixed_list or reset_list):
             lines = self._format_lists(fixed_list, reset_list)
@@ -648,7 +741,7 @@ class BestVersionGuard(_PluginBase):
                 f"{f.get('name', '')} S{f.get('season')}" for f in reset_list[:limit]
             )
             suffix = f"等 {len(reset_list)} 个" if len(reset_list) > limit else ""
-            lines.append(f"媒体库文件丢失，已重置订阅重新下载: {names}{suffix}")
+            lines.append(f"已重置订阅/洗版进度，等待重新下载: {names}{suffix}")
         return lines
 
     # ── API ───────────────────────────────────────────────────
