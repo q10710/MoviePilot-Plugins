@@ -13,10 +13,12 @@
 3. 该季尚未播完 → 取消洗版
 4. 库缺集且订阅却认为已下完（lack_episode<=0）→ 重置订阅触发重新下载（原有能力）
 5. 取不到该季分集信息 → 保守跳过本轮，不做任何改动
+6. 订阅一建立即判定（监听 SubscribeAdded 事件，只处理洗版订阅），不必等每小时巡检
 
 媒体库检查用「媒体身份 + 本地索引条目 ID」定位，条目名与 TMDB 中文名不一致时也能命中。
 """
 
+import threading
 import time
 from datetime import datetime
 from app.log import logger
@@ -54,7 +56,7 @@ class BestVersionGuard(_PluginBase):
     plugin_name = "洗版守护Q自用版"
     plugin_desc = "定时检查电视剧订阅：未完结的误标洗版自动取消，恢复普通订阅继续追更。"
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/bestversionguard.png"
-    plugin_version = "2.5.9"
+    plugin_version = "2.6.0"
     plugin_label = "订阅"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -538,12 +540,27 @@ class BestVersionGuard(_PluginBase):
 
     # ── 核心逻辑 ──────────────────────────────────────────────
 
-    # 订阅助手魔改版创建洗版订阅时使用的 username
-    ASSISTANT_USERNAME = "订阅助手魔改版"
+    def _guard_check(self, subscribe_id: Optional[int] = None) -> None:
+        """检查洗版订阅。
 
-    def _guard_check(self) -> None:
-        logger.info("开始检查")
-        subscribes = self._subscribe_oper.list(state=None)
+        subscribe_id 为空：定时巡检全部订阅（主调度器每小时触发）；
+        subscribe_id 不为空：只检查该订阅（订阅新增事件触发，见 _on_subscribe_added）。
+        """
+        single = subscribe_id is not None
+        if single:
+            sub = self._subscribe_oper.get(subscribe_id)
+            if not sub:
+                return
+            # 只处理洗版订阅；普通订阅归订阅助手Q 管，这里不介入
+            if not sub.best_version:
+                logger.info(f"订阅新增检查：{sub.name} S{sub.season} (id={subscribe_id}) "
+                            f"非洗版订阅，跳过")
+                return
+            subscribes = [sub]
+            logger.info(f"订阅新增检查：{sub.name} S{sub.season} (id={subscribe_id})")
+        else:
+            logger.info("开始检查")
+            subscribes = self._subscribe_oper.list(state=None)
         if not subscribes:
             logger.info("无订阅，跳过")
             return
@@ -574,15 +591,10 @@ class BestVersionGuard(_PluginBase):
             if sub.state == "S":
                 continue
 
-            # ── 处理订阅助手魔改版创建的洗版订阅 ──
-            is_assistant_best = (
-                sub.best_version
-                and getattr(sub, "username", "") == self.ASSISTANT_USERNAME
-            )
-            # ── 处理普通订阅的 best_version 标记 ──
-            is_normal_best = sub.best_version and not is_assistant_best
-
-            if not is_assistant_best and not is_normal_best:
+            # 只处理洗版订阅（best_version=1）。
+            # 历史上这里按 username 区分「旧版订阅助手魔改版创建」与「其它来源」，
+            # 但两者处置完全相同（都是置 best_version=0），现合并为单一分支，日志不再区分来源。
+            if not sub.best_version:
                 continue
 
             tmdb_info = _get_tmdb(tmdbid)
@@ -686,40 +698,28 @@ class BestVersionGuard(_PluginBase):
             if tmdb_status:
                 reason = f"{reason}，TMDB {tmdb_status}"
 
-            if is_assistant_best:
-                # 订阅助手魔改版创建的洗版订阅，取消洗版标记（不删除，保留订阅继续追更）
-                try:
-                    self._subscribe_oper.update(sid=sub.id, payload={"best_version": 0})
-                    self._fixed_ids.add(fix_key)
-                    self._save_state()
-                    fixed_list.append({
-                        "name": sub.name, "year": sub.year, "season": sub.season,
-                        "reason": reason, "fixed_time": now_str,
-                    })
-                    logger.info(f"取消洗版(助手): {sub.name} S{sub.season} ({reason})")
-                except Exception as e:
-                    logger.info(f"取消洗版失败: {sub.name} - {e}")
-            else:
-                # 普通订阅的 best_version 标记，取消洗版
-                try:
-                    self._subscribe_oper.update(sid=sub.id, payload={"best_version": 0})
-                    self._fixed_ids.add(fix_key)
-                    self._save_state()
-                    fixed_list.append({
-                        "name": sub.name, "year": sub.year, "season": sub.season,
-                        "reason": reason, "fixed_time": now_str,
-                    })
-                    logger.info(f"取消洗版: {sub.name} S{sub.season} ({reason})")
-                except Exception as e:
-                    logger.info(f"取消洗版失败: {sub.name} - {e}")
+            # 取消洗版标记（不删除订阅，保留订阅继续追更）
+            try:
+                self._subscribe_oper.update(sid=sub.id, payload={"best_version": 0})
+                self._fixed_ids.add(fix_key)
+                self._save_state()
+                fixed_list.append({
+                    "name": sub.name, "year": sub.year, "season": sub.season,
+                    "reason": reason, "fixed_time": now_str,
+                })
+                logger.info(f"取消洗版: {sub.name} S{sub.season} ({reason})")
+            except Exception as e:
+                logger.info(f"取消洗版失败: {sub.name} - {e}")
 
-        self._last_run = now_str
-        self._fixed_count += len(fixed_list)
-        # 仅在本轮确有结果时更新明细，保留最近一次非空清单（重启后数据页仍能看到影视名）
-        if fixed_list:
-            self._last_fixed = fixed_list
-        if reset_list:
-            self._last_reset = reset_list
+        if not single:
+            # 单条（订阅新增触发）不覆盖定时巡检的最近明细与累计数，避免互相干扰
+            self._last_run = now_str
+            self._fixed_count += len(fixed_list)
+            # 仅在本轮确有结果时更新明细，保留最近一次非空清单（重启后数据页仍能看到影视名）
+            if fixed_list:
+                self._last_fixed = fixed_list
+            if reset_list:
+                self._last_reset = reset_list
         self._save_state()
 
         logger.info(f"检查完成: 取消洗版 {len(fixed_list)} 个，重置 {len(reset_list)} 个")
@@ -774,3 +774,33 @@ class BestVersionGuard(_PluginBase):
         else:
             text = "检查完成\n未发现需要处置的订阅"
         self.post_message(title="洗版守护", text=text)
+
+    @eventmanager.register(EventType.SubscribeAdded)
+    def _on_subscribe_added(self, event: Event = None) -> None:
+        """订阅新增事件：立即判定该订阅，不必等每小时巡检（只处理洗版订阅）。"""
+        if not self._enabled:
+            return
+        data = getattr(event, "event_data", None)
+        if not isinstance(data, dict):
+            return
+        try:
+            subscribe_id = int(data.get("subscribe_id") or 0)
+        except (TypeError, ValueError):
+            return
+        if not subscribe_id:
+            return
+        # 该事件在订阅创建流程中同步派发，这里用独立线程执行，
+        # 避免 TMDB / 媒体库查询拖慢订阅创建；异常一律只记日志。
+        threading.Thread(
+            target=self._check_added_subscribe,
+            args=(subscribe_id,),
+            name=f"BestVersionGuardAdded-{subscribe_id}",
+            daemon=True,
+        ).start()
+
+    def _check_added_subscribe(self, subscribe_id: int) -> None:
+        """订阅新增后的即时判定（异常只记日志，绝不中断主流程）。"""
+        try:
+            self._guard_check(subscribe_id=subscribe_id)
+        except Exception as e:
+            logger.error(f"订阅新增即时检查失败: id={subscribe_id} - {e}")
