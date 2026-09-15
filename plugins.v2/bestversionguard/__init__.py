@@ -54,9 +54,10 @@ class BestVersionGuard(_PluginBase):
     """洗版订阅守护插件。"""
 
     plugin_name = "洗版守护Q自用版"
-    plugin_desc = "定时检查电视剧订阅：未完结的误标洗版自动取消，恢复普通订阅继续追更。"
+    plugin_desc = ("只看订阅那一季：该季已播完的保留整季洗版（库缺集时重置洗版进度重新补集），"
+                   "该季未播完的取消洗版恢复普通订阅；订阅一建立即判定。")
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/bestversionguard.png"
-    plugin_version = "2.6.0"
+    plugin_version = "2.6.1"
     plugin_label = "订阅"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -658,9 +659,8 @@ class BestVersionGuard(_PluginBase):
                     self._fixed_ids.discard(fix_key)
                     self._save_state()
                 # 该季已播完：确保处于整季洗版状态（单季播完就洗版）
+                # 注：循环开头已过滤掉非洗版订阅，此处 sub.best_version 恒为真，无需再置 1
                 payload: Dict[str, Any] = {}
-                if not sub.best_version:
-                    payload["best_version"] = 1
                 if not sub.best_version_full:
                     payload["best_version_full"] = 1
                 if payload:
