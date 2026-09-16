@@ -545,6 +545,9 @@ class EventProxy:
                 page_url=getattr(torrent_info, "page_url", None),
                 title=getattr(torrent_info, "title", None),
                 description=getattr(torrent_info, "description", None),
+                # 下载当时存档种子级 H&R 标记与来源站点，供收容判定使用
+                hit_and_run=getattr(torrent_info, "hit_and_run", None),
+                site_name=getattr(torrent_info, "site_name", None),
             )
         lifecycle = self.get("lifecycle")
         result = lifecycle.handle_download_added_for_subscribe(subscribe) if lifecycle else None
