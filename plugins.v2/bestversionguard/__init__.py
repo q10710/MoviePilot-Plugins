@@ -64,7 +64,7 @@ class BestVersionGuard(_PluginBase):
     plugin_desc = ("只看订阅那一季：订阅新增时判定——该季已播完就直接开整季洗版，未播完保持普通订阅；"
                    "定时巡检只维护已是洗版的订阅（未播完取消洗版、已播完维持整季洗版并在库缺集时重置进度）。")
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/bestversionguard.png"
-    plugin_version = "2.8.1"
+    plugin_version = "2.8.2"
     plugin_label = "订阅"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -229,107 +229,185 @@ class BestVersionGuard(_PluginBase):
         }
 
     def get_page(self) -> Optional[List[dict]]:
+        """返回插件数据页：运行概览、统计卡片与最近一次变更明细。
+
+        布局说明：顶部状态条 → 四个统计卡片 → 操作按钮 → 三张明细表格卡片 → 判定口径说明。
+        表格改用 VTable + thead/tbody 结构（VDataTable 在当前前端渲染器下表头不显示，只剩分页脚，
+        页面会显得空白难读）。
+        """
         if not self._enabled:
-            return [{"component": "VAlert", "props": {"type": "warning", "text": "插件未启用"}}]
+            return [{
+                "component": "VAlert",
+                "props": {
+                    "type": "warning",
+                    "variant": "tonal",
+                    "text": "插件未启用：启用后才会在订阅新增时判定该季是否已播完，并对已是洗版的订阅做巡检维护",
+                },
+            }]
 
         last_run = self._last_run or "尚未运行"
-        page = [
-            {
+
+        # ── 顶部状态条 ──
+        page: List[dict] = [{
+            "component": "VAlert",
+            "props": {
+                "type": "info",
+                "variant": "tonal",
+                "class": "mb-4",
+                "text": (
+                    f"上次检查：{last_run}"
+                    f"｜检查周期：{self._cron or '未设置'}"
+                    f"｜库缺集重置：{'开启' if self._reset_missing_enabled else '关闭'}"
+                    f"（限频 {self._reset_cooldown_days} 天）"
+                ),
+            },
+        }]
+
+        # ── 统计卡片 ──
+        stats = [
+            ("累计开启洗版", self._enabled_count, "success", "该季已播完，开整季洗版"),
+            ("累计取消洗版", self._fixed_count, "warning", "该季未播完，恢复普通订阅"),
+            ("已重置进度", len(self._reset_records), "info", "库缺集，重置洗版重新补集"),
+            ("在管取消记录", len(self._fixed_ids), "primary", "已取消洗版的订阅条数"),
+        ]
+        stat_cols = []
+        for label, number, color, hint in stats:
+            stat_cols.append({
+                "component": "VCol",
+                "props": {"cols": 12, "sm": 6, "md": 3},
+                "content": [{
+                    "component": "VCard",
+                    "props": {"variant": "tonal", "color": color, "class": "h-100"},
+                    "content": [{
+                        "component": "VCardText",
+                        "props": {"class": "text-center py-4"},
+                        "content": [
+                            {
+                                "component": "div",
+                                "props": {"class": "text-h4 font-weight-black"},
+                                "text": str(number),
+                            },
+                            {
+                                "component": "div",
+                                "props": {"class": "text-body-2 mt-1"},
+                                "text": label,
+                            },
+                            {
+                                "component": "div",
+                                "props": {"class": "text-caption text-medium-emphasis mt-1"},
+                                "text": hint,
+                            },
+                        ],
+                    }],
+                }],
+            })
+        page.append({"component": "VRow", "content": stat_cols})
+
+        # ── 操作区 ──
+        page.append({
+            "component": "VCard",
+            "props": {"variant": "outlined", "class": "my-4"},
+            "content": [{
+                "component": "VCardActions",
+                "content": [
+                    {
+                        "component": "VBtn",
+                        "props": {"color": "primary", "variant": "flat"},
+                        "text": "立即检查",
+                        "events": {
+                            "click": {
+                                "api": "plugin/BestVersionGuard/check",
+                                "method": "get",
+                                "params": {"apikey": settings.API_TOKEN},
+                            }
+                        },
+                    },
+                    {"component": "VSpacer"},
+                    {
+                        "component": "span",
+                        "props": {"class": "text-caption text-medium-emphasis"},
+                        "text": "手动触发一轮判定，不影响定时检查节奏",
+                    },
+                ],
+            }],
+        })
+
+        # ── 最近一次变更明细 ──
+        sections = [
+            ("最近一次开启洗版（原为普通订阅）", self._last_enabled, "enable_time",
+             "最近一次检查没有新开洗版的订阅"),
+            ("最近一次取消洗版", self._last_fixed, "fixed_time",
+             "最近一次检查没有取消洗版的订阅"),
+            ("最近一次重置洗版进度", self._last_reset, "reset_time",
+             "最近一次检查没有重置进度的订阅"),
+        ]
+        for title, items, time_key, empty_text in sections:
+            if items:
+                head_cells = [
+                    {"component": "th", "text": text}
+                    for text in ("订阅", "季", "原因", "时间")
+                ]
+                rows = []
+                for item in items[:50]:
+                    season = item.get("season")
+                    rows.append({
+                        "component": "tr",
+                        "content": [
+                            {
+                                "component": "td",
+                                "text": f"{item.get('name') or '-'}（{item.get('year') or '-'}）",
+                            },
+                            {
+                                "component": "td",
+                                "text": f"S{season}" if season is not None else "-",
+                            },
+                            {"component": "td", "text": item.get("reason") or "-"},
+                            {"component": "td", "text": item.get(time_key) or "-"},
+                        ],
+                    })
+                body = [{
+                    "component": "VTable",
+                    "props": {"density": "compact", "hover": True},
+                    "content": [
+                        {
+                            "component": "thead",
+                            "content": [{"component": "tr", "content": head_cells}],
+                        },
+                        {"component": "tbody", "content": rows},
+                    ],
+                }]
+            else:
+                body = [{
+                    "component": "VAlert",
+                    "props": {"type": "success", "variant": "tonal", "text": empty_text},
+                }]
+            page.append({
                 "component": "VCard",
+                "props": {"variant": "outlined", "class": "mb-3"},
                 "content": [
                     {
                         "component": "VCardTitle",
-                        "props": {"title": "洗版守护"},
+                        "props": {"class": "text-subtitle-1 font-weight-bold"},
+                        "text": title,
                     },
-                    {
-                        "component": "VCardText",
-                        "content": [
-                            {
-                                "component": "VAlert",
-                                "props": {
-                                    "type": "info",
-                                    "text": (
-                                        f"上次检查: {last_run}\n"
-                                        f"累计开启洗版: {self._enabled_count} 个\n"
-                                        f"累计取消洗版: {self._fixed_count} 个"
-                                    ),
-                                    "variant": "tonal",
-                                },
-                            }
-                        ],
-                    },
-                    {
-                        "component": "VCardActions",
-                        "content": [
-                            {
-                                "component": "VBtn",
-                                "props": {"color": "primary"},
-                                "text": "立即检查",
-                                "events": {
-                                    "click": {
-                                        "api": "plugin/BestVersionGuard/check",
-                                        "method": "get",
-                                        "params": {"apikey": settings.API_TOKEN},
-                                    }
-                                },
-                            }
-                        ],
-                    },
-                ],
-            }
-        ]
-
-        if self._last_fixed:
-            page.append({
-                "component": "VCard",
-                "content": [
-                    {"component": "VCardTitle", "props": {"title": "最近取消洗版"}},
-                    {
-                        "component": "VCardText",
-                        "content": [
-                            {
-                                "component": "VDataTable",
-                                "props": {
-                                    "headers": [
-                                        {"title": "订阅", "key": "name"},
-                                        {"title": "季", "key": "season"},
-                                        {"title": "原因", "key": "reason"},
-                                        {"title": "时间", "key": "fixed_time"},
-                                    ],
-                                    "items": self._last_fixed[:50],
-                                    "itemsPerPage": 20,
-                                },
-                            }
-                        ],
-                    },
+                    {"component": "VCardText", "props": {"class": "pa-2"}, "content": body},
                 ],
             })
 
-        if self._last_enabled:
-            page.append({
-                "component": "VCard",
-                "content": [
-                    {"component": "VCardTitle", "props": {"title": "最近开启洗版（原为普通订阅）"}},
-                    {
-                        "component": "VCardText",
-                        "content": [
-                            {
-                                "component": "VDataTable",
-                                "props": {
-                                    "headers": [
-                                        {"title": "订阅", "key": "name"},
-                                        {"title": "季", "key": "season"},
-                                        {"title": "原因", "key": "reason"},
-                                        {"title": "时间", "key": "enable_time"},
-                                    ],
-                                    "items": self._last_enabled[:50],
-                                    "itemsPerPage": 20,
-                                },
-                            }
-                        ],
-                    },
-                ],
-            })
+        # ── 判定口径说明 ──
+        page.append({
+            "component": "VAlert",
+            "props": {
+                "type": "info",
+                "variant": "outlined",
+                "class": "mt-2",
+                "text": (
+                    "判定口径：① 订阅新增那一刻——该季已播完就直接开整季洗版，未播完保持普通订阅；"
+                    "② 定时巡检只维护已是洗版的订阅——未播完取消洗版、已播完且库缺集则重置洗版进度；"
+                    "③ 单季判据＝该季分集已全部播出，或库内该季已齐全；取不到分集信息时保守跳过。"
+                ),
+            },
+        })
 
         return page
 
