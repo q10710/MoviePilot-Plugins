@@ -64,7 +64,7 @@ class BestVersionGuard(_PluginBase):
     plugin_desc = ("只看订阅那一季：订阅新增时判定——该季已播完就直接开整季洗版，未播完保持普通订阅；"
                    "定时巡检只维护已是洗版的订阅（未播完取消洗版、已播完维持整季洗版并在库缺集时重置进度）。")
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/bestversionguard.png"
-    plugin_version = "2.8.2"
+    plugin_version = "2.8.3"
     plugin_label = "订阅"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -229,11 +229,11 @@ class BestVersionGuard(_PluginBase):
         }
 
     def get_page(self) -> Optional[List[dict]]:
-        """返回插件数据页：运行概览、统计卡片与最近一次变更明细。
+        """返回插件数据页：概览头部、统计卡片、最近一次变更明细与判定口径说明。
 
-        布局说明：顶部状态条 → 四个统计卡片 → 操作按钮 → 三张明细表格卡片 → 判定口径说明。
-        表格改用 VTable + thead/tbody 结构（VDataTable 在当前前端渲染器下表头不显示，只剩分页脚，
-        页面会显得空白难读）。
+        排版参考社区成熟插件：卡片用半透明色块 + 图标方块做视觉锚点，状态用彩色标签，
+        明细表用 VTable + thead/tbody（VDataTable 在当前渲染器下表头不显示、只剩分页脚）。
+        本方法只负责展示，不改变任何判定逻辑与数据。
         """
         if not self._enabled:
             return [{
@@ -241,107 +241,88 @@ class BestVersionGuard(_PluginBase):
                 "props": {
                     "type": "warning",
                     "variant": "tonal",
+                    "density": "compact",
+                    "prepend-icon": "mdi-alert-outline",
                     "text": "插件未启用：启用后才会在订阅新增时判定该季是否已播完，并对已是洗版的订阅做巡检维护",
                 },
             }]
 
-        last_run = self._last_run or "尚未运行"
+        def rgba(hex_color: str, alpha: float) -> str:
+            """把 #rrggbb 颜色转成指定透明度的 rgba 值（用于半透明底与描边）。"""
+            value = hex_color.lstrip("#")
+            red, green, blue = int(value[0:2], 16), int(value[2:4], 16), int(value[4:6], 16)
+            return f"rgba({red}, {green}, {blue}, {alpha})"
 
-        # ── 顶部状态条 ──
-        page: List[dict] = [{
-            "component": "VAlert",
-            "props": {
-                "type": "info",
-                "variant": "tonal",
-                "class": "mb-4",
-                "text": (
-                    f"上次检查：{last_run}"
-                    f"｜检查周期：{self._cron or '未设置'}"
-                    f"｜库缺集重置：{'开启' if self._reset_missing_enabled else '关闭'}"
-                    f"（限频 {self._reset_cooldown_days} 天）"
-                ),
-            },
-        }]
+        def icon_tile(icon: str, color: str, size: int = 40) -> dict:
+            """图标方块：圆角半透明底色 + 同色图标，用于卡片与标题的视觉锚点。"""
+            return {
+                "component": "div",
+                "props": {
+                    "class": "d-flex align-center justify-center flex-shrink-0",
+                    "style": (f"width: {size}px; height: {size}px; border-radius: 12px; "
+                              f"background: {rgba(color, 0.14)};"),
+                },
+                "content": [{
+                    "component": "VIcon",
+                    "props": {"size": int(size * 0.56), "style": f"color: {color};"},
+                    "text": icon,
+                }],
+            }
 
-        # ── 统计卡片 ──
-        stats = [
-            ("累计开启洗版", self._enabled_count, "success", "该季已播完，开整季洗版"),
-            ("累计取消洗版", self._fixed_count, "warning", "该季未播完，恢复普通订阅"),
-            ("已重置进度", len(self._reset_records), "info", "库缺集，重置洗版重新补集"),
-            ("在管取消记录", len(self._fixed_ids), "primary", "已取消洗版的订阅条数"),
-        ]
-        stat_cols = []
-        for label, number, color, hint in stats:
-            stat_cols.append({
+        def chip(text: str, color: str = "primary", icon: Optional[str] = None,
+                 size: str = "small", variant: str = "tonal") -> dict:
+            """状态标签：可选前置图标，颜色使用主题色名。"""
+            content: List[dict] = []
+            if icon:
+                content.append({
+                    "component": "VIcon",
+                    "props": {"size": 14, "class": "mr-1"},
+                    "text": icon,
+                })
+            content.append({"component": "span", "text": text})
+            return {
+                "component": "VChip",
+                "props": {"size": size, "variant": variant, "color": color},
+                "content": content,
+            }
+
+        def stat_card(icon: str, label: str, value: int, color: str, hint: str) -> dict:
+            """统计卡片：图标方块 + 大号数值 + 名称 + 说明。"""
+            return {
                 "component": "VCol",
                 "props": {"cols": 12, "sm": 6, "md": 3},
                 "content": [{
-                    "component": "VCard",
-                    "props": {"variant": "tonal", "color": color, "class": "h-100"},
-                    "content": [{
-                        "component": "VCardText",
-                        "props": {"class": "text-center py-4"},
-                        "content": [
-                            {
-                                "component": "div",
-                                "props": {"class": "text-h4 font-weight-black"},
-                                "text": str(number),
-                            },
-                            {
-                                "component": "div",
-                                "props": {"class": "text-body-2 mt-1"},
-                                "text": label,
-                            },
-                            {
-                                "component": "div",
-                                "props": {"class": "text-caption text-medium-emphasis mt-1"},
-                                "text": hint,
-                            },
-                        ],
-                    }],
-                }],
-            })
-        page.append({"component": "VRow", "content": stat_cols})
-
-        # ── 操作区 ──
-        page.append({
-            "component": "VCard",
-            "props": {"variant": "outlined", "class": "my-4"},
-            "content": [{
-                "component": "VCardActions",
-                "content": [
-                    {
-                        "component": "VBtn",
-                        "props": {"color": "primary", "variant": "flat"},
-                        "text": "立即检查",
-                        "events": {
-                            "click": {
-                                "api": "plugin/BestVersionGuard/check",
-                                "method": "get",
-                                "params": {"apikey": settings.API_TOKEN},
-                            }
+                    "component": "div",
+                    "props": {
+                        "class": "d-flex align-center ga-3 h-100 pa-3",
+                        "style": (f"background: {rgba(color, 0.08)}; "
+                                  f"border: 1px solid {rgba(color, 0.22)}; border-radius: 12px;"),
+                    },
+                    "content": [
+                        icon_tile(icon, color),
+                        {
+                            "component": "div",
+                            "props": {"class": "flex-grow-1", "style": "min-width: 0;"},
+                            "content": [
+                                {"component": "div",
+                                 "props": {"class": "text-h5 font-weight-black", "style": "line-height: 1.1;"},
+                                 "text": str(value)},
+                                {"component": "div",
+                                 "props": {"class": "text-body-2 font-weight-medium"},
+                                 "text": label},
+                                {"component": "div",
+                                 "props": {"class": "text-caption text-medium-emphasis",
+                                           "style": "white-space: normal;"},
+                                 "text": hint},
+                            ],
                         },
-                    },
-                    {"component": "VSpacer"},
-                    {
-                        "component": "span",
-                        "props": {"class": "text-caption text-medium-emphasis"},
-                        "text": "手动触发一轮判定，不影响定时检查节奏",
-                    },
-                ],
-            }],
-        })
+                    ],
+                }],
+            }
 
-        # ── 最近一次变更明细 ──
-        sections = [
-            ("最近一次开启洗版（原为普通订阅）", self._last_enabled, "enable_time",
-             "最近一次检查没有新开洗版的订阅"),
-            ("最近一次取消洗版", self._last_fixed, "fixed_time",
-             "最近一次检查没有取消洗版的订阅"),
-            ("最近一次重置洗版进度", self._last_reset, "reset_time",
-             "最近一次检查没有重置进度的订阅"),
-        ]
-        for title, items, time_key, empty_text in sections:
+        def detail_section(title: str, icon: str, color: str, items: List[dict],
+                           time_key: str, empty_text: str, badge: dict) -> dict:
+            """明细卡片：图标标题 + 数量标签 + 可滚动表格（无数据时显示提示）。"""
             if items:
                 head_cells = [
                     {"component": "th", "text": text}
@@ -353,60 +334,173 @@ class BestVersionGuard(_PluginBase):
                     rows.append({
                         "component": "tr",
                         "content": [
-                            {
-                                "component": "td",
-                                "text": f"{item.get('name') or '-'}（{item.get('year') or '-'}）",
-                            },
-                            {
-                                "component": "td",
-                                "text": f"S{season}" if season is not None else "-",
-                            },
-                            {"component": "td", "text": item.get("reason") or "-"},
-                            {"component": "td", "text": item.get(time_key) or "-"},
+                            {"component": "td", "props": {"style": "white-space: nowrap;"},
+                             "text": f"{item.get('name') or '-'}（{item.get('year') or '-'}）"},
+                            {"component": "td", "props": {"style": "white-space: nowrap;"},
+                             "text": f"S{season}" if season is not None else "-"},
+                            {"component": "td", "props": {"class": "text-body-2"},
+                             "text": item.get("reason") or "-"},
+                            {"component": "td", "props": {"class": "text-caption", "style": "white-space: nowrap;"},
+                             "text": item.get(time_key) or "-"},
                         ],
                     })
                 body = [{
-                    "component": "VTable",
-                    "props": {"density": "compact", "hover": True},
-                    "content": [
-                        {
-                            "component": "thead",
-                            "content": [{"component": "tr", "content": head_cells}],
-                        },
-                        {"component": "tbody", "content": rows},
-                    ],
+                    "component": "div",
+                    "props": {"style": "max-height: 420px; overflow: auto; scrollbar-width: thin;"},
+                    "content": [{
+                        "component": "VTable",
+                        "props": {"hover": True, "density": "comfortable", "style": "min-width: 560px;"},
+                        "content": [
+                            {"component": "thead", "content": [{"component": "tr", "content": head_cells}]},
+                            {"component": "tbody", "content": rows},
+                        ],
+                    }],
                 }]
             else:
                 body = [{
                     "component": "VAlert",
-                    "props": {"type": "success", "variant": "tonal", "text": empty_text},
+                    "props": {"type": "success", "variant": "tonal", "density": "compact",
+                              "prepend-icon": "mdi-check-circle-outline", "text": empty_text},
                 }]
-            page.append({
+            return {
                 "component": "VCard",
-                "props": {"variant": "outlined", "class": "mb-3"},
+                "props": {"variant": "flat", "rounded": "xl", "class": "mb-3 overflow-hidden",
+                          "style": "border: 1px solid rgba(128, 128, 128, 0.18);"},
                 "content": [
-                    {
-                        "component": "VCardTitle",
-                        "props": {"class": "text-subtitle-1 font-weight-bold"},
-                        "text": title,
-                    },
-                    {"component": "VCardText", "props": {"class": "pa-2"}, "content": body},
+                    {"component": "div", "props": {"class": "d-flex align-center ga-3 px-4 pt-4 pb-3"},
+                     "content": [
+                         icon_tile(icon, color, 34),
+                         {"component": "div", "props": {"class": "text-subtitle-1 font-weight-bold"},
+                          "text": title},
+                         {"component": "VSpacer"},
+                         badge,
+                     ]},
+                    {"component": "VDivider"},
+                    {"component": "VCardText", "props": {"class": "px-4 pt-3 pb-4"}, "content": body},
                 ],
-            })
+            }
+
+        last_run = self._last_run or "尚未运行"
+        accent, ok_color, warn_color, info_color, alt_color = (
+            "#6366f1", "#10b981", "#f59e0b", "#3b82f6", "#8b5cf6",
+        )
+
+        # ── 概览头部 ──
+        hero = {
+            "component": "VCard",
+            "props": {"variant": "flat", "rounded": "xl", "class": "mb-4 overflow-hidden",
+                      "style": "position: relative; border: 1px solid rgba(128, 128, 128, 0.18);"},
+            "content": [
+                {"component": "div", "props": {
+                    "class": "d-none d-sm-flex",
+                    "style": ("position: absolute; width: 150px; height: 150px; border-radius: 50%; "
+                              f"background: {rgba(accent, 0.08)}; top: -60px; left: -40px;")},
+                 "content": []},
+                {"component": "div", "props": {
+                    "class": "d-none d-sm-flex",
+                    "style": ("position: absolute; width: 190px; height: 190px; border-radius: 50%; "
+                              f"background: {rgba(ok_color, 0.07)}; bottom: -75px; right: -55px;")},
+                 "content": []},
+                {"component": "div", "props": {"class": "pa-4", "style": "position: relative;"},
+                 "content": [
+                     {"component": "div", "props": {"class": "d-flex align-center ga-3 flex-wrap"},
+                      "content": [
+                          icon_tile("mdi-shield-star-outline", accent, 48),
+                          {"component": "div", "props": {"class": "flex-grow-1", "style": "min-width: 200px;"},
+                           "content": [
+                               {"component": "div", "props": {"class": "text-h6 font-weight-bold"},
+                                "text": "洗版守护"},
+                               {"component": "div",
+                                "props": {"class": "text-caption text-medium-emphasis"},
+                                "text": "订阅新增时判定该季是否已播完；定时巡检只维护已是洗版的订阅"},
+                           ]},
+                          {"component": "VBtn",
+                           "props": {"color": "primary", "variant": "flat", "size": "small",
+                                     "prepend-icon": "mdi-refresh"},
+                           "text": "立即检查",
+                           "events": {"click": {
+                               "api": "plugin/BestVersionGuard/check",
+                               "method": "get",
+                               "params": {"apikey": settings.API_TOKEN},
+                           }}},
+                      ]},
+                     {"component": "VDivider", "props": {"class": "my-3"}},
+                     {"component": "div", "props": {"class": "d-flex flex-wrap ga-2"},
+                      "content": [
+                          chip(f"上次检查 {last_run}", "primary", icon="mdi-clock-outline"),
+                          chip(f"检查周期 {self._cron or '未设置'}", "secondary",
+                               icon="mdi-calendar-clock"),
+                          chip("库缺集重置 开启" if self._reset_missing_enabled else "库缺集重置 关闭",
+                               "success" if self._reset_missing_enabled else "warning",
+                               icon="mdi-restore"),
+                          chip(f"限频 {self._reset_cooldown_days} 天", "info",
+                               icon="mdi-timer-sand"),
+                      ]},
+                 ]},
+            ],
+        }
+
+        # ── 统计卡片 ──
+        stats_row = {
+            "component": "VRow",
+            "props": {"dense": True, "class": "mb-4"},
+            "content": [
+                stat_card("mdi-star-check-outline", "累计开启洗版", self._enabled_count,
+                          ok_color, "该季已播完，改走整季洗版"),
+                stat_card("mdi-star-off-outline", "累计取消洗版", self._fixed_count,
+                          warn_color, "该季未播完，恢复普通订阅"),
+                stat_card("mdi-restore", "已重置进度", len(self._reset_records),
+                          info_color, "库缺集，重置洗版重新补集"),
+                stat_card("mdi-format-list-bulleted", "在管取消记录", len(self._fixed_ids),
+                          alt_color, "已取消洗版的订阅条数"),
+            ],
+        }
+
+        # ── 最近一次变更明细 ──
+        page: List[dict] = [
+            hero,
+            stats_row,
+            detail_section(
+                "最近一次开启洗版（原为普通订阅）", "mdi-star-plus-outline", ok_color,
+                self._last_enabled, "enable_time", "最近一次检查没有新开洗版的订阅",
+                chip(f"{len(self._last_enabled)} 条", "success"),
+            ),
+            detail_section(
+                "最近一次取消洗版", "mdi-star-off-outline", warn_color,
+                self._last_fixed, "fixed_time", "最近一次检查没有取消洗版的订阅",
+                chip(f"{len(self._last_fixed)} 条", "warning"),
+            ),
+            detail_section(
+                "最近一次重置洗版进度", "mdi-restore", info_color,
+                self._last_reset, "reset_time", "最近一次检查没有重置进度的订阅",
+                chip(f"{len(self._last_reset)} 条", "info"),
+            ),
+        ]
 
         # ── 判定口径说明 ──
         page.append({
-            "component": "VAlert",
+            "component": "div",
             "props": {
-                "type": "info",
-                "variant": "outlined",
-                "class": "mt-2",
-                "text": (
-                    "判定口径：① 订阅新增那一刻——该季已播完就直接开整季洗版，未播完保持普通订阅；"
-                    "② 定时巡检只维护已是洗版的订阅——未播完取消洗版、已播完且库缺集则重置洗版进度；"
-                    "③ 单季判据＝该季分集已全部播出，或库内该季已齐全；取不到分集信息时保守跳过。"
-                ),
+                "class": "d-flex ga-3 pa-3 mt-1",
+                "style": (f"background: {rgba(accent, 0.06)}; "
+                          f"border: 1px solid {rgba(accent, 0.20)}; border-radius: 12px;"),
             },
+            "content": [
+                {"component": "VIcon",
+                 "props": {"size": "small", "class": "flex-shrink-0", "style": f"color: {accent};"},
+                 "text": "mdi-information-outline"},
+                {"component": "div", "props": {"class": "text-caption", "style": "line-height: 1.7;"},
+                 "content": [
+                     {"component": "div", "props": {"class": "font-weight-medium mb-1"},
+                      "text": "判定口径"},
+                     {"component": "div",
+                      "text": "① 订阅新增那一刻：该季已播完就直接开整季洗版，未播完保持普通订阅；"},
+                     {"component": "div",
+                      "text": "② 定时巡检只维护已是洗版的订阅：未播完取消洗版，已播完且库缺集则重置洗版进度；"},
+                     {"component": "div",
+                      "text": "③ 单季判据＝该季分集已全部播出，或库内该季已齐全；取不到分集信息时保守跳过。"},
+                 ]},
+            ],
         })
 
         return page
