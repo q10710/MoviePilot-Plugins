@@ -5,12 +5,12 @@
 1) **订阅新增的那一刻**（监听 SubscribeAdded，本插件唯一的「普通订阅 → 洗版」入口）：
    判断这一季是否已播完——已播完就直接开整季洗版（best_version / best_version_full = 1），
    避免同一批集反复「下不动 → 超时删种 → 补搜 → 再下」的空转；
-   未播完就保持普通订阅正常追更，不做任何动作。
+   未播完就让它当普通订阅正常追更（若新订阅本身带着洗版标记，则取消该标记恢复普通订阅）。
    这台订阅从哪来（手动 / 缺失插件补建 / 榜单命中）不影响判定。
 2) **定时巡检**（每小时）：只维护**已经是洗版**的订阅——
    该季未播完 → 取消洗版、恢复普通订阅继续追更；该季已播完 → 维持整季洗版并在库缺集时重置洗版进度。
    **已存在订阅的洗版不由本插件开启**：它们逐集正常下载，等这一季下完，由订阅助手Q 的洗版编排
-   在「订阅完成」时自动新建整季洗版订阅（用户口径 2026-09-16）。
+   在「订阅完成」时自动新建整季洗版订阅（用户口径 2026-09-16）。**普通订阅在巡检里一律不处理**。
 
 判断逻辑：
 1. 该季是否播完：取该季全部分集的 air_date，全部已过才算播完（只考虑单季）；
@@ -64,7 +64,7 @@ class BestVersionGuard(_PluginBase):
     plugin_desc = ("只看订阅那一季：订阅新增时判定——该季已播完就直接开整季洗版，未播完保持普通订阅；"
                    "定时巡检只维护已是洗版的订阅（未播完取消洗版、已播完维持整季洗版并在库缺集时重置进度）。")
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/bestversionguard.png"
-    plugin_version = "2.8.0"
+    plugin_version = "2.8.1"
     plugin_label = "订阅"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -601,9 +601,9 @@ class BestVersionGuard(_PluginBase):
         """检查订阅。
 
         subscribe_id 不为空：订阅新增的那一刻判定这一条（订阅新增事件触发，见 _on_subscribe_added）——
-        该季已播完就直接开整季洗版，未播完就保持普通订阅、不做任何动作。**这是本插件唯一的
-        「普通订阅 → 洗版」入口**：已经在跑的订阅不需要在这里转，它们由订阅助手Q 在订阅完成时
-        自动新建整季洗版订阅（用户口径 2026-09-16）。
+        该季已播完就直接开整季洗版；未播完就让它当普通订阅（若本身带洗版标记则取消）。**这是本
+        插件唯一的「普通订阅 → 洗版」入口**：已经在跑的订阅不需要在这里转，它们由订阅助手Q 在
+        订阅完成时自动新建整季洗版订阅（用户口径 2026-09-16）。
 
         subscribe_id 为空：定时巡检（主调度器每小时触发）——只维护**已经是洗版**的订阅：
         未播完的取消洗版、已播完的维持整季洗版并在库缺集时重置洗版进度。不给普通订阅开洗版。
@@ -808,18 +808,20 @@ class BestVersionGuard(_PluginBase):
             except Exception as e:
                 logger.info(f"取消洗版失败: {sub.name} - {e}")
 
+        # 「开启洗版」的明细与累计计数两种模式都要记：新增那一刻是本插件唯一的开启入口，
+        # 若只在巡检里累计，数据页的「最近开启洗版」与累计数会永远是空的。
+        self._enabled_count += len(enable_list)
+        if enable_list:
+            self._last_enabled = enable_list
         if not single:
-            # 单条（订阅新增触发）不覆盖定时巡检的最近明细与累计数，避免互相干扰
+            # 单条（订阅新增触发）不覆盖定时巡检的「最近一次检查/取消洗版/重置」明细与累计数，
+            # 避免互相干扰；仅在本轮确有结果时更新明细，保留最近一次非空清单。
             self._last_run = now_str
             self._fixed_count += len(fixed_list)
-            self._enabled_count += len(enable_list)
-            # 仅在本轮确有结果时更新明细，保留最近一次非空清单（重启后数据页仍能看到影视名）
             if fixed_list:
                 self._last_fixed = fixed_list
             if reset_list:
                 self._last_reset = reset_list
-            if enable_list:
-                self._last_enabled = enable_list
         self._save_state()
 
         logger.info(f"检查完成: 开启洗版 {len(enable_list)} 个，取消洗版 {len(fixed_list)} 个，"
