@@ -67,7 +67,7 @@ class HitAndRunQ(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/hitandrunq.png"
     # 插件版本
-    plugin_version = "2.2.7"
+    plugin_version = "2.2.8"
     # 插件作者
     plugin_author = "Q"
     # 作者主页
@@ -307,7 +307,7 @@ class HitAndRunQ(_PluginBase):
                         'content': [
                             {
                                 'component': 'VCol',
-                                'props': {'cols': 12, 'md': 8},
+                                'props': {'cols': 12, 'md': 4},
                                 'content': [
                                     {
                                         'component': 'VTextField',
@@ -315,6 +315,21 @@ class HitAndRunQ(_PluginBase):
                                             'model': 'site_hr_hours',
                                             'label': '站点H&R时长（可选）',
                                             'hint': '格式：站点名:小时，多个用逗号或换行分隔，例如 CARPT:168,听听歌:72；填了即覆盖该站做种时长',
+                                            'persistent-hint': True
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 4},
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'full_hr_sites',
+                                            'label': '全站H&R站点（可选）',
+                                            'hint': '全站所有种子都计 H&R 的站点，多个用逗号分隔，例如 52pt,1PTBA；仅名单内的站点在缺少 H&R 标签时才按站点补标',
                                             'persistent-hint': True
                                         }
                                     }
@@ -832,6 +847,7 @@ class HitAndRunQ(_PluginBase):
             "relocate_tag": "订阅收容",
             "relocate_delete_files": True,
             "site_hr_hours": "",
+            "full_hr_sites": "",
             "hr_auto_scan": True,
             "hit_and_run_tag": "H&R",
             "spider_period": 720,
@@ -1532,11 +1548,14 @@ class HitAndRunQ(_PluginBase):
                                          torrent_tasks: Dict[str, TorrentTask],
                                          histories: Dict[str, TorrentHistory],
                                          seeding_by_downloader: Dict[str, Dict[str, Any]]):
-        """遍历所有下载器的种子，对来自 H&R 站点但没有 H&R 标签的种子自动补打标签并加入管理。
+        """遍历所有下载器的种子，对来自「全站H&R站点」但没有 H&R 标签的种子自动补打标签并加入管理。
 
         解决收容移动/新下载但未触发 DownloadAdded 事件的种子遗漏问题。
+
+        仅对「全站H&R站点」名单（如 52pt、1PTBA）生效：「站点H&R时长」只表示该站做种时长，
+        库非、彩虹岛、CARPT 等只有部分种子计 H&R 的站点按站点一刀切补标会把普通种子误标为 H&R。
         """
-        hr_sites = self.__parse_site_hours(getattr(self._hnr_config, "site_hr_hours", ""))
+        hr_sites = self.__parse_site_names(getattr(self._hnr_config, "full_hr_sites", ""))
         if not hr_sites:
             return
 
@@ -1695,6 +1714,19 @@ class HitAndRunQ(_PluginBase):
             except Exception:
                 continue
         return result
+
+    @staticmethod
+    def __parse_site_names(text: Any) -> set:
+        """解析站点名单（逗号/换行分隔），兼容写成「站点名:小时」的条目。"""
+        names = set()
+        for item in str(text or "").replace("；", ",").replace(";", ",").replace("\n", ",").split(","):
+            item = item.strip()
+            if not item:
+                continue
+            name = item.rpartition(":")[0].strip() if ":" in item else item
+            if name:
+                names.add(name)
+        return names
 
     def run_hr_hours_scan(self) -> None:
         """抓取各站 H&R 做种时长并合并进「站点H&R时长」配置。
