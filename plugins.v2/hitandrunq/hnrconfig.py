@@ -72,6 +72,9 @@ class HNRConfig(BaseConfig):
     relocate_delete_files: Optional[bool] = True
     # 站点 H&R 时长（站点名:小时，多个用逗号或换行分隔）；填了即覆盖该站的做种时长
     site_hr_hours: Optional[str] = None
+    # 全站 H&R 站点名单（逗号分隔）：仅这些站点在缺少种子级 H&R 标记时才按站点兜底补标；
+    # 「站点H&R时长」只表示做种时长，不代表该站所有种子都是 H&R
+    full_hr_sites: Optional[str] = None
     # 每天自动抓取站点 H&R 页面并合并进上面的站点时长配置
     hr_auto_scan: Optional[bool] = True
     hit_and_run_tag: Optional[str] = None  # 种子标签
