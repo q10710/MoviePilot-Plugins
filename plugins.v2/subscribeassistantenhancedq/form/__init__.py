@@ -130,7 +130,7 @@ HINTS = {
     "relocate_incomplete_days": "收容后仍未下载完成满 N 天，按「站点不计 H&R」删除任务与文件；0 表示不清理",
     "default_hr_hours": "站点页面与种子信息都取不到H&R时长时使用的默认值，默认168小时",
     "site_hr_hours": "格式：站点名:小时，多个用逗号或换行分隔，例如 CARPT:168,听听歌:72；仅用于计算收容到期时长，不代表该站所有种子都是 H&R",
-    "full_hr_sites": "全站所有种子都计 H&R 的站点，多个用逗号分隔，例如 52pt,1PTBA；只有名单内的站点在缺少 H&R 标签时才按站点兜底判定",
+    "full_hr_sites": "全站所有种子都计 H&R 的站点，多个用逗号分隔，例如 52pt,1PTBA；仅在该站解析不出种子级 H&R 标记时作为兜底",
     "default_tracker_response": "每一行一个关键字，忽略大小写，支持正则表达式匹配",
     "subscription_cleanup_history_type": "订阅下载前清理旧整理记录、源文件和入库前目标文件的媒体类型范围（破坏性）",
     "subscription_cleanup_history_scenes": "选择普通订阅、洗版订阅或分集洗版下载时触发订阅清理",
