@@ -26,13 +26,138 @@ from app.plugins import _PluginBase
 from app.schemas.types import EventType
 
 
+# ---------------------------------------------------------------------------
+# 数据页展示层辅助（2026-09-17 统一界面标准）
+# 仅用于 get_page() 渲染，不参与任何判定逻辑、不读写配置与插件数据。
+# ---------------------------------------------------------------------------
+UI_ACCENT = "#6366f1"
+UI_OK = "#10b981"
+UI_WARN = "#f59e0b"
+UI_INFO = "#3b82f6"
+UI_PURPLE = "#8b5cf6"
+
+
+def _ui_rgba(hex_color: str, alpha: float) -> str:
+    """把 #rrggbb 转成 rgba(...)；alpha 为 0~1。"""
+    h = hex_color.lstrip("#")
+    return f"rgba({int(h[0:2], 16)},{int(h[2:4], 16)},{int(h[4:6], 16)},{alpha})"
+
+
+def _ui_tile(icon: str, color: str, size: int = 44) -> dict:
+    """图标方块（统一视觉锚点）。"""
+    return {
+        "component": "div",
+        "props": {
+            "class": "d-flex align-center justify-center flex-shrink-0",
+            "style": f"width: {size}px; height: {size}px; border-radius: 12px; background: {_ui_rgba(color, 0.14)};",
+        },
+        "content": [{
+            "component": "VIcon",
+            "props": {"size": int(size * 0.55), "style": f"color: {color};"},
+            "text": icon,
+        }],
+    }
+
+
+def _ui_chip(text: str, icon: str, color: str) -> dict:
+    """彩色状态标签。"""
+    return {
+        "component": "VChip",
+        "props": {"size": "small", "variant": "tonal", "color": color},
+        "content": [
+            {"component": "VIcon", "props": {"size": 14, "class": "mr-1"}, "text": icon},
+            {"component": "span", "text": str(text)},
+        ],
+    }
+
+
+def _ui_stat(value, label: str, hint: str, icon: str, color: str) -> dict:
+    """统计小卡（半透明色块 + 图标方块 + 大数字）。"""
+    return {
+        "component": "div",
+        "props": {
+            "class": "d-flex align-center ga-3 h-100 pa-3",
+            "style": f"background: {_ui_rgba(color, 0.08)}; border: 1px solid {_ui_rgba(color, 0.22)}; border-radius: 12px;",
+        },
+        "content": [
+            _ui_tile(icon, color, 40),
+            {
+                "component": "div",
+                "content": [
+                    {"component": "div",
+                     "props": {"class": "text-h5 font-weight-black", "style": "line-height: 1.1;"},
+                     "text": str(value)},
+                    {"component": "div", "props": {"class": "text-body-2 font-weight-medium"}, "text": label},
+                    {"component": "div",
+                     "props": {"class": "text-caption text-medium-emphasis", "style": "white-space: normal;"},
+                     "text": hint},
+                ],
+            },
+        ],
+    }
+
+
+def _ui_card_title(title: str, icon: str, color: str, count_text: str = "", count_color: str = "primary") -> dict:
+    """明细卡片的标题行（图标方块 + 标题 + 计数标签）。"""
+    content: List[dict] = [
+        _ui_tile(icon, color, 34),
+        {"component": "div", "props": {"class": "text-subtitle-1 font-weight-bold"}, "text": title},
+    ]
+    if count_text:
+        content.append({"component": "VSpacer"})
+        content.append(_ui_chip(count_text, "mdi-counter", count_color))
+    return {"component": "div", "props": {"class": "d-flex align-center ga-3 px-4 pt-4 pb-3"}, "content": content}
+
+
+def _ui_empty_alert(text: str) -> dict:
+    return {
+        "component": "VAlert",
+        "props": {"type": "success", "variant": "tonal", "density": "compact",
+                  "prepend-icon": "mdi-check-circle-outline", "text": text},
+    }
+
+
+def _ui_footer(lines: List[str]) -> dict:
+    """底部口径说明块。"""
+    return {
+        "component": "div",
+        "props": {"class": "d-flex ga-3 pa-3 mt-1", "style": f"background: {_ui_rgba(UI_PURPLE, 0.08)}; border-radius: 12px;"},
+        "content": [
+            {"component": "VIcon",
+             "props": {"size": "small", "class": "mt-1", "style": f"color: {UI_PURPLE};"},
+             "text": "mdi-information-outline"},
+            {"component": "div", "props": {"class": "text-caption", "style": "line-height: 1.7;"},
+             "content": [{"component": "div", "props": {"class": "font-weight-bold"}, "text": lines[0]}]
+                        + [{"component": "div", "text": line} for line in lines[1:]]},
+        ],
+    }
+
+
+def _ui_scroll_table(headers: List[str], rows: List[dict], min_width: int = 720) -> dict:
+    """可滚动表格（VTable + 原生表标签；VDataTable 在当前渲染器下表头/行不显示）。"""
+    return {
+        "component": "div",
+        "props": {"style": "max-height: 420px; overflow: auto; scrollbar-width: thin;"},
+        "content": [{
+            "component": "VTable",
+            "props": {"density": "comfortable", "hover": True, "style": f"min-width: {min_width}px;"},
+            "content": [
+                {"component": "thead", "content": [{"component": "tr", "content": [
+                    {"component": "th", "text": h} for h in headers
+                ]}]},
+                {"component": "tbody", "content": rows},
+            ],
+        }],
+    }
+
+
 class LinkChecker(_PluginBase):
     """硬链接孤立文件检查插件。"""
 
     plugin_name = "硬链接检查Q自用版"
     plugin_desc = "扫描下载目录和媒体库目录中的孤立硬链接文件，连续3天孤立自动删除；并可清理只剩元数据、没有视频的空壳季目录/剧目录。"
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/linkchecker.png"
-    plugin_version = "3.3.4"
+    plugin_version = "3.3.5"
     plugin_label = "文件管理"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -467,9 +592,18 @@ class LinkChecker(_PluginBase):
         }
 
     def get_page(self) -> Optional[List[dict]]:
-        """返回插件详情页面。"""
+        """返回插件详情页面（2026-09-17 按统一界面标准改版，仅调整展示层）。"""
         if not self._enabled:
-            return [{"component": "VAlert", "props": {"type": "warning", "text": "插件未启用"}}]
+            return [{
+                "component": "VAlert",
+                "props": {
+                    "type": "warning",
+                    "variant": "tonal",
+                    "density": "compact",
+                    "prepend-icon": "mdi-alert-outline",
+                    "text": "插件未启用。启用后会按周期扫描下载目录与媒体库，找出「曾经被硬链接、如今链接断开」的残留文件并按阈值清理。",
+                },
+            }]
 
         scan_time = self._last_scan_time or "尚未扫描"
         dl_count = len(self._last_download_orphans)
@@ -479,153 +613,144 @@ class LinkChecker(_PluginBase):
         tracking_count = len(self._orphan_tracker)
         empty_count = len(self._last_empty_dirs)
 
-        page = [
-            {
-                "component": "VCard",
-                "content": [
-                    {
-                        "component": "VCardTitle",
-                        "props": {"title": f"扫描时间: {scan_time}"},
-                    },
-                    {
-                        "component": "VCardText",
-                        "content": [
-                            {
-                                "component": "VRow",
-                                "content": [
-                                    {
-                                        "component": "VCol",
-                                        "props": {"cols": 4},
-                                        "content": [
-                                            {
-                                                "component": "VAlert",
-                                                "props": {
-                                                    "type": "warning" if dl_count else "success",
-                                                    "text": f"下载目录孤立: {dl_count} 个 ({dl_size})",
-                                                    "variant": "tonal",
-                                                },
-                                            }
-                                        ],
-                                    },
-                                    {
-                                        "component": "VCol",
-                                        "props": {"cols": 4},
-                                        "content": [
-                                            {
-                                                "component": "VAlert",
-                                                "props": {
-                                                    "type": "warning" if lib_count else "success",
-                                                    "text": f"媒体库孤立: {lib_count} 个 ({lib_size})",
-                                                    "variant": "tonal",
-                                                },
-                                            }
-                                        ],
-                                    },
-                                    {
-                                        "component": "VCol",
-                                        "props": {"cols": 4},
-                                        "content": [
-                                            {
-                                                "component": "VAlert",
-                                                "props": {
-                                                    "type": "info",
-                                                    "text": f"跟踪中: {tracking_count} 个文件",
-                                                    "variant": "tonal",
-                                                },
-                                            }
-                                        ],
-                                    },
-                                    {
-                                        "component": "VCol",
-                                        "props": {"cols": 12},
-                                        "content": [
-                                            {
-                                                "component": "VAlert",
-                                                "props": {
-                                                    "type": "warning" if empty_count else "success",
-                                                    "variant": "tonal",
-                                                    "text": (
-                                                        f"空壳目录: {empty_count} 个（本次已删除 {self._last_deleted_dirs} 个，"
-                                                        f"清理开关: {'开' if self._clean_empty_dirs else '关'}，"
-                                                        f"阈值 {self._empty_dir_days} 天，静置 {self._empty_dir_grace_hours} 小时）"
-                                                    ),
-                                                },
-                                            }
-                                        ],
-                                    },
-                                ],
-                            }
-                        ],
-                    },
-                    {
-                        "component": "VCardActions",
-                        "content": [
-                            {
-                                "component": "VBtn",
-                                "props": {"color": "primary"},
-                                "text": "立即扫描",
-                                "events": {
-                                    "click": {
+        page: List[dict] = []
+
+        # ① 概览头部
+        page.append({
+            "component": "VCard",
+            "props": {"variant": "flat", "rounded": "xl", "class": "mb-4 overflow-hidden",
+                      "style": "border: 1px solid rgba(128,128,128,0.18); position: relative;"},
+            "content": [
+                {"component": "div",
+                 "props": {"class": "d-none d-sm-flex",
+                           "style": (f"position: absolute; width: 180px; height: 180px; border-radius: 50%; "
+                                     f"top: -70px; left: -50px; background: {_ui_rgba(UI_ACCENT, 0.08)};")}},
+                {"component": "div",
+                 "props": {"class": "d-none d-sm-flex",
+                           "style": (f"position: absolute; width: 220px; height: 220px; border-radius: 50%; "
+                                     f"bottom: -120px; right: -60px; background: {_ui_rgba(UI_OK, 0.07)};")}},
+                {
+                    "component": "div",
+                    "props": {"class": "pa-4", "style": "position: relative;"},
+                    "content": [
+                        {
+                            "component": "div",
+                            "props": {"class": "d-flex align-center ga-3 flex-wrap"},
+                            "content": [
+                                _ui_tile("mdi-link-variant-off", UI_ACCENT, 48),
+                                {
+                                    "component": "div",
+                                    "content": [
+                                        {"component": "div", "props": {"class": "text-h6 font-weight-bold"},
+                                         "text": "硬链接检查"},
+                                        {"component": "div",
+                                         "props": {"class": "text-caption text-medium-emphasis"},
+                                         "text": "清理「曾硬链接、现断开」的残留文件，并清理只剩元数据的空壳目录"},
+                                    ],
+                                },
+                                {"component": "VSpacer"},
+                                {
+                                    "component": "VBtn",
+                                    "props": {"color": "primary", "variant": "flat", "size": "small",
+                                              "prepend-icon": "mdi-magnify-scan"},
+                                    "text": "立即扫描",
+                                    "events": {"click": {
                                         "api": "plugin/LinkChecker/scan",
                                         "method": "get",
                                         "params": {"apikey": settings.API_TOKEN},
-                                    }
+                                    }},
                                 },
-                            },
-                            {
-                                "component": "VBtn",
-                                "props": {"color": "warning", "disabled": dl_count == 0},
-                                "text": "清理下载目录",
-                                "events": {
-                                    "click": {
+                                {
+                                    "component": "VBtn",
+                                    "props": {"color": "warning", "variant": "tonal", "size": "small",
+                                              "prepend-icon": "mdi-delete-sweep-outline",
+                                              "disabled": dl_count == 0},
+                                    "text": "清理下载目录",
+                                    "events": {"click": {
                                         "api": "plugin/LinkChecker/clean",
                                         "method": "get",
                                         "params": {"target": "download", "apikey": settings.API_TOKEN},
-                                    }
+                                    }},
                                 },
-                            },
-                            {
-                                "component": "VBtn",
-                                "props": {"color": "warning", "disabled": lib_count == 0},
-                                "text": "清理媒体库",
-                                "events": {
-                                    "click": {
+                                {
+                                    "component": "VBtn",
+                                    "props": {"color": "warning", "variant": "tonal", "size": "small",
+                                              "prepend-icon": "mdi-folder-remove-outline",
+                                              "disabled": lib_count == 0},
+                                    "text": "清理媒体库",
+                                    "events": {"click": {
                                         "api": "plugin/LinkChecker/clean",
                                         "method": "get",
                                         "params": {"target": "library", "apikey": settings.API_TOKEN},
-                                    }
+                                    }},
                                 },
-                            },
-                            {
-                                "component": "VBtn",
-                                "props": {"color": "error", "variant": "outlined"},
-                                "text": "重置跟踪",
-                                "events": {
-                                    "click": {
-                                        "api": "plugin/LinkChecker/reset",
-                                        "method": "get",
-                                        "params": {"apikey": settings.API_TOKEN},
-                                    }
-                                },
-                            },
-                            {
-                                "component": "VBtn",
-                                "props": {"color": "warning", "variant": "outlined", "disabled": empty_count == 0},
-                                "text": "清理空壳目录",
-                                "events": {
-                                    "click": {
+                                {
+                                    "component": "VBtn",
+                                    "props": {"color": "warning", "variant": "outlined", "size": "small",
+                                              "prepend-icon": "mdi-broom",
+                                              "disabled": empty_count == 0},
+                                    "text": "清理空壳目录",
+                                    "events": {"click": {
                                         "api": "plugin/LinkChecker/clean_empty",
                                         "method": "get",
                                         "params": {"apikey": settings.API_TOKEN},
-                                    }
+                                    }},
                                 },
-                            },
-                        ],
-                    },
-                ],
-            }
-        ]
+                                {
+                                    "component": "VBtn",
+                                    "props": {"color": "error", "variant": "outlined", "size": "small",
+                                              "prepend-icon": "mdi-restore"},
+                                    "text": "重置跟踪",
+                                    "events": {"click": {
+                                        "api": "plugin/LinkChecker/reset",
+                                        "method": "get",
+                                        "params": {"apikey": settings.API_TOKEN},
+                                    }},
+                                },
+                            ],
+                        },
+                        {"component": "VDivider", "props": {"class": "my-3"}},
+                        {
+                            "component": "div",
+                            "props": {"class": "d-flex flex-wrap ga-2"},
+                            "content": [
+                                _ui_chip(f"上次扫描 {scan_time}", "mdi-clock-outline", "primary"),
+                                _ui_chip(f"自动删除 {'开启' if self._auto_delete else '关闭'}", "mdi-delete-outline",
+                                         "warning" if self._auto_delete else "secondary"),
+                                _ui_chip(f"阈值 {self._delete_threshold} 天", "mdi-calendar-clock", "info"),
+                                _ui_chip(f"媒体库删除 {'允许' if self._allow_library_delete else '不允许'}",
+                                         "mdi-shield-outline",
+                                         "warning" if self._allow_library_delete else "success"),
+                                _ui_chip(f"空壳清理 {'开启' if self._clean_empty_dirs else '关闭'}", "mdi-broom",
+                                         "warning" if self._clean_empty_dirs else "secondary"),
+                            ],
+                        },
+                    ],
+                },
+            ],
+        })
 
+        # ② 统计卡片
+        page.append({
+            "component": "VRow",
+            "props": {"dense": True, "class": "mb-4"},
+            "content": [
+                {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 3},
+                 "content": [_ui_stat(dl_count, "下载目录孤立候选", f"合计 {dl_size}", "mdi-download-off-outline",
+                                      UI_WARN if dl_count else UI_OK)]},
+                {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 3},
+                 "content": [_ui_stat(lib_count, "媒体库孤立候选", f"合计 {lib_size}", "mdi-library-shelves",
+                                      UI_WARN if lib_count else UI_OK)]},
+                {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 3},
+                 "content": [_ui_stat(tracking_count, "跟踪中文件", "曾硬链接、当前断开的跟踪条目",
+                                      "mdi-file-eye-outline", UI_INFO)]},
+                {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 3},
+                 "content": [_ui_stat(empty_count, "空壳目录候选", f"本次已删 {self._last_deleted_dirs} 个",
+                                      "mdi-folder-alert-outline", UI_WARN if empty_count else UI_OK)]},
+            ],
+        })
+
+        # ③ 明细卡片
         if self._last_download_orphans:
             page.append(self._build_table_card("下载目录孤立文件", self._last_download_orphans))
 
@@ -635,84 +760,113 @@ class LinkChecker(_PluginBase):
         if self._last_empty_dirs:
             page.append(self._build_empty_dir_card(self._last_empty_dirs))
 
+        if not (self._last_download_orphans or self._last_library_orphans or self._last_empty_dirs):
+            page.append({
+                "component": "VCard",
+                "props": {"variant": "flat", "rounded": "xl", "class": "mb-3 overflow-hidden",
+                          "style": "border: 1px solid rgba(128,128,128,0.18);"},
+                "content": [
+                    _ui_card_title("本次扫描结果", "mdi-check-circle-outline", UI_OK),
+                    {"component": "VDivider"},
+                    {"component": "VCardText", "props": {"class": "px-4 pt-3 pb-4"},
+                     "content": [_ui_empty_alert("未发现孤立文件与空壳目录。")]},
+                ],
+            })
+
+        # ④ 口径说明
+        page.append(_ui_footer([
+            "判定口径",
+            "· 只处理「曾经 links≥2、如今 links=1」的文件；从未被硬链接过的文件一律不处理。",
+            f"· 孤立候选按天计数（同一天多次扫描只算一次），连续 {self._delete_threshold} 天才按开关处置。",
+            f"· 空壳目录：目录内只剩元数据/字幕、无任何视频，静置 {self._empty_dir_grace_hours} 小时以上、"
+            f"连续 {self._empty_dir_days} 天才清理；分类目录永不命中。",
+            "· 收容目录（hr/h&r/relocate/收容 及订阅助手配置的收容目录）一律排除，不做判定。",
+            "· 上方「孤立候选」为等待期满的候选数，不是扫描到的文件总数。",
+        ]))
+
         return page
 
     def _build_table_card(self, title: str, items: List[Dict[str, Any]]) -> dict:
-        """构建文件列表卡片。"""
-        list_items = []
+        """构建文件列表卡片（2026-09-17 改版：可滚动表格 + 图标标题；仅展示层）。"""
+        rows = []
         for item in items[:100]:
             count = item.get("_track_count", 0)
-            count_str = f" [连续{count}天]" if count > 1 else ""
-            list_items.append({
-                "component": "VListItem",
+            rows.append({
+                "component": "tr",
                 "content": [
-                    {
-                        "component": "VListItemTitle",
-                        "text": f"{item['file_name']}{count_str}",
-                    },
-                    {
-                        "component": "VListItemSubtitle",
-                        "text": f"{item['dir_path']} | {item['size_str']} | {item['mtime']} | 硬链接: {item['nlink']}",
-                    },
-                    {
-                        "component": "VListItemSubtitle",
-                        "text": f"媒体: {item['media_info']}",
-                    },
+                    {"component": "td", "props": {"class": "text-body-2"},
+                     "text": item.get("file_name") or "-"},
+                    {"component": "td", "props": {"class": "text-caption"},
+                     "text": item.get("dir_path") or "-"},
+                    {"component": "td", "props": {"class": "text-body-2"},
+                     "text": item.get("size_str") or "-"},
+                    {"component": "td", "props": {"class": "text-caption"},
+                     "text": item.get("mtime") or "-"},
+                    {"component": "td", "content": [{
+                        "component": "VChip",
+                        "props": {"size": "x-small", "variant": "tonal",
+                                  "color": "warning" if count > 1 else "info"},
+                        "text": f"links={item.get('nlink', '-')} / 连续 {count} 天",
+                    }]},
+                    {"component": "td", "props": {"class": "text-caption"},
+                     "text": item.get("media_info") or "-"},
                 ],
             })
+
+        body = _ui_scroll_table(
+            ["文件名", "所在目录", "大小", "修改时间", "硬链接 / 连续", "媒体"],
+            rows, min_width=900,
+        ) if rows else _ui_empty_alert("本次扫描未发现该类孤立文件。")
+
         return {
             "component": "VCard",
+            "props": {"variant": "flat", "rounded": "xl", "class": "mb-3 overflow-hidden",
+                      "style": "border: 1px solid rgba(128,128,128,0.18);"},
             "content": [
-                {"component": "VCardTitle", "props": {"title": f"{title} ({len(items)} 个)"}},
-                {
-                    "component": "VCardText",
-                    "content": [
-                        {
-                            "component": "VList",
-                            "props": {"dense": True},
-                            "content": list_items,
-                        }
-                    ],
-                },
+                _ui_card_title(title, "mdi-file-link-outline", UI_WARN, f"{len(items)} 个", "warning"),
+                {"component": "VDivider"},
+                {"component": "VCardText", "props": {"class": "px-4 pt-3 pb-4"}, "content": [body]},
             ],
         }
 
     def _build_empty_dir_card(self, items: List[Dict[str, Any]]) -> dict:
-        """构建空壳目录列表卡片。"""
-        list_items = []
+        """构建空壳目录列表卡片（2026-09-17 改版：可滚动表格 + 图标标题；仅展示层）。"""
+        rows = []
         for item in items[:100]:
             count = item.get("_track_count", 0)
-            count_str = f" [连续{count}天]" if count > 1 else ""
-            list_items.append({
-                "component": "VListItem",
+            rows.append({
+                "component": "tr",
                 "content": [
-                    {
-                        "component": "VListItemTitle",
-                        "text": f"{item['dir_name']}{count_str}",
-                    },
-                    {
-                        "component": "VListItemSubtitle",
-                        "text": (
-                            f"{item['dir_path']} | 剩余元数据文件 {item['file_count']} 个 "
-                            f"| 最新更新 {item['mtime']}"
-                        ),
-                    },
+                    {"component": "td", "props": {"class": "text-body-2"},
+                     "text": item.get("dir_name") or "-"},
+                    {"component": "td", "props": {"class": "text-caption"},
+                     "text": item.get("dir_path") or "-"},
+                    {"component": "td", "props": {"class": "text-body-2"},
+                     "text": f"{item.get('file_count', '-')} 个"},
+                    {"component": "td", "props": {"class": "text-caption"},
+                     "text": item.get("mtime") or "-"},
+                    {"component": "td", "content": [{
+                        "component": "VChip",
+                        "props": {"size": "x-small", "variant": "tonal",
+                                  "color": "warning" if count > 1 else "info"},
+                        "text": f"连续 {count} 天",
+                    }]},
                 ],
             })
+
+        body = _ui_scroll_table(
+            ["目录名", "完整路径", "剩余元数据文件", "最新更新", "连续"],
+            rows, min_width=820,
+        ) if rows else _ui_empty_alert("本次扫描未发现空壳目录。")
+
         return {
             "component": "VCard",
+            "props": {"variant": "flat", "rounded": "xl", "class": "mb-3 overflow-hidden",
+                      "style": "border: 1px solid rgba(128,128,128,0.18);"},
             "content": [
-                {"component": "VCardTitle", "props": {"title": f"空壳目录 ({len(items)} 个)"}},
-                {
-                    "component": "VCardText",
-                    "content": [
-                        {
-                            "component": "VList",
-                            "props": {"dense": True},
-                            "content": list_items,
-                        }
-                    ],
-                },
+                _ui_card_title("空壳目录", "mdi-folder-alert-outline", UI_INFO, f"{len(items)} 个", "info"),
+                {"component": "VDivider"},
+                {"component": "VCardText", "props": {"class": "px-4 pt-3 pb-4"}, "content": [body]},
             ],
         }
 
