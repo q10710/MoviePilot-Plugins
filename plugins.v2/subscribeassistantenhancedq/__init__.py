@@ -123,7 +123,7 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/subscribeassistantenhancedq.png"
     # 插件版本
-    plugin_version = "0.10.19"
+    plugin_version = "0.10.20"
     _site_cache_candidate_helper_warned = False
     # 插件作者
     plugin_author = "Q"
@@ -1506,36 +1506,267 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
         return build_form()
 
     def get_page(self) -> Optional[List[dict]]:
-        """返回收容清单：展示当前收容中的 H&R 种子及其到期时间。"""
+        """返回收容清单数据页：概览、统计与收容种子明细表。
+
+        只读取插件自身的收容记录与配置用于展示，不改变任何判定逻辑与数据。
+        排版遵循本机统一标准：概览卡（图标方块 + 彩色状态标签）→ 统计卡 → 可滚动明细表 → 口径说明。
+        """
         records = self.get_data("relocate_records") or {}
-        if not records:
-            return [{
-                "component": "VAlert",
-                "props": {"type": "info", "variant": "tonal",
-                          "text": "当前没有收容中的 H&R 种子"},
-            }]
-        rows: List[dict] = [{
-            "component": "VAlert",
-            "props": {"type": "success", "variant": "tonal",
-                      "text": (f"当前收容中 {len(records)} 个 H&R 种子"
-                               f"（保存在收容目录继续做种，到期后自动删除任务）")},
-        }]
-        for torrent_hash, record in list(records.items()):
-            rows.append({
-                "component": "VAlert",
+
+        def rgba(hex_color: str, alpha: float) -> str:
+            """把 #rrggbb 颜色转成指定透明度的 rgba 值。"""
+            value = hex_color.lstrip("#")
+            red, green, blue = int(value[0:2], 16), int(value[2:4], 16), int(value[4:6], 16)
+            return f"rgba({red}, {green}, {blue}, {alpha})"
+
+        def icon_tile(icon: str, color: str, size: int = 40) -> dict:
+            """图标方块：圆角半透明底色 + 同色图标。"""
+            return {
+                "component": "div",
                 "props": {
-                    "type": "warning",
-                    "variant": "tonal",
-                    "text": (f"{record.get('title') or torrent_hash}"
-                             f"｜站点 {record.get('site_name') or '-'}"
-                             f"｜下载器 {record.get('downloader') or '-'}"
-                             f"｜收容 {record.get('relocated_at') or '-'}"
-                             f"｜完成 {record.get('completed_at') or '未完成（完成后按 H&R 时长起算）'}"
-                             f"｜需做种 {record.get('hr_hours') or '-'} 小时"
-                             f"｜到期 {record.get('deadline') or '-'}"),
+                    "class": "d-flex align-center justify-center flex-shrink-0",
+                    "style": (f"width: {size}px; height: {size}px; border-radius: 12px; "
+                              f"background: {rgba(color, 0.14)};"),
                 },
+                "content": [{
+                    "component": "VIcon",
+                    "props": {"size": int(size * 0.56), "style": f"color: {color};"},
+                    "text": icon,
+                }],
+            }
+
+        def chip(text: str, color: str = "primary", icon: Optional[str] = None,
+                 size: str = "small", variant: str = "tonal") -> dict:
+            """状态标签：可选前置图标。"""
+            content: List[dict] = []
+            if icon:
+                content.append({"component": "VIcon", "props": {"size": 14, "class": "mr-1"}, "text": icon})
+            content.append({"component": "span", "text": text})
+            return {"component": "VChip",
+                    "props": {"size": size, "variant": variant, "color": color},
+                    "content": content}
+
+        def stat_card(icon: str, label: str, value: str, color: str, hint: str) -> dict:
+            """统计卡片：图标方块 + 大号数值 + 名称 + 说明。"""
+            return {
+                "component": "VCol",
+                "props": {"cols": 12, "sm": 6, "md": 3},
+                "content": [{
+                    "component": "div",
+                    "props": {
+                        "class": "d-flex align-center ga-3 h-100 pa-3",
+                        "style": (f"background: {rgba(color, 0.08)}; "
+                                  f"border: 1px solid {rgba(color, 0.22)}; border-radius: 12px;"),
+                    },
+                    "content": [
+                        icon_tile(icon, color),
+                        {
+                            "component": "div",
+                            "props": {"class": "flex-grow-1", "style": "min-width: 0;"},
+                            "content": [
+                                {"component": "div",
+                                 "props": {"class": "text-h5 font-weight-black", "style": "line-height: 1.1;"},
+                                 "text": value},
+                                {"component": "div",
+                                 "props": {"class": "text-body-2 font-weight-medium"},
+                                 "text": label},
+                                {"component": "div",
+                                 "props": {"class": "text-caption text-medium-emphasis",
+                                           "style": "white-space: normal;"},
+                                 "text": hint},
+                            ],
+                        },
+                    ],
+                }],
+            }
+
+        accent, ok_color, warn_color, info_color, alt_color = (
+            "#6366f1", "#10b981", "#f59e0b", "#3b82f6", "#8b5cf6",
+        )
+
+        # 配置项做兜底读取，插件未初始化配置时页面也能渲染
+        config = self._config
+        relocate_dir = str(getattr(config, "relocate_dir", "") or "未配置")
+        try:
+            relocate_after = float(getattr(config, "relocate_after_hours", 0) or 0)
+        except (TypeError, ValueError):
+            relocate_after = 0.0
+        try:
+            incomplete_days = int(getattr(config, "relocate_incomplete_days", 0) or 0)
+        except (TypeError, ValueError):
+            incomplete_days = 0
+
+        entries = list(records.values())
+        total = len(entries)
+        unfinished = [e for e in entries if not e.get("completed_at")]
+        finished = [e for e in entries if e.get("completed_at")]
+        deadlines = sorted(str(e.get("deadline")) for e in entries if e.get("deadline"))
+        next_deadline = deadlines[0] if deadlines else "—"
+
+        # ── 概览头部 ──
+        hero = {
+            "component": "VCard",
+            "props": {"variant": "flat", "rounded": "xl", "class": "mb-4 overflow-hidden",
+                      "style": "position: relative; border: 1px solid rgba(128, 128, 128, 0.18);"},
+            "content": [
+                {"component": "div", "props": {
+                    "class": "d-none d-sm-flex",
+                    "style": ("position: absolute; width: 150px; height: 150px; border-radius: 50%; "
+                              f"background: {rgba(accent, 0.08)}; top: -60px; left: -40px;")},
+                 "content": []},
+                {"component": "div", "props": {
+                    "class": "d-none d-sm-flex",
+                    "style": ("position: absolute; width: 190px; height: 190px; border-radius: 50%; "
+                              f"background: {rgba(warn_color, 0.07)}; bottom: -75px; right: -55px;")},
+                 "content": []},
+                {"component": "div", "props": {"class": "pa-4", "style": "position: relative;"},
+                 "content": [
+                     {"component": "div", "props": {"class": "d-flex align-center ga-3 flex-wrap"},
+                      "content": [
+                          icon_tile("mdi-package-variant-closed", accent, 48),
+                          {"component": "div",
+                           "props": {"class": "flex-grow-1", "style": "min-width: 200px;"},
+                           "content": [
+                               {"component": "div", "props": {"class": "text-h6 font-weight-bold"},
+                                "text": "订阅收容清单"},
+                               {"component": "div",
+                                "props": {"class": "text-caption text-medium-emphasis"},
+                                "text": "H&R 种子超时未完成后移入收容目录继续做种，满足站点时长后到期清理"},
+                           ]},
+                      ]},
+                     {"component": "VDivider", "props": {"class": "my-3"}},
+                     {"component": "div", "props": {"class": "d-flex flex-wrap ga-2"},
+                      "content": [
+                          chip(f"收容中 {total} 个", "primary", icon="mdi-format-list-bulleted"),
+                          chip(f"收容目录 {relocate_dir}", "secondary", icon="mdi-folder-outline"),
+                          chip(f"收容门槛 {relocate_after:g} 小时", "info", icon="mdi-timer-sand"),
+                          chip(f"未完成清理 {incomplete_days} 天" if incomplete_days else "未完成清理 关闭",
+                               "warning" if incomplete_days else "secondary", icon="mdi-calendar-clock"),
+                      ]},
+                 ]},
+            ],
+        }
+
+        if not total:
+            return [
+                hero,
+                {"component": "VAlert",
+                 "props": {"type": "success", "variant": "tonal", "density": "compact",
+                           "prepend-icon": "mdi-check-circle-outline",
+                           "text": "当前没有收容中的 H&R 种子（H&R 种子超时未完成时才会移入收容目录）"}},
+            ]
+
+        # ── 统计卡片 ──
+        stats_row = {
+            "component": "VRow",
+            "props": {"dense": True, "class": "mb-4"},
+            "content": [
+                stat_card("mdi-package-variant", "收容中总数", str(total), accent, "当前保存在收容目录的种子"),
+                stat_card("mdi-progress-download", "未完成", str(len(unfinished)), warn_color,
+                          "完成后才开始计站点 H&R 时长"),
+                stat_card("mdi-check-circle-outline", "已完成待到期", str(len(finished)), ok_color,
+                          "按完成时间 + 站点时长到期"),
+                stat_card("mdi-clock-outline", "最近到期", next_deadline.split(" ")[0] if next_deadline != "—" else "—",
+                          info_color, "最早一个到期日"),
+            ],
+        }
+
+        # ── 明细表 ──
+        rows = []
+        for torrent_hash, record in records.items():
+            finished_at = record.get("completed_at")
+            if finished_at:
+                state_cell = {"component": "VChip",
+                              "props": {"size": "small", "variant": "tonal", "color": "success"},
+                              "text": "已完成"}
+            else:
+                state_cell = {"component": "VChip",
+                              "props": {"size": "small", "variant": "tonal", "color": "warning"},
+                              "text": "未完成"}
+            round_no = record.get("round")
+            rows.append({
+                "component": "tr",
+                "content": [
+                    {"component": "td", "props": {"class": "text-body-2"},
+                     "text": str(record.get("title") or torrent_hash)[:80]},
+                    {"component": "td", "props": {"style": "white-space: nowrap;"},
+                     "text": str(record.get("site_name") or "-")},
+                    {"component": "td", "props": {"style": "white-space: nowrap;"},
+                     "text": str(record.get("downloader") or "-")},
+                    {"component": "td", "content": [state_cell]},
+                    {"component": "td", "props": {"class": "text-caption", "style": "white-space: nowrap;"},
+                     "text": str(record.get("relocated_at") or "-")},
+                    {"component": "td", "props": {"class": "text-caption", "style": "white-space: nowrap;"},
+                     "text": str(record.get("deadline") or "-")},
+                    {"component": "td", "props": {"style": "white-space: nowrap;"},
+                     "text": f"{round_no}" if round_no is not None else "-"},
+                ],
             })
-        return rows
+
+        detail = {
+            "component": "VCard",
+            "props": {"variant": "flat", "rounded": "xl", "class": "mb-3 overflow-hidden",
+                      "style": "border: 1px solid rgba(128, 128, 128, 0.18);"},
+            "content": [
+                {"component": "div", "props": {"class": "d-flex align-center ga-3 px-4 pt-4 pb-3"},
+                 "content": [
+                     icon_tile("mdi-package-variant", accent, 34),
+                     {"component": "div", "props": {"class": "text-subtitle-1 font-weight-bold"},
+                      "text": "收容种子明细"},
+                     {"component": "VSpacer"},
+                     chip(f"{total} 条", "primary"),
+                 ]},
+                {"component": "VDivider"},
+                {"component": "VCardText", "props": {"class": "px-4 pt-3 pb-4"}, "content": [
+                    {"component": "div",
+                     "props": {"style": "max-height: 460px; overflow: auto; scrollbar-width: thin;"},
+                     "content": [{
+                         "component": "VTable",
+                         "props": {"hover": True, "density": "comfortable", "style": "min-width: 860px;"},
+                         "content": [
+                             {"component": "thead", "content": [{"component": "tr", "content": [
+                                 {"component": "th", "text": "种子"},
+                                 {"component": "th", "text": "站点"},
+                                 {"component": "th", "text": "下载器"},
+                                 {"component": "th", "text": "状态"},
+                                 {"component": "th", "text": "收容时间"},
+                                 {"component": "th", "text": "到期时间"},
+                                 {"component": "th", "text": "轮次"},
+                             ]}]},
+                             {"component": "tbody", "content": rows},
+                         ],
+                     }],
+                },
+            ]},
+            ],
+        }
+
+        # ── 口径说明 ──
+        footer = {
+            "component": "div",
+            "props": {
+                "class": "d-flex ga-3 pa-3 mt-1",
+                "style": (f"background: {rgba(accent, 0.06)}; "
+                          f"border: 1px solid {rgba(accent, 0.20)}; border-radius: 12px;"),
+            },
+            "content": [
+                {"component": "VIcon",
+                 "props": {"size": "small", "class": "flex-shrink-0", "style": f"color: {accent};"},
+                 "text": "mdi-information-outline"},
+                {"component": "div", "props": {"class": "text-caption", "style": "line-height: 1.7;"},
+                 "content": [
+                     {"component": "div", "props": {"class": "font-weight-medium mb-1"}, "text": "收容规则"},
+                     {"component": "div",
+                      "text": "① 只有 H&R 种子超时未完成才会移入收容目录保种，普通种子仍按原逻辑删除；"},
+                     {"component": "div",
+                      "text": "② 到期时间＝下载完成时间 + 站点 H&R 时长（未完成时先给预估，完成后重算）；"},
+                     {"component": "div",
+                      "text": "③ 收容后仍未下载完成满「未完成清理天数」的，按「站点不计 H&R」清理任务与文件。"},
+                 ]},
+            ],
+        }
+
+        return [hero, stats_row, detail, footer]
 
     def _tmdb_episodes(self, tmdbid: int, season: int, episode_group: str = None):
         """查询 TMDB 季内集信息供完成证据流水线构建 SeasonScope；不可用时返回空列表。"""
