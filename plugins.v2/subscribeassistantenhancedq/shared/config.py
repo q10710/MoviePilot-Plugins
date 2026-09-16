@@ -340,6 +340,16 @@ class PluginConfig:
         return self.get_str("site_hr_hours", "")
 
     @property
+    def full_hr_sites(self) -> str:
+        """全站 H&R 站点名单（逗号分隔）。
+
+        仅这些站点的种子在缺少种子级 H&R 标记时才按站点兜底判定为 H&R。
+        「站点H&R时长」只表示该站做种时长，不代表该站所有种子都是 H&R：
+        库非、彩虹岛、CARPT 等站只有部分种子计 H&R，按站点一刀切会把普通种子误判为 H&R。
+        """
+        return self.get_str("full_hr_sites", "")
+
+    @property
     def hr_auto_scan(self) -> bool:
         """每天自动抓取站点 H&R 时长并合并进兜底配置（抓取失败不影响其它功能）。"""
         return self.get_bool("hr_auto_scan", True)
