@@ -1,8 +1,10 @@
 """洗版订阅守护插件。
 
-定时检查所有电视剧订阅的洗版状态，**只看订阅指向的那一季**，不看整剧状态：
-- 该季已播完 → 保留并确保整季洗版（best_version / best_version_full = 1）
-- 该季尚未播完 → 取消洗版，恢复普通订阅继续追更
+定时检查**全部电视剧订阅**的洗版状态，**只看订阅指向的那一季**，不看整剧状态，
+也**不看这个订阅是什么原因加进来的**（手动添加、缺失插件补建、榜单命中、洗版编排创建一视同仁）：
+- 该季已播完 → 确保处于整季洗版状态（best_version / best_version_full = 1）；
+  原本是普通订阅的也一并开启洗版，避免逐集零散下载来回折腾
+- 该季尚未播完 → 仅当它是洗版订阅时取消洗版，恢复普通订阅继续追更
 
 判断逻辑：
 1. 该季是否播完：取该季全部分集的 air_date，全部已过才算播完（只考虑单季）；
@@ -10,10 +12,10 @@
 2. 该季已播完但媒体库缺集（整季缺或个别集缺）→ 重置洗版进度（清 current_priority），
    让主程序重新搜索补集 —— 顶档（current_priority=100）会被主程序视为「洗版完成」而不再搜索，
    库缺集也补不回来
-3. 该季尚未播完 → 取消洗版
+3. 该季尚未播完 → 取消洗版（仅对洗版订阅；普通订阅不做动作）
 4. 库缺集且订阅却认为已下完（lack_episode<=0）→ 重置订阅触发重新下载（原有能力）
 5. 取不到该季分集信息 → 保守跳过本轮，不做任何改动
-6. 订阅一建立即判定（监听 SubscribeAdded 事件，只处理洗版订阅），不必等每小时巡检
+6. 订阅一建立即判定（监听 SubscribeAdded 事件，判据与巡检完全一致），不必等每小时巡检
 
 媒体库检查用「媒体身份 + 本地索引条目 ID」定位，条目名与 TMDB 中文名不一致时也能命中。
 """
@@ -54,10 +56,10 @@ class BestVersionGuard(_PluginBase):
     """洗版订阅守护插件。"""
 
     plugin_name = "洗版守护Q自用版"
-    plugin_desc = ("只看订阅那一季：该季已播完的保留整季洗版（库缺集时重置洗版进度重新补集），"
+    plugin_desc = ("只看订阅那一季：该季已播完的一律开启整季洗版（库缺集时重置洗版进度重新补集），"
                    "该季未播完的取消洗版恢复普通订阅；订阅一建立即判定。")
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/bestversionguard.png"
-    plugin_version = "2.6.3"
+    plugin_version = "2.7.0"
     plugin_label = "订阅"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -75,9 +77,12 @@ class BestVersionGuard(_PluginBase):
 
     _subscribe_oper = None
     _fixed_count: int = 0
+    _enabled_count: int = 0
     _last_run: Optional[str] = None
     _last_fixed: List[Dict[str, Any]] = []
     _last_reset: List[Dict[str, Any]] = []
+    # 最近一次「原本是普通订阅、被自动开启洗版」的明细（持久化）
+    _last_enabled: List[Dict[str, Any]] = []
     # 持久化：已取消洗版的订阅 ID，避免重复操作
     _fixed_ids: Set[str] = set()
     # 持久化：已重置订阅 ID -> 上次重置时间戳（用于限频）
@@ -94,11 +99,13 @@ class BestVersionGuard(_PluginBase):
         saved = self.get_data("state") or {}
         self._fixed_ids = set(saved.get("fixed_ids", []))
         self._fixed_count = saved.get("fixed_count", 0)
+        self._enabled_count = saved.get("enabled_count", 0)
         self._reset_records = {str(k): float(v) for k, v in (saved.get("reset_records") or {}).items()}
         # 最近一次明细需持久化：否则重启后数据页只显示累计数量、看不到具体影视名
         self._last_run = saved.get("last_run") or self._last_run
         self._last_fixed = saved.get("last_fixed") or []
         self._last_reset = saved.get("last_reset") or []
+        self._last_enabled = saved.get("last_enabled") or []
         if not config:
             self._enabled = False
             return
@@ -238,6 +245,7 @@ class BestVersionGuard(_PluginBase):
                                     "type": "info",
                                     "text": (
                                         f"上次检查: {last_run}\n"
+                                        f"累计开启洗版: {self._enabled_count} 个\n"
                                         f"累计取消洗版: {self._fixed_count} 个"
                                     ),
                                     "variant": "tonal",
@@ -292,6 +300,32 @@ class BestVersionGuard(_PluginBase):
                 ],
             })
 
+        if self._last_enabled:
+            page.append({
+                "component": "VCard",
+                "content": [
+                    {"component": "VCardTitle", "props": {"title": "最近开启洗版（原为普通订阅）"}},
+                    {
+                        "component": "VCardText",
+                        "content": [
+                            {
+                                "component": "VDataTable",
+                                "props": {
+                                    "headers": [
+                                        {"title": "订阅", "key": "name"},
+                                        {"title": "季", "key": "season"},
+                                        {"title": "原因", "key": "reason"},
+                                        {"title": "时间", "key": "enable_time"},
+                                    ],
+                                    "items": self._last_enabled[:50],
+                                    "itemsPerPage": 20,
+                                },
+                            }
+                        ],
+                    },
+                ],
+            })
+
         return page
 
     def stop_service(self) -> None:
@@ -306,10 +340,12 @@ class BestVersionGuard(_PluginBase):
             self.save_data("state", {
                 "fixed_ids": list(self._fixed_ids),
                 "fixed_count": self._fixed_count,
+                "enabled_count": self._enabled_count,
                 "reset_records": dict(self._reset_records),
                 "last_run": self._last_run,
                 "last_fixed": (self._last_fixed or [])[:50],
                 "last_reset": (self._last_reset or [])[:50],
+                "last_enabled": (self._last_enabled or [])[:50],
             })
 
     def _can_reset(self, subscribe_id: Any) -> bool:
@@ -321,11 +357,14 @@ class BestVersionGuard(_PluginBase):
             return True
         return (time.time() - float(last)) >= self._reset_cooldown_days * 86400
 
-    def _reset_subscribe(self, sub: Any) -> bool:
+    def _reset_subscribe(self, sub: Any, extra: Optional[Dict[str, Any]] = None) -> bool:
         """重置订阅，让它重新搜索下载；字段与主程序「订阅重置」保持一致。
 
         媒体库那份被删后，主程序仍以为该季已下完（lack_episode=0、note 记录全部集数），
         不会自动补下；清空下载事实并恢复缺集数后，下一轮订阅搜索即会重新获取。
+
+        extra：可选的附加字段（例如该季已播完时一并开启整季洗版），
+        与重置字段在同一次写入里提交，避免要等下一轮才补上。
         """
         if not self._subscribe_oper:
             return False
@@ -341,6 +380,8 @@ class BestVersionGuard(_PluginBase):
             "manual_total_episode": 0,
             "state": "R",
         }
+        if extra:
+            payload.update({k: v for k, v in extra.items() if v is not None})
         try:
             self._subscribe_oper.update(sid=sub.id, payload=payload)
         except Exception as e:
@@ -562,11 +603,8 @@ class BestVersionGuard(_PluginBase):
             sub = self._subscribe_oper.get(subscribe_id)
             if not sub:
                 return
-            # 只处理洗版订阅；普通订阅归订阅助手Q 管，这里不介入
-            if not sub.best_version:
-                logger.info(f"订阅新增检查：{sub.name} S{sub.season} (id={subscribe_id}) "
-                            f"非洗版订阅，跳过")
-                return
+            # 处理全部电视剧订阅：该季已播完就开洗版，不管订阅是什么原因加进来的
+            # （用户口径 2026-09-16）。非电视剧/无身份/S 状态仍在主循环里跳过。
             subscribes = [sub]
             logger.info(f"订阅新增检查：{sub.name} S{sub.season} (id={subscribe_id})")
         else:
@@ -579,6 +617,7 @@ class BestVersionGuard(_PluginBase):
         tmdb_chain = TmdbChain()
         fixed_list: List[Dict[str, Any]] = []
         reset_list: List[Dict[str, Any]] = []
+        enable_list: List[Dict[str, Any]] = []
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         tmdb_cache: Dict[int, dict] = {}
@@ -602,11 +641,10 @@ class BestVersionGuard(_PluginBase):
             if sub.state == "S":
                 continue
 
-            # 只处理洗版订阅（best_version=1）。
-            # 历史上这里按 username 区分「旧版订阅助手魔改版创建」与「其它来源」，
-            # 但两者处置完全相同（都是置 best_version=0），现合并为单一分支，日志不再区分来源。
-            if not sub.best_version:
-                continue
+            # 处理全部电视剧订阅，不再限定「已是洗版订阅」：
+            # 用户口径（2026-09-16）——只要该季已播完就开洗版，不管订阅是什么原因加进来的
+            # （缺失插件补建、榜单命中、手动添加都一样）。历史上这里还按 username 区分来源，
+            # 各分支处置完全相同，已合并。
 
             tmdb_info = _get_tmdb(tmdbid)
             tmdb_status = (tmdb_info or {}).get("status", "")
@@ -653,7 +691,14 @@ class BestVersionGuard(_PluginBase):
                                 f"{sub.name} S{sub.season}")
                     continue
                 missing_text = self._format_missing_episodes(missing_eps)
-                if self._reset_subscribe(sub):
+                # 该季已播完时，同一次写入里一并开启整季洗版：
+                # 用户口径（2026-09-16）——只要该季播完就开洗版，不管订阅是什么原因加进来的。
+                extra: Dict[str, Any] = {}
+                enable_now = season_ended and not sub.best_version
+                if enable_now:
+                    extra["best_version"] = 1
+                    extra["best_version_full"] = 1
+                if self._reset_subscribe(sub, extra=extra):
                     logger.info(f"库缺集重置订阅: {sub.name} S{sub.season} "
                                 f"(媒体库缺 {missing_text}，等待重新下载)")
                     reset_list.append({
@@ -661,6 +706,13 @@ class BestVersionGuard(_PluginBase):
                         "reason": f"媒体库缺 {missing_text}但订阅认为已下完",
                         "reset_time": now_str,
                     })
+                    if enable_now:
+                        logger.info(f"该季已播完，已开启整季洗版（原为普通订阅）: "
+                                    f"{sub.name} S{sub.season}")
+                        enable_list.append({
+                            "name": sub.name, "year": sub.year, "season": sub.season,
+                            "reason": "该季已播完", "enable_time": now_str,
+                        })
                     continue
 
             if season_ended:
@@ -668,15 +720,27 @@ class BestVersionGuard(_PluginBase):
                 if fix_key in self._fixed_ids:
                     self._fixed_ids.discard(fix_key)
                     self._save_state()
-                # 该季已播完：确保处于整季洗版状态（单季播完就洗版）
-                # 注：循环开头已过滤掉非洗版订阅，此处 sub.best_version 恒为真，无需再置 1
+                # 该季已播完：确保处于整季洗版状态（单季播完就洗版）。
+                # 原本是普通订阅的也一并开启洗版——同一批集反复「下不动→超时删种→补搜→再下」
+                # 纯属浪费带宽与磁盘 IO，整季洗版让主程序只认整季包、一次到位。
                 payload: Dict[str, Any] = {}
+                newly_enabled = not sub.best_version
+                if newly_enabled:
+                    payload["best_version"] = 1
                 if not sub.best_version_full:
                     payload["best_version_full"] = 1
                 if payload:
                     try:
                         self._subscribe_oper.update(sid=sub.id, payload=payload)
-                        logger.info(f"该季已播完，开启整季洗版: {sub.name} S{sub.season}")
+                        if newly_enabled:
+                            logger.info(f"该季已播完，已开启整季洗版（原为普通订阅）: "
+                                        f"{sub.name} S{sub.season}")
+                            enable_list.append({
+                                "name": sub.name, "year": sub.year, "season": sub.season,
+                                "reason": "该季已播完", "enable_time": now_str,
+                            })
+                        else:
+                            logger.info(f"该季已播完，开启整季洗版: {sub.name} S{sub.season}")
                     except Exception as e:
                         logger.info(f"开启整季洗版失败: {sub.name} - {e}")
                 # 该季已播完但媒体库缺集 → 重置洗版进度，让主程序重新搜索补集。
@@ -702,7 +766,10 @@ class BestVersionGuard(_PluginBase):
                         })
                 continue
 
-            # ── 该季尚未播完，取消洗版 ──
+            # ── 该季尚未播完 ──
+            # 只有洗版订阅需要「取消洗版」；普通订阅本就没开洗版，直接跳过（不做无意义动作）。
+            if not sub.best_version:
+                continue
             fix_key = str(sub.id)
             if fix_key in self._fixed_ids:
                 # 之前取消过洗版但被重新开启了，清除记录重新处理
@@ -729,25 +796,36 @@ class BestVersionGuard(_PluginBase):
             # 单条（订阅新增触发）不覆盖定时巡检的最近明细与累计数，避免互相干扰
             self._last_run = now_str
             self._fixed_count += len(fixed_list)
+            self._enabled_count += len(enable_list)
             # 仅在本轮确有结果时更新明细，保留最近一次非空清单（重启后数据页仍能看到影视名）
             if fixed_list:
                 self._last_fixed = fixed_list
             if reset_list:
                 self._last_reset = reset_list
+            if enable_list:
+                self._last_enabled = enable_list
         self._save_state()
 
-        logger.info(f"检查完成: 取消洗版 {len(fixed_list)} 个，重置 {len(reset_list)} 个")
+        logger.info(f"检查完成: 开启洗版 {len(enable_list)} 个，取消洗版 {len(fixed_list)} 个，"
+                    f"重置 {len(reset_list)} 个")
 
-        if self._notify and (fixed_list or reset_list):
-            lines = self._format_lists(fixed_list, reset_list)
+        if self._notify and (fixed_list or reset_list or enable_list):
+            lines = self._format_lists(fixed_list, reset_list, enable_list)
             self.post_message(title="洗版守护", text="\n".join(lines))
 
     @staticmethod
     def _format_lists(fixed_list: List[Dict[str, Any]],
                       reset_list: List[Dict[str, Any]],
+                      enable_list: Optional[List[Dict[str, Any]]] = None,
                       limit: int = 10) -> List[str]:
-        """格式化取消洗版/重置订阅清单（前 N 个明细 + 总数后缀），供通知复用。"""
+        """格式化开启洗版/取消洗版/重置订阅清单（前 N 个明细 + 总数后缀），供通知复用。"""
         lines: List[str] = []
+        if enable_list:
+            names = "、".join(
+                f"{e.get('name', '')} S{e.get('season')}" for e in enable_list[:limit]
+            )
+            suffix = f"等 {len(enable_list)} 个" if len(enable_list) > limit else ""
+            lines.append(f"已开启洗版: {names}{suffix}")
         if fixed_list:
             names = "、".join(
                 f"{f.get('name', '')} S{f.get('season')}" for f in fixed_list[:limit]
@@ -768,6 +846,7 @@ class BestVersionGuard(_PluginBase):
         self._guard_check()
         return {
             "success": True,
+            "enabled_count": len(self._last_enabled),
             "fixed_count": len(self._last_fixed),
             "last_run": self._last_run,
         }
@@ -782,7 +861,7 @@ class BestVersionGuard(_PluginBase):
             return
         logger.info("收到手动检查命令")
         self._guard_check()
-        lines = self._format_lists(self._last_fixed, self._last_reset)
+        lines = self._format_lists(self._last_fixed, self._last_reset, self._last_enabled)
         if lines:
             text = f"检查完成（最近一次 {self._last_run or '未知'}）\n" + "\n".join(lines)
         else:
@@ -791,7 +870,7 @@ class BestVersionGuard(_PluginBase):
 
     @eventmanager.register(EventType.SubscribeAdded)
     def _on_subscribe_added(self, event: Event = None) -> None:
-        """订阅新增事件：立即判定该订阅，不必等每小时巡检（只处理洗版订阅）。"""
+        """订阅新增事件：立即判定该订阅，不必等每小时巡检（判据与定时巡检完全一致）。"""
         if not self._enabled:
             return
         data = getattr(event, "event_data", None)
