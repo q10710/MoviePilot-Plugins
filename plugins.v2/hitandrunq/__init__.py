@@ -67,7 +67,7 @@ class HitAndRunQ(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/hitandrunq.png"
     # 插件版本
-    plugin_version = "2.2.8"
+    plugin_version = "2.2.9"
     # 插件作者
     plugin_author = "Q"
     # 作者主页
@@ -864,14 +864,19 @@ class HitAndRunQ(_PluginBase):
         torrent_tasks: Dict[str, TorrentTask] = self.__get_and_parse_data(key="torrents", model=TorrentTask)
 
         if not torrent_tasks:
+            # 2026-09-17 统一界面标准：空状态带图标说明，不留空白
             return [
+                self.__build_hero_card(),
                 {
-                    'component': 'div',
-                    'text': '暂无数据',
+                    'component': 'VAlert',
                     'props': {
-                        'class': 'text-center',
-                    }
-                }
+                        'type': 'info',
+                        'variant': 'tonal',
+                        'density': 'compact',
+                        'prepend-icon': 'mdi-information-outline',
+                        'text': '当前没有纳入 H&R 管理的种子。新下载的种子会在检查轮次中按「下载那一刻存档的 H&R 标记」纳入管理。',
+                    },
+                },
             ]
         else:
             data_list = list(torrent_tasks.values())
@@ -953,22 +958,25 @@ class HitAndRunQ(_PluginBase):
             }
             torrent_trs.append(torrent_tr)
 
-        # 拼装页面
-        return [
-            {
-                'component': 'VRow',
-                'content': self.__get_total_elements() + [
+        # 拼装页面（2026-09-17 按统一界面标准改版：概览头部 + 统计卡 + 可滚动明细表 + 口径说明）
+        page = [self.__build_hero_card()]
+        page.append({
+            'component': 'VRow',
+            'content': self.__get_total_elements() + [
                     # 种子明细
                     {
                         'component': 'VCol',
                         'props': {
                             'cols': 12,
+                            'class': 'overflow-x-auto',
                         },
                         'content': [
                             {
                                 'component': 'VTable',
                                 'props': {
-                                    'hover': True
+                                    'hover': True,
+                                    'density': 'comfortable',
+                                    'style': 'min-width: 1100px;'
                                 },
                                 'content': [
                                     {
@@ -1059,7 +1067,9 @@ class HitAndRunQ(_PluginBase):
                     }
                 ]
             }
-        ]
+        )
+        page.append(self.__build_footer())
+        return page
 
     def __get_total_elements(self) -> List[dict]:
         """
@@ -1090,76 +1100,200 @@ class HitAndRunQ(_PluginBase):
     @staticmethod
     def __create_stat_card(title: str, icon_path: str, count: str):
         """
-        创建一个统计卡片组件
+        创建一个统计卡片组件（2026-09-17 统一界面标准：图标方块 + 半透明色块 + 大号数值）
+
+        icon_path 仍按原调用传入，仅用于取主题色/图标，不再渲染静态 VImg。
         """
+        style_map = {
+            "seed": ("mdi-file-multiple-outline", "#6366f1"),
+            "upload": ("mdi-upload-network-outline", "#3b82f6"),
+            "Overleaf_A": ("mdi-check-circle-outline", "#10b981"),
+            "delete": ("mdi-delete-outline", "#f59e0b"),
+        }
+        key = str(icon_path).rsplit("/", 1)[-1].rsplit(".", 1)[0]
+        icon, color = style_map.get(key, ("mdi-chart-box-outline", "#8b5cf6"))
+        hex_color = color.lstrip("#")
+        rgba = (f"rgba({int(hex_color[0:2], 16)},{int(hex_color[2:4], 16)},"
+                f"{int(hex_color[4:6], 16)},")
         return {
             'component': 'VCol',
             'props': {
-                'cols': 6,
+                'cols': 12,
                 'md': 3,
-                'sm': 6
+                'sm': 6,
             },
             'content': [
                 {
-                    'component': 'VCard',
+                    'component': 'div',
                     'props': {
-                        'variant': 'tonal',
+                        'class': 'd-flex align-center ga-3 h-100 pa-3',
+                        'style': (f"background: {rgba}0.08); border: 1px solid {rgba}0.22); "
+                                  f"border-radius: 12px;"),
                     },
                     'content': [
                         {
-                            'component': 'VCardText',
+                            'component': 'div',
                             'props': {
-                                'class': 'd-flex align-center',
+                                'class': 'd-flex align-center justify-center flex-shrink-0',
+                                'style': (f"width: 40px; height: 40px; border-radius: 12px; "
+                                          f"background: {rgba}0.14);"),
                             },
                             'content': [
                                 {
-                                    'component': 'VAvatar',
+                                    'component': 'VIcon',
+                                    'props': {'size': 22, 'style': f"color: {color};"},
+                                    'text': icon,
+                                }
+                            ],
+                        },
+                        {
+                            'component': 'div',
+                            'content': [
+                                {
+                                    'component': 'div',
+                                    'props': {'class': 'text-h5 font-weight-black',
+                                              'style': 'line-height: 1.1;'},
+                                    'text': str(count),
+                                },
+                                {
+                                    'component': 'div',
+                                    'props': {'class': 'text-body-2 font-weight-medium'},
+                                    'text': title,
+                                },
+                            ],
+                        },
+                    ],
+                }
+            ],
+        }
+
+    def __build_hero_card(self) -> dict:
+        """概览头部卡（2026-09-17 统一界面标准；仅展示层，不读不改任何判定数据）。"""
+        statistic_info = self.__get_data(key="statistic") or {}
+        total_count = statistic_info.get("total_count") or 0
+
+        def _chip(text: str, icon: str, color: str) -> dict:
+            return {
+                'component': 'VChip',
+                'props': {'size': 'small', 'variant': 'tonal', 'color': color},
+                'content': [
+                    {'component': 'VIcon', 'props': {'size': 14, 'class': 'mr-1'}, 'text': icon},
+                    {'component': 'span', 'text': str(text)},
+                ],
+            }
+
+        return {
+            'component': 'VCard',
+            'props': {
+                'variant': 'flat',
+                'rounded': 'xl',
+                'class': 'mb-4 overflow-hidden',
+                'style': ('border: 1px solid rgba(128,128,128,0.18); position: relative;'),
+            },
+            'content': [
+                {
+                    'component': 'div',
+                    'props': {
+                        'class': 'd-none d-sm-flex',
+                        'style': ('position: absolute; width: 180px; height: 180px; border-radius: 50%; '
+                                  'top: -70px; left: -50px; background: rgba(99,102,241,0.08);'),
+                    },
+                },
+                {
+                    'component': 'div',
+                    'props': {
+                        'class': 'd-none d-sm-flex',
+                        'style': ('position: absolute; width: 220px; height: 220px; border-radius: 50%; '
+                                  'bottom: -120px; right: -60px; background: rgba(16,185,129,0.07);'),
+                    },
+                },
+                {
+                    'component': 'div',
+                    'props': {'class': 'pa-4', 'style': 'position: relative;'},
+                    'content': [
+                        {
+                            'component': 'div',
+                            'props': {'class': 'd-flex align-center ga-3'},
+                            'content': [
+                                {
+                                    'component': 'div',
                                     'props': {
-                                        'rounded': True,
-                                        'variant': 'text',
-                                        'class': 'me-3'
+                                        'class': 'd-flex align-center justify-center flex-shrink-0',
+                                        'style': ('width: 48px; height: 48px; border-radius: 12px; '
+                                                  'background: rgba(99,102,241,0.14);'),
                                     },
-                                    'content': [
-                                        {
-                                            'component': 'VImg',
-                                            'props': {
-                                                'src': icon_path
-                                            }
-                                        }
-                                    ]
+                                    'content': [{
+                                        'component': 'VIcon',
+                                        'props': {'size': 26, 'style': 'color: #6366f1;'},
+                                        'text': 'mdi-shield-star-outline',
+                                    }],
                                 },
                                 {
                                     'component': 'div',
                                     'content': [
                                         {
-                                            'component': 'span',
-                                            'props': {
-                                                'class': 'text-caption'
-                                            },
-                                            'text': title
+                                            'component': 'div',
+                                            'props': {'class': 'text-h6 font-weight-bold'},
+                                            'text': 'H&R 助手',
                                         },
                                         {
                                             'component': 'div',
-                                            'props': {
-                                                'class': 'd-flex align-center flex-wrap'
-                                            },
-                                            'content': [
-                                                {
-                                                    'component': 'span',
-                                                    'props': {
-                                                        'class': 'text-h6'
-                                                    },
-                                                    'text': count
-                                                }
-                                            ]
-                                        }
-                                    ]
-                                }
-                            ]
-                        }
-                    ]
-                }
-            ]
+                                            'props': {'class': 'text-caption text-medium-emphasis'},
+                                            'text': '跟踪 H&R 种子的做种时间与上传量，未达标到期提醒；支持多下载器与转移做种',
+                                        },
+                                    ],
+                                },
+                            ],
+                        },
+                        {'component': 'VDivider', 'props': {'class': 'my-3'}},
+                        {
+                            'component': 'div',
+                            'props': {'class': 'd-flex flex-wrap ga-2'},
+                            'content': [
+                                _chip(f"任务数 {total_count}", 'mdi-format-list-numbered', 'primary'),
+                                _chip('订阅超时收容 开启' if self._relocate_enabled else '订阅超时收容 关闭',
+                                      'mdi-folder-move-outline',
+                                      'warning' if self._relocate_enabled else 'secondary'),
+                                _chip(f"收容门槛 {self._relocate_after_hours} 小时", 'mdi-timer-sand', 'info'),
+                                _chip(f"收容目录 {self._relocate_dir or '未设置'}",
+                                      'mdi-folder-outline', 'success' if self._relocate_dir else 'secondary'),
+                            ],
+                        },
+                    ],
+                },
+            ],
+        }
+
+    def __build_footer(self) -> dict:
+        """底部口径说明块（2026-09-17 统一界面标准）。"""
+        lines = [
+            "判定口径",
+            "· 标签名 H&R；qb 与 tr 都按标签纳入管理（收容统一由订阅助手Q负责）。",
+            "· 做种时长以站点配置值为准：命中站点名单时覆盖任务记录里的历史值，避免沿用创建时的旧快照。",
+            "· 同一 hash 存在于多个下载器时，按做种时间最长的副本统计，不重复累加。",
+            "· 某 hash 在记录所属下载器消失但出现在其它下载器 → 判为已转移并补写 H&R 标签。",
+            "· 某下载器本轮取不到种子 → 跳过它的删除判定，避免瞬断误报。",
+        ]
+        return {
+            'component': 'div',
+            'props': {
+                'class': 'd-flex ga-3 pa-3 mt-1',
+                'style': 'background: rgba(139,92,246,0.08); border-radius: 12px;',
+            },
+            'content': [
+                {
+                    'component': 'VIcon',
+                    'props': {'size': 'small', 'class': 'mt-1', 'style': 'color: #8b5cf6;'},
+                    'text': 'mdi-information-outline',
+                },
+                {
+                    'component': 'div',
+                    'props': {'class': 'text-caption', 'style': 'line-height: 1.7;'},
+                    'content': [{'component': 'div', 'props': {'class': 'font-weight-bold'},
+                                 'text': lines[0]}]
+                               + [{'component': 'div', 'text': line} for line in lines[1:]],
+                },
+            ],
         }
 
     def get_service(self) -> List[Dict[str, Any]]:
