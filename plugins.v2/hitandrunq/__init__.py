@@ -67,7 +67,7 @@ class HitAndRunQ(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/hitandrunq.png"
     # 插件版本
-    plugin_version = "2.2.6"
+    plugin_version = "2.2.7"
     # 插件作者
     plugin_author = "Q"
     # 作者主页
@@ -1288,6 +1288,14 @@ class HitAndRunQ(_PluginBase):
                                                           histories=histories,
                                                           seeding_torrents_dict=seeding_by_downloader[name])
 
+            # 站点补标：遍历所有种子，对来自 H&R 站点但没有标签的种子自动补打标签并加入管理
+            self.__scan_and_tag_untagged_hr_seeds(
+                contexts=contexts,
+                torrent_tasks=torrent_tasks,
+                histories=histories,
+                seeding_by_downloader=seeding_by_downloader,
+            )
+
             # 打标检测：对在管且未满足的 H&R 任务补写 H&R 标签，避免标签丢失导致其它插件误删
             for torrent_task in list(torrent_tasks.values()):
                 if torrent_task.deleted or not torrent_task.hit_and_run:
@@ -1517,6 +1525,54 @@ class HitAndRunQ(_PluginBase):
                                                             reason="在下载器中找到已标记删除的H&R任务对应的种子信息",
                                                             torrent_tasks=reset_tasks)
         if is_modified:
+            self.__save_torrent_task(key="torrents", torrent_tasks=torrent_tasks)
+
+    def __scan_and_tag_untagged_hr_seeds(self,
+                                         contexts: Dict[str, DownloaderContext],
+                                         torrent_tasks: Dict[str, TorrentTask],
+                                         histories: Dict[str, TorrentHistory],
+                                         seeding_by_downloader: Dict[str, Dict[str, Any]]):
+        """遍历所有下载器的种子，对来自 H&R 站点但没有 H&R 标签的种子自动补打标签并加入管理。
+
+        解决收容移动/新下载但未触发 DownloadAdded 事件的种子遗漏问题。
+        """
+        hr_sites = self.__parse_site_hours(getattr(self._hnr_config, "site_hr_hours", ""))
+        if not hr_sites:
+            return
+
+        added_count = 0
+        for name, context in contexts.items():
+            if name not in seeding_by_downloader:
+                continue
+            seeding_dict = seeding_by_downloader[name]
+            for torrent_hash, torrent in seeding_dict.items():
+                # 已在管理中的跳过
+                if torrent_hash in torrent_tasks:
+                    continue
+                # 已有 H&R 标签的会由 __update_seeding_tasks_based_on_tags 处理，跳过
+                tags = context.torrent_helper.get_torrent_tags(torrent=torrent)
+                if self._hnr_config.hit_and_run_tag in tags:
+                    continue
+                # 尝试获取站点信息
+                torrent_task = self.__convert_torrent_info_to_task(
+                    context=context, torrent=torrent, histories=histories)
+                if not torrent_task or not torrent_task.site_name:
+                    continue
+                # 检查站点是否在 H&R 站点名单中
+                if torrent_task.site_name not in hr_sites:
+                    continue
+                # 是 H&R 站点但没有标签，补打标签并加入管理
+                torrent_task.downloader = context.name
+                torrent_tasks[torrent_hash] = torrent_task
+                added_count += 1
+                logger.info(f"站点 {torrent_task.site_name}，H&R 站点种子补标加入：{torrent_task.identifier}")
+                try:
+                    self.__update_hit_and_run_tag(torrent_task=torrent_task, add=True)
+                except Exception as err:
+                    logger.warning(f"H&R 站点种子补标失败：{torrent_hash} - {err}")
+
+        if added_count:
+            logger.info(f"H&R 站点补标完成，本轮新增 {added_count} 个种子加入 H&R 管理")
             self.__save_torrent_task(key="torrents", torrent_tasks=torrent_tasks)
 
     def __sync_presence_and_transfer(self, torrent_tasks: Dict[str, TorrentTask],
