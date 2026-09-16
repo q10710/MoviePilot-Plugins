@@ -144,11 +144,16 @@ class DownloadMonitor:
     def on_download(self, subscribe_id, torrent_hash: str, episodes=None,
                     downloader: Optional[str] = None, progress: float = 0.0,
                     enclosure: Optional[str] = None, page_url: Optional[str] = None,
-                    title: Optional[str] = None, description: Optional[str] = None):
+                    title: Optional[str] = None, description: Optional[str] = None,
+                    hit_and_run: Optional[bool] = None, site_name: Optional[str] = None):
         """DownloadAdded 阶段按 hash 登记种子监控与归属信息。
 
         enclosure 用于洗版按集基线回滚，enclosure/page_url 用于删除指纹防重；
         此阶段 hash 已确定，同时补齐 ResourceDownload 建立的无 hash 待定。
+
+        hit_and_run 是下载当时从站点解析出的种子级 H&R 标记（TorrentInfo.hit_and_run），
+        site_name 是来源站点名；两者存档供收容判定使用 —— 种子一旦进了下载器，
+        就无法再从下载器反查它是不是 H&R，只能在下载这一刻记下来。
         """
         if not torrent_hash:
             return
@@ -164,6 +169,8 @@ class DownloadMonitor:
                 "page_url": page_url,
                 "title": title,
                 "description": description,
+                "hit_and_run": hit_and_run,
+                "site_name": site_name,
                 "baseline_progress": progress,
                 "baseline_at": now,
                 "queue_grace_seconds": 0,
