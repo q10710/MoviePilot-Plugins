@@ -123,7 +123,7 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/subscribeassistantenhancedq.png"
     # 插件版本
-    plugin_version = "0.10.18"
+    plugin_version = "0.10.19"
     _site_cache_candidate_helper_warned = False
     # 插件作者
     plugin_author = "Q"
@@ -1782,18 +1782,23 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
         return names
 
     def _is_hr_release(self, downloader, torrent_hash, torrent_task=None, subscribe=None) -> bool:
-        """判断种子是否属于 H&R（判据全部自采，不依赖其它插件写入的标签）。
+        """判断种子是否属于 H&R（只认本插件自采的存档与配置，不读任何标签）。
 
         1) 下载当时存档的 TorrentInfo.hit_and_run=True → 是（种子级确证，最可靠）；
-        2) 站点属于本插件配置的「全站H&R站点」名单 → 是（站点级兜底，应对该站解析不出种子级图标）；
-        3) 存档明确为 False → 否（种子级确证为非 H&R，直接采信）；
-        4) 没有存档（改造前的老记录）→ 下载器标签兜底；其余 → 否。
+        2) 站点属于本插件配置的「全站H&R站点」名单 → 是（站点级兜底）；
+        3) 其余 → 否。
 
         H&R 不是种子文件或下载器自带属性，而是站点按账号记账的；站点种子列表的 HR 图标
-        已被主程序解析成 TorrentInfo.hit_and_run，所以「下载当时的存档」才是最可靠的
-        种子级判据 —— 种子一旦进了下载器就无法再反查该标记。
+        已被主程序解析成 TorrentInfo.hit_and_run，「下载当时的存档」是唯一可靠的种子级判据 ——
+        种子一旦进了下载器就无法再反查该标记。
         「站点H&R时长」只表示该站做种时长，不参与本判定。
-        本插件只用自己采集的存档与自己的配置判定，H&R 助手或其它插件是否打标签不影响结果。
+        本插件**不使用下载器上的 H&R 标签**（那是其它插件写入的副产物），以保证两个插件
+        各自独立运行：对方不安装也不影响本插件的判定。
+
+        为什么第 2 步的站点兜底不能省（2026-09-16 实测）：52pt、1PTBA 是站点公告明写的
+        「全站 H&R」站，但 MP 对这两个站解析不出种子级图标（搜索结果 hit_and_run 恒为 false，
+        含本站官组）。若只按「存档 True」判定，这两站的种子会被判为非 H&R →
+        超时时走普通种子删除分支直接删种（而不是收容保种）→ 造成真实的 H&R 违约。
         """
         record = torrent_task if isinstance(torrent_task, dict) else {}
         site_name = str(record.get("site_name") or "").strip()
@@ -1807,30 +1812,12 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
                         f"（站点 {site_name or '未知'}）")
             return True
 
-        # 2) 站点级兜底：全站所有种子都计 H&R 的站点（该站可能解析不出种子级图标）
+        # 2) 站点级兜底：全站所有种子都计 H&R 的站点（该站解析不出种子级图标）
         if site_name and site_name in self._full_hr_site_names():
             logger.info(f"订阅收容：站点 {site_name} 属于全站 H&R 站点，按 H&R 处理：{torrent_hash[:12]}")
             return True
 
-        # 3) 存档明确为非 H&R：直接采信，不再看标签
-        if archived is False:
-            logger.info(f"订阅收容：种子 {torrent_hash[:12]} 下载时站点标记为非 H&R"
-                        f"（站点 {site_name or '未知'}），跳过收容")
-            return False
-
-        # 4) 无存档（改造前的老记录）：下载器标签兜底
-        try:
-            service = self._downloader_helper.get_service(name=downloader) if self._downloader_helper else None
-            instance = getattr(service, "instance", None) if service else None
-            if instance:
-                torrents, error = instance.get_torrents(ids=torrent_hash)
-                if torrents and not error:
-                    tags = self._torrent_tags(torrents[0])
-                    if any(str(tag).strip().upper() in ("H&R", "HR") for tag in tags):
-                        logger.info(f"订阅收容：种子 {torrent_hash[:12]} 无下载时存档，按 H&R 标签兜底判定为 H&R")
-                        return True
-        except Exception as err:
-            logger.debug(f"订阅收容：读取种子标签失败 {torrent_hash}：{err}")
+        # 3) 其余一律按非 H&R 处理（存档为 False、无存档，或站点不在全站名单）
         return False
 
     def _site_name_from_history(self, torrent_hash: str) -> str:
