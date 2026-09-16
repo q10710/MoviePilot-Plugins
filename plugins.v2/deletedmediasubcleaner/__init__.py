@@ -43,7 +43,7 @@ class DeletedMediaSubCleaner(_PluginBase):
                    "连续达到宽限天数后按配置清理该订阅。")
     plugin_icon = ("https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/"
                    "main/icons/deletedmediasubcleaner.png")
-    plugin_version = "1.0.3"
+    plugin_version = "1.0.4"
     plugin_label = "订阅"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -346,58 +346,319 @@ class DeletedMediaSubCleaner(_PluginBase):
         }
 
     def get_page(self) -> List[dict]:
-        """返回插件详情页，展示最近检测结果与待处置清单。"""
+        """返回插件详情页，展示最近检测结果与待处置清单（2026-09-17 按统一界面标准改版，仅展示层）。"""
         state = self.get_data(DATA_STATE) or {}
         missing: Dict[str, dict] = self.get_data(DATA_MISSING) or {}
         handled: List[dict] = state.get("last_handled") or []
 
-        rows: List[dict] = []
-        if not state:
-            rows.append({
-                "component": "VAlert",
-                "props": {"type": "info", "variant": "tonal", "text": "尚未运行，请先启用插件或执行一次检测"},
-            })
-        else:
-            rows.append({
-                "component": "VAlert",
+        accent, ok, warn, info_c, purple = "#6366f1", "#10b981", "#f59e0b", "#3b82f6", "#8b5cf6"
+
+        def _rgba(hex_color: str, alpha: float) -> str:
+            h = hex_color.lstrip("#")
+            return f"rgba({int(h[0:2], 16)},{int(h[2:4], 16)},{int(h[4:6], 16)},{alpha})"
+
+        def _tile(icon: str, color: str, size: int = 44) -> dict:
+            return {
+                "component": "div",
                 "props": {
-                    "type": "success" if not missing else "warning",
-                    "variant": "tonal",
-                    "text": (f"最近检测：{state.get('last_run') or 'N/A'}，"
-                             f"媒体库条目 {state.get('library_count') or 0} 个，"
-                             f"待处置缺失 {len(missing)} 个，"
-                             f"累计处置 {state.get('total_handled') or 0} 个"),
+                    "class": "d-flex align-center justify-center flex-shrink-0",
+                    "style": (f"width: {size}px; height: {size}px; border-radius: 12px; "
+                              f"background: {_rgba(color, 0.14)};"),
                 },
+                "content": [{
+                    "component": "VIcon",
+                    "props": {"size": int(size * 0.55), "style": f"color: {color};"},
+                    "text": icon,
+                }],
+            }
+
+        def _chip(text: str, icon: str, color: str) -> dict:
+            return {
+                "component": "VChip",
+                "props": {"size": "small", "variant": "tonal", "color": color},
+                "content": [
+                    {"component": "VIcon", "props": {"size": 14, "class": "mr-1"}, "text": icon},
+                    {"component": "span", "text": str(text)},
+                ],
+            }
+
+        def _stat(value, label: str, hint: str, icon: str, color: str) -> dict:
+            return {
+                "component": "div",
+                "props": {
+                    "class": "d-flex align-center ga-3 h-100 pa-3",
+                    "style": (f"background: {_rgba(color, 0.08)}; border: 1px solid {_rgba(color, 0.22)}; "
+                              f"border-radius: 12px;"),
+                },
+                "content": [
+                    _tile(icon, color, 40),
+                    {
+                        "component": "div",
+                        "content": [
+                            {"component": "div",
+                             "props": {"class": "text-h5 font-weight-black", "style": "line-height: 1.1;"},
+                             "text": str(value)},
+                            {"component": "div", "props": {"class": "text-body-2 font-weight-medium"},
+                             "text": label},
+                            {"component": "div",
+                             "props": {"class": "text-caption text-medium-emphasis",
+                                       "style": "white-space: normal;"},
+                             "text": hint},
+                        ],
+                    },
+                ],
+            }
+
+        def _card_title(title: str, icon: str, color: str, count_text: str, count_color: str) -> dict:
+            return {
+                "component": "div",
+                "props": {"class": "d-flex align-center ga-3 px-4 pt-4 pb-3"},
+                "content": [
+                    _tile(icon, color, 34),
+                    {"component": "div", "props": {"class": "text-subtitle-1 font-weight-bold"},
+                     "text": title},
+                    {"component": "VSpacer"},
+                    _chip(count_text, "mdi-counter", count_color),
+                ],
+            }
+
+        def _empty_alert(text: str) -> dict:
+            return {
+                "component": "VAlert",
+                "props": {"type": "success", "variant": "tonal", "density": "compact",
+                          "prepend-icon": "mdi-check-circle-outline", "text": text},
+            }
+
+        def _scroll_table(headers: List[str], rows_in: List[dict], min_width: int = 720) -> dict:
+            return {
+                "component": "div",
+                "props": {"style": "max-height: 420px; overflow: auto; scrollbar-width: thin;"},
+                "content": [{
+                    "component": "VTable",
+                    "props": {"density": "comfortable", "hover": True,
+                              "style": f"min-width: {min_width}px;"},
+                    "content": [
+                        {"component": "thead", "content": [{"component": "tr", "content": [
+                            {"component": "th", "text": h} for h in headers
+                        ]}]},
+                        {"component": "tbody", "content": rows_in},
+                    ],
+                }],
+            }
+
+        def _footer(lines: List[str]) -> dict:
+            return {
+                "component": "div",
+                "props": {"class": "d-flex ga-3 pa-3 mt-1",
+                          "style": f"background: {_rgba(purple, 0.08)}; border-radius: 12px;"},
+                "content": [
+                    {"component": "VIcon",
+                     "props": {"size": "small", "class": "mt-1", "style": f"color: {purple};"},
+                     "text": "mdi-information-outline"},
+                    {"component": "div", "props": {"class": "text-caption", "style": "line-height: 1.7;"},
+                     "content": [{"component": "div", "props": {"class": "font-weight-bold"},
+                                  "text": lines[0]}]
+                                + [{"component": "div", "text": line} for line in lines[1:]]},
+                ],
+            }
+
+        last_run = state.get("last_run") or "尚未运行"
+        lib_count = state.get("library_count") or 0
+        total_handled = state.get("total_handled") or 0
+        action_text = {"delete": "删除订阅", "pause": "暂停订阅", "notify": "仅通知"}.get(
+            str(self._action or ""), str(self._action or "未设置"))
+        enabled = bool(self._enabled)
+
+        page: List[dict] = []
+
+        # ① 概览头部
+        page.append({
+            "component": "VCard",
+            "props": {"variant": "flat", "rounded": "xl", "class": "mb-4 overflow-hidden",
+                      "style": "border: 1px solid rgba(128,128,128,0.18); position: relative;"},
+            "content": [
+                {"component": "div",
+                 "props": {"class": "d-none d-sm-flex",
+                           "style": (f"position: absolute; width: 180px; height: 180px; border-radius: 50%; "
+                                     f"top: -70px; left: -50px; background: {_rgba(accent, 0.08)};")}},
+                {"component": "div",
+                 "props": {"class": "d-none d-sm-flex",
+                           "style": (f"position: absolute; width: 220px; height: 220px; border-radius: 50%; "
+                                     f"bottom: -120px; right: -60px; background: {_rgba(ok, 0.07)};")}},
+                {
+                    "component": "div",
+                    "props": {"class": "pa-4", "style": "position: relative;"},
+                    "content": [
+                        {
+                            "component": "div",
+                            "props": {"class": "d-flex align-center ga-3"},
+                            "content": [
+                                _tile("mdi-folder-alert-outline", accent, 48),
+                                {
+                                    "component": "div",
+                                    "content": [
+                                        {"component": "div", "props": {"class": "text-h6 font-weight-bold"},
+                                         "text": "删档订阅清理"},
+                                        {"component": "div",
+                                         "props": {"class": "text-caption text-medium-emphasis"},
+                                         "text": "媒体库条目消失后，若订阅仍在且期间无新下载，按宽限期处置"},
+                                    ],
+                                },
+                            ],
+                        },
+                        {"component": "VDivider", "props": {"class": "my-3"}},
+                        {
+                            "component": "div",
+                            "props": {"class": "d-flex flex-wrap ga-2"},
+                            "content": [
+                                _chip("运行中" if enabled else "未启用", "mdi-power",
+                                      "success" if enabled else "secondary"),
+                                _chip(f"上次检测 {last_run}", "mdi-clock-outline", "primary"),
+                                _chip(f"宽限 {self._missing_days} 天", "mdi-calendar-clock", "warning"),
+                                _chip(f"处置动作 {action_text}", "mdi-gavel", "info"),
+                                _chip("通知 开启" if self._notify else "通知 关闭", "mdi-bell-outline",
+                                      "secondary" if not self._notify else "success"),
+                            ],
+                        },
+                    ],
+                },
+            ],
+        })
+
+        # ② 统计卡片
+        page.append({
+            "component": "VRow",
+            "props": {"dense": True, "class": "mb-4"},
+            "content": [
+                {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 3},
+                 "content": [_stat(lib_count, "媒体库条目", "上次检测采集到的条目总数",
+                                   "mdi-library-shelves", info_c)]},
+                {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 3},
+                 "content": [_stat(len(missing), "观察中缺失", "已从媒体库消失、正在计时",
+                                   "mdi-timer-sand", warn if missing else ok)]},
+                {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 3},
+                 "content": [_stat(total_handled, "累计处置", f"动作：{action_text}",
+                                   "mdi-archive-cancel-outline", accent)]},
+                {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 3},
+                 "content": [_stat(self._missing_days, "宽限天数", "连续缺失达到该天数才处置",
+                                   "mdi-calendar-clock", warn)]},
+            ],
+        })
+
+        if not state:
+            page.append({
+                "component": "VCard",
+                "props": {"variant": "flat", "rounded": "xl", "class": "mb-3 overflow-hidden",
+                          "style": "border: 1px solid rgba(128,128,128,0.18);"},
+                "content": [
+                    _card_title("检测结果", "mdi-information-outline", info_c, "尚未运行", "info"),
+                    {"component": "VDivider"},
+                    {"component": "VCardText", "props": {"class": "px-4 pt-3 pb-4"},
+                     "content": [{
+                         "component": "VAlert",
+                         "props": {"type": "info", "variant": "tonal", "density": "compact",
+                                   "prepend-icon": "mdi-information-outline",
+                                   "text": "尚未运行。首次运行只采集媒体库基线，不做任何判定。"},
+                     }]},
+                ],
             })
 
-        if missing:
-            rows.append({"component": "div", "text": "当前处于缺失观察期的媒体", "props": {"class": "text-subtitle-1 mt-3"}})
-            for key, item in list(missing.items())[:20]:
-                rows.append({
-                    "component": "VAlert",
-                    "props": {
-                        "type": "info",
-                        "variant": "tonal",
-                        "text": (f"{item.get('title')}（{item.get('year') or '-'}｜{item.get('type')}）"
-                                 f" 首次缺失 {item.get('first_missing')}，"
-                                 f"已缺失 {item.get('last_days') or 0} 天"),
-                    },
-                })
+        # ③ 缺失观察期明细
+        obs_rows: List[dict] = []
+        for key, item in list(missing.items())[:200]:
+            if not isinstance(item, dict):
+                continue
+            obs_rows.append({
+                "component": "tr",
+                "content": [
+                    {"component": "td", "props": {"class": "text-body-2"},
+                     "text": item.get("title") or "-"},
+                    {"component": "td", "props": {"class": "text-body-2"},
+                     "text": item.get("year") or "-"},
+                    {"component": "td", "content": [{
+                        "component": "VChip",
+                        "props": {"size": "x-small", "variant": "tonal", "color": "info"},
+                        "text": item.get("type") or "-",
+                    }]},
+                    {"component": "td", "props": {"class": "text-caption"},
+                     "text": key},
+                    {"component": "td", "props": {"class": "text-caption"},
+                     "text": item.get("first_missing") or "-"},
+                    {"component": "td", "content": [{
+                        "component": "VChip",
+                        "props": {"size": "x-small", "variant": "tonal",
+                                  "color": "warning" if (item.get("last_days") or 0) >= self._missing_days
+                                           else "secondary"},
+                        "text": f"{item.get('last_days') or 0} 天",
+                    }]},
+                ],
+            })
 
-        if handled:
-            rows.append({"component": "div", "text": "最近处置记录", "props": {"class": "text-subtitle-1 mt-3"}})
-            for item in handled[:20]:
-                rows.append({
-                    "component": "VAlert",
-                    "props": {
-                        "type": "success",
-                        "variant": "tonal",
-                        "text": (f"[{item.get('time')}] {item.get('title')}（{item.get('year') or '-'}）"
-                                 f" → {item.get('result')}（缺失 {item.get('days')} 天）"),
-                    },
-                })
+        page.append({
+            "component": "VCard",
+            "props": {"variant": "flat", "rounded": "xl", "class": "mb-3 overflow-hidden",
+                      "style": "border: 1px solid rgba(128,128,128,0.18);"},
+            "content": [
+                _card_title("当前处于缺失观察期的媒体", "mdi-timer-sand", warn,
+                            f"{len(missing)} 个", "warning"),
+                {"component": "VDivider"},
+                {"component": "VCardText", "props": {"class": "px-4 pt-3 pb-4"},
+                 "content": [_scroll_table(
+                     ["标题", "年份", "类型", "媒体标识", "首次缺失", "已缺失"],
+                     obs_rows, min_width=820,
+                 ) if obs_rows else _empty_alert("当前没有处于缺失观察期的媒体。")]},
+            ],
+        })
 
-        return rows
+        # ④ 最近处置记录
+        h_rows: List[dict] = []
+        for item in handled[:200]:
+            if not isinstance(item, dict):
+                continue
+            h_rows.append({
+                "component": "tr",
+                "content": [
+                    {"component": "td", "props": {"class": "text-caption"},
+                     "text": item.get("time") or "-"},
+                    {"component": "td", "props": {"class": "text-body-2"},
+                     "text": item.get("title") or "-"},
+                    {"component": "td", "props": {"class": "text-body-2"},
+                     "text": item.get("year") or "-"},
+                    {"component": "td", "content": [{
+                        "component": "VChip",
+                        "props": {"size": "x-small", "variant": "tonal", "color": "success"},
+                        "text": item.get("result") or "-",
+                    }]},
+                    {"component": "td", "props": {"class": "text-body-2"},
+                     "text": f"{item.get('days') or 0} 天"},
+                ],
+            })
+
+        page.append({
+            "component": "VCard",
+            "props": {"variant": "flat", "rounded": "xl", "class": "mb-3 overflow-hidden",
+                      "style": "border: 1px solid rgba(128,128,128,0.18);"},
+            "content": [
+                _card_title("最近处置记录", "mdi-history", ok, f"{len(handled)} 条", "success"),
+                {"component": "VDivider"},
+                {"component": "VCardText", "props": {"class": "px-4 pt-3 pb-4"},
+                 "content": [_scroll_table(
+                     ["时间", "标题", "年份", "处置结果", "缺失天数"],
+                     h_rows, min_width=700,
+                 ) if h_rows else _empty_alert("最近一轮没有需要处置的订阅。")]},
+            ],
+        })
+
+        # ⑤ 口径说明
+        page.append(_footer([
+            "判定口径",
+            "· 首次运行只采集媒体库基线，不做判定；媒体服务器读取失败或本轮 0 条目会整轮中止。",
+            f"· 条目从媒体库消失后进入观察，连续缺失达 {self._missing_days} 天、且缺失期间没有新的下载记录，才按「{action_text}」处置。",
+            "· 条目重新回到媒体库 → 取消观察；正在重下自愈的订阅会被「有新的下载记录」这道门挡住。",
+            "· 条目数比上轮快照骤降（≥10% 且 ≥5 个）时，本轮只刷新基线、跳过消失判定，防媒体服务器异常造成整批误判。",
+        ]))
+
+        return page
 
     # ── 主流程 ────────────────────────────────────────────────
 
