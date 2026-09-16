@@ -32,7 +32,7 @@ class SeedSourceGuard(_PluginBase):
     plugin_desc = ("检测本地源文件是否有下载器在做种、下载器是否存在文件丢失的无效做种或"
                    "tracker 全部失败的做种任务；连续N天异常可通知或按策略处置，杜绝无效做种与孤儿文件。")
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/seedsourceguard.png"
-    plugin_version = "1.1.11"
+    plugin_version = "1.1.12"
     plugin_label = "下载管理"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -460,9 +460,19 @@ class SeedSourceGuard(_PluginBase):
         }
 
     def get_page(self) -> Optional[List[dict]]:
-        """返回插件数据页：运行概览与异常明细（中文卡片布局）。"""
+        """返回插件数据页：运行概览与异常明细（2026-09-17 按统一界面标准改版，仅展示层）。"""
         if not self._enabled:
-            return None
+            return [{
+                "component": "VAlert",
+                "props": {
+                    "type": "warning",
+                    "variant": "tonal",
+                    "density": "compact",
+                    "prepend-icon": "mdi-alert-outline",
+                    "text": "插件未启用。启用后会按周期扫描配置的下载/整理目录，检查孤儿源文件、无效做种与红种做种。",
+                },
+            }]
+
         state = self.get_data("state") or {}
         no_seed = state.get("no_seed_active") or []
         invalid = state.get("invalid_active") or []
@@ -471,253 +481,321 @@ class SeedSourceGuard(_PluginBase):
         last_run = state.get("last_run") or "尚未运行"
         handled = state.get("handled") or []
         total = len(no_seed) + len(invalid) + len(red) + len(unavailable)
-        # ── 顶部状态条 ──
-        if total == 0:
-            head_type = "success"
-            head_text = f"一切正常：未发现孤儿文件、无效做种与红种做种（最近检测：{last_run}）"
-        else:
-            head_type = "warning"
-            head_text = (f"共发现 {total} 项异常（最近检测：{last_run}）"
-                         f"，连续 {self._days} 次扫描仍存在将按配置处置，删除类处置需先开启允许开关")
-        children = [
-            {
-                "component": "VAlert",
+        max_rows = 200
+
+        accent, ok, warn, info_c, purple = "#6366f1", "#10b981", "#f59e0b", "#3b82f6", "#8b5cf6"
+
+        def _rgba(hex_color: str, alpha: float) -> str:
+            h = hex_color.lstrip("#")
+            return f"rgba({int(h[0:2], 16)},{int(h[2:4], 16)},{int(h[4:6], 16)},{alpha})"
+
+        def _tile(icon: str, color: str, size: int = 44) -> dict:
+            return {
+                "component": "div",
                 "props": {
-                    "type": head_type,
-                    "variant": "tonal",
-                    "text": head_text,
+                    "class": "d-flex align-center justify-center flex-shrink-0",
+                    "style": (f"width: {size}px; height: {size}px; border-radius: 12px; "
+                              f"background: {_rgba(color, 0.14)};"),
                 },
+                "content": [{
+                    "component": "VIcon",
+                    "props": {"size": int(size * 0.55), "style": f"color: {color};"},
+                    "text": icon,
+                }],
             }
-        ]
-        # ── 统计卡片 ──
-        stats = [
-            ("孤儿源文件", len(no_seed), "orange-darken-2"),
-            ("无效做种", len(invalid), "red-darken-2"),
-            ("红种做种", len(red), "deep-purple-darken-2"),
-            ("下载器异常", len(unavailable), "grey-darken-1"),
-        ]
-        row_content = []
-        for label, num, color in stats:
-            row_content.append({
-                "component": "VCol",
-                "props": {"cols": 12, "md": 3},
+
+        def _chip(text: str, icon: str, color: str) -> dict:
+            return {
+                "component": "VChip",
+                "props": {"size": "small", "variant": "tonal", "color": color},
                 "content": [
+                    {"component": "VIcon", "props": {"size": 14, "class": "mr-1"}, "text": icon},
+                    {"component": "span", "text": str(text)},
+                ],
+            }
+
+        def _stat(value, label: str, hint: str, icon: str, color: str) -> dict:
+            return {
+                "component": "div",
+                "props": {
+                    "class": "d-flex align-center ga-3 h-100 pa-3",
+                    "style": (f"background: {_rgba(color, 0.08)}; border: 1px solid {_rgba(color, 0.22)}; "
+                              f"border-radius: 12px;"),
+                },
+                "content": [
+                    _tile(icon, color, 40),
                     {
-                        "component": "VCard",
-                        "props": {"variant": "tonal"},
+                        "component": "div",
                         "content": [
-                            {
-                                "component": "VCardText",
-                                "props": {"class": "text-center py-3"},
-                                "content": [
-                                    {
-                                        "component": "div",
-                                        "props": {
-                                            "class": f"text-h3 font-weight-black {color}",
-                                        },
-                                        "text": str(num),
-                                    },
-                                    {
-                                        "component": "div",
-                                        "props": {
-                                            "class": "text-body-2 text-medium-emphasis",
-                                        },
-                                        "text": label,
-                                    },
-                                ],
-                            }
+                            {"component": "div",
+                             "props": {"class": "text-h5 font-weight-black", "style": "line-height: 1.1;"},
+                             "text": str(value)},
+                            {"component": "div", "props": {"class": "text-body-2 font-weight-medium"},
+                             "text": label},
+                            {"component": "div",
+                             "props": {"class": "text-caption text-medium-emphasis",
+                                       "style": "white-space: normal;"},
+                             "text": hint},
                         ],
-                    }
-                ],
-            })
-        children.append({"component": "VRow", "content": row_content})
-        # ── 明细分组卡片 ──
-        sections = [
-            {
-                "key": "no_seed",
-                "title": "孤儿源文件（本地存在但一直无下载器做种）",
-                "color": "warning",
-                "empty": "未发现孤儿源文件",
-                "items": no_seed,
-            },
-            {
-                "key": "invalid",
-                "title": "无效做种（任务仍在但文件丢失或报错）",
-                "color": "error",
-                "empty": "未发现无效做种任务",
-                "items": invalid,
-            },
-            {
-                "key": "red",
-                "title": "红种做种（tracker 全部通告失败，占做种数 80% 以上时自动保护）",
-                "color": "deep-purple-darken-2",
-                "empty": "未发现红种做种任务",
-                "items": red,
-            },
-            {
-                "key": "unavailable",
-                "title": "下载器异常（本轮已跳过，未做任何处置）",
-                "color": "secondary",
-                "empty": "全部下载器在线",
-                "items": [
-                    {"name": item.get("name", ""), "err": item.get("err", "")}
-                    for item in unavailable
-                ],
-            },
-        ]
-        for sec in sections:
-            items = sec["items"]
-            content = []
-            if not items:
-                content.append({
-                    "component": "VAlert",
-                    "props": {
-                        "type": "success",
-                        "variant": "tonal",
-                        "text": sec["empty"],
                     },
-                })
-            else:
-                content.append({
-                    "component": "VRow",
+                ],
+            }
+
+        def _card(title: str, icon: str, color: str, count_text: str, count_color: str,
+                  body: List[dict]) -> dict:
+            return {
+                "component": "VCard",
+                "props": {"variant": "flat", "rounded": "xl", "class": "mb-3 overflow-hidden",
+                          "style": "border: 1px solid rgba(128,128,128,0.18);"},
+                "content": [
+                    {"component": "div",
+                     "props": {"class": "d-flex align-center ga-3 px-4 pt-4 pb-3"},
+                     "content": [
+                         _tile(icon, color, 34),
+                         {"component": "div", "props": {"class": "text-subtitle-1 font-weight-bold"},
+                          "text": title},
+                         {"component": "VSpacer"},
+                         _chip(count_text, "mdi-counter", count_color),
+                     ]},
+                    {"component": "VDivider"},
+                    {"component": "VCardText", "props": {"class": "px-4 pt-3 pb-4"}, "content": body},
+                ],
+            }
+
+        def _empty_alert(text: str) -> dict:
+            return {
+                "component": "VAlert",
+                "props": {"type": "success", "variant": "tonal", "density": "compact",
+                          "prepend-icon": "mdi-check-circle-outline", "text": text},
+            }
+
+        def _style_text(color: str) -> str:
+            return f"color: {color};"
+
+        def _scroll_table(headers: List[str], rows_in: List[dict], min_width: int = 720) -> dict:
+            return {
+                "component": "div",
+                "props": {"style": "max-height: 420px; overflow: auto; scrollbar-width: thin;"},
+                "content": [{
+                    "component": "VTable",
+                    "props": {"density": "comfortable", "hover": True,
+                              "style": f"min-width: {min_width}px;"},
+                    "content": [
+                        {"component": "thead", "content": [{"component": "tr", "content": [
+                            {"component": "th", "text": h} for h in headers
+                        ]}]},
+                        {"component": "tbody", "content": rows_in},
+                    ],
+                }],
+            }
+
+        def _footer(lines: List[str]) -> dict:
+            return {
+                "component": "div",
+                "props": {"class": "d-flex ga-3 pa-3 mt-1",
+                          "style": f"background: {_rgba(purple, 0.08)}; border-radius: 12px;"},
+                "content": [
+                    {"component": "VIcon",
+                     "props": {"size": "small", "class": "mt-1", "style": _style_text(purple)},
+                     "text": "mdi-information-outline"},
+                    {"component": "div", "props": {"class": "text-caption", "style": "line-height: 1.7;"},
+                     "content": [{"component": "div", "props": {"class": "font-weight-bold"},
+                                  "text": lines[0]}]
+                                + [{"component": "div", "text": line} for line in lines[1:]]},
+                ],
+            }
+
+        action_text = {"notify": "仅通知", "move": "移动", "delete": "删除"}
+
+        page: List[dict] = []
+
+        # ① 概览头部
+        page.append({
+            "component": "VCard",
+            "props": {"variant": "flat", "rounded": "xl", "class": "mb-4 overflow-hidden",
+                      "style": "border: 1px solid rgba(128,128,128,0.18); position: relative;"},
+            "content": [
+                {"component": "div",
+                 "props": {"class": "d-none d-sm-flex",
+                           "style": (f"position: absolute; width: 180px; height: 180px; border-radius: 50%; "
+                                     f"top: -70px; left: -50px; background: {_rgba(accent, 0.08)};")}},
+                {"component": "div",
+                 "props": {"class": "d-none d-sm-flex",
+                           "style": (f"position: absolute; width: 220px; height: 220px; border-radius: 50%; "
+                                     f"bottom: -120px; right: -60px; background: "
+                                     f"{_rgba(ok if total == 0 else warn, 0.07)};")}},
+                {
+                    "component": "div",
+                    "props": {"class": "pa-4", "style": "position: relative;"},
                     "content": [
                         {
-                            "component": "VCol",
-                            "props": {"cols": 12},
+                            "component": "div",
+                            "props": {"class": "d-flex align-center ga-3"},
                             "content": [
+                                _tile("mdi-shield-sync-outline" if total == 0 else "mdi-shield-alert-outline",
+                                      ok if total == 0 else warn, 48),
                                 {
-                                    "component": "VCard",
-                                    "props": {
-                                        "variant": "outlined",
-                                        "color": sec["color"],
-                                    },
+                                    "component": "div",
                                     "content": [
-                                        {
-                                            "component": "VCardText",
-                                            "props": {"class": "py-2"},
-                                            "content": [
-                                                {
-                                                    "component": "div",
-                                                    "props": {
-                                                        "class": "text-body-2 d-flex align-center",
-                                                    },
-                                                    "content": [
-                                                        {
-                                                            "component": "div",
-                                                            "props": {
-                                                                "class": f"text-{sec['color']} mr-2",
-                                                            },
-                                                            "text": "●",
-                                                        },
-                                                        {
-                                                            "component": "div",
-                                                            "text": (
-                                                                f"{sec['title']}，共 {len(items)} 项"
-                                                            ),
-                                                        },
-                                                    ],
-                                                },
-                                            ],
-                                        },
+                                        {"component": "div", "props": {"class": "text-h6 font-weight-bold"},
+                                         "text": "做种守卫"},
+                                        {"component": "div",
+                                         "props": {"class": "text-caption text-medium-emphasis"},
+                                         "text": ("一切正常：未发现孤儿文件、无效做种与红种做种"
+                                                  if total == 0 else
+                                                  f"共发现 {total} 项异常，连续 {self._days} 次扫描仍存在将按配置处置")},
                                     ],
-                                }
+                                },
                             ],
-                        }
-                    ],
-                })
-                for item in items:
-                    if sec["key"] == "no_seed":
-                        line = f"{item.get('path', '')}"
-                        extra = f"已持续 {item.get('days', 1)} 次扫描"
-                    elif sec["key"] in ("invalid", "red"):
-                        line = f"[{item.get('dl', '')}] {item.get('name', '')}"
-                        extra = f"已持续 {item.get('days', 1)} 次扫描"
-                    else:
-                        line = f"{item.get('name', '')}"
-                        extra = str(item.get("err", ""))[:120]
-                    content.append({
-                        "component": "VRow",
-                        "props": {"align": "center", "class": "px-2"},
-                        "content": [
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 9},
-                                "content": [
-                                    {
-                                        "component": "div",
-                                        "props": {"class": "text-body-2"},
-                                        "text": line,
-                                    }
-                                ],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 3},
-                                "content": [
-                                    {
-                                        "component": "div",
-                                        "props": {
-                                            "class": "text-caption text-medium-emphasis text-right",
-                                        },
-                                        "text": extra,
-                                    }
-                                ],
-                            },
-                        ],
-                    })
-            children.append({
-                "component": "VCard",
-                "props": {"variant": "flat", "class": "mt-3"},
-                "content": [
-                    {
-                        "component": "VCardTitle",
-                        "props": {
-                            "class": "text-subtitle-1 font-weight-bold",
                         },
-                        "text": sec["title"],
-                    },
-                    {
-                        "component": "VCardText",
-                        "content": content,
-                    },
-                ],
-            })
-        # ── 最近处置记录 ──
-        handled_rows = [
-            f"{item.get('time', '')}　{item.get('text', '')}" for item in handled[-10:]
-        ]
-        record_card = [
-            {
-                "component": "VAlert",
-                "props": {
-                    "type": "info",
-                    "variant": "tonal",
-                    "text": "暂无处置记录",
+                        {"component": "VDivider", "props": {"class": "my-3"}},
+                        {
+                            "component": "div",
+                            "props": {"class": "d-flex flex-wrap ga-2"},
+                            "content": [
+                                _chip(f"最近检测 {last_run}", "mdi-clock-outline", "primary"),
+                                _chip(f"连续阈值 {self._days} 次扫描", "mdi-counter", "info"),
+                                _chip(f"清理宽限 {self._clean_days} 天", "mdi-calendar-clock", "warning"),
+                                _chip("删除开关 允许" if self._allow_delete else "删除开关 未允许",
+                                      "mdi-delete-outline", "warning" if self._allow_delete else "success"),
+                                _chip("通知 开启" if self._notify else "通知 关闭", "mdi-bell-outline",
+                                      "success" if self._notify else "secondary"),
+                            ],
+                        },
+                    ],
                 },
-            }
-        ] if not handled_rows else [
-            {
-                "component": "div",
-                "props": {"class": "text-body-2"},
-                "content": [
-                    {"component": "div", "props": {"class": "py-1"}, "text": row}
-                    for row in handled_rows
-                ],
-            }
-        ]
-        children.append({
-            "component": "VCard",
-            "props": {"variant": "flat", "class": "mt-3"},
-            "content": [
-                {
-                    "component": "VCardTitle",
-                    "props": {"class": "text-subtitle-1 font-weight-bold"},
-                    "text": "最近处置记录",
-                },
-                {"component": "VCardText", "content": record_card},
             ],
         })
-        return children
+
+        # ② 统计卡片
+        page.append({
+            "component": "VRow",
+            "props": {"dense": True, "class": "mb-4"},
+            "content": [
+                {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 3},
+                 "content": [_stat(len(no_seed), "孤儿源文件",
+                                   f"处置：{action_text.get(str(self._no_seed_action), self._no_seed_action)}",
+                                   "mdi-file-hidden", warn if no_seed else ok)]},
+                {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 3},
+                 "content": [_stat(len(invalid), "无效做种",
+                                   f"处置：{action_text.get(str(self._invalid_action), self._invalid_action)}",
+                                   "mdi-alert-circle-outline", warn if invalid else ok)]},
+                {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 3},
+                 "content": [_stat(len(red), "红种做种",
+                                   f"处置：{action_text.get(str(self._red_action), self._red_action)}",
+                                   "mdi-record-circle-outline", warn if red else ok)]},
+                {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 3},
+                 "content": [_stat(len(unavailable), "下载器异常",
+                                   "本轮已跳过，未做任何处置", "mdi-lan-disconnect",
+                                   warn if unavailable else ok)]},
+            ],
+        })
+
+        # ③ 明细卡片
+        no_seed_rows = [{
+            "component": "tr",
+            "content": [
+                {"component": "td", "props": {"class": "text-body-2"},
+                 "text": item.get("path", "") or "-"},
+                {"component": "td", "content": [{
+                    "component": "VChip",
+                    "props": {"size": "x-small", "variant": "tonal", "color": "warning"},
+                    "text": f"已持续 {item.get('days', 1)} 次",
+                }]},
+            ],
+        } for item in no_seed[:max_rows] if isinstance(item, dict)]
+        page.append(_card(
+            "孤儿源文件（本地存在但一直无下载器做种）", "mdi-file-hidden", warn,
+            f"{len(no_seed)} 项", "warning",
+            [_scroll_table(["文件路径", "已持续"], no_seed_rows, min_width=680)
+             if no_seed_rows else _empty_alert("未发现孤儿源文件。")],
+        ))
+
+        def _seed_rows(items: List[dict], color_name: str) -> List[dict]:
+            out = []
+            for item in items[:max_rows]:
+                if not isinstance(item, dict):
+                    continue
+                out.append({
+                    "component": "tr",
+                    "content": [
+                        {"component": "td", "content": [{
+                            "component": "VChip",
+                            "props": {"size": "x-small", "variant": "tonal", "color": color_name},
+                            "text": item.get("dl", "") or "-",
+                        }]},
+                        {"component": "td", "props": {"class": "text-body-2"},
+                         "text": item.get("name", "") or "-"},
+                        {"component": "td", "props": {"class": "text-body-2"},
+                         "text": f"{item.get('days', 1)} 次"},
+                    ],
+                })
+            return out
+
+        invalid_rows = _seed_rows(invalid, "error")
+        page.append(_card(
+            "无效做种（任务仍在但文件丢失或报错）", "mdi-alert-circle-outline", warn,
+            f"{len(invalid)} 项", "warning",
+            [_scroll_table(["下载器", "种子", "已持续"], invalid_rows, min_width=760)
+             if invalid_rows else _empty_alert("未发现无效做种任务。")],
+        ))
+
+        red_rows = _seed_rows(red, "purple")
+        page.append(_card(
+            "红种做种（tracker 全部通告失败）", "mdi-record-circle-outline", purple,
+            f"{len(red)} 项", "warning",
+            [_scroll_table(["下载器", "种子", "已持续"], red_rows, min_width=760)
+             if red_rows
+             else _empty_alert("未发现红种做种任务。")]
+            + ([{"component": "div",
+                 "props": {"class": "text-caption text-medium-emphasis mt-2"},
+                 "text": f"单下载器红种占做种数 50% 以上时只通知不处置（本机最近一轮做种数："
+                         f"{len(red)} 项红种）；表格最多显示前 {max_rows} 项。"}]
+               if len(red) > max_rows else []),
+        ))
+
+        unavail_rows = [{
+            "component": "tr",
+            "content": [
+                {"component": "td", "props": {"class": "text-body-2"},
+                 "text": item.get("name", "") or "-"},
+                {"component": "td", "props": {"class": "text-caption"},
+                 "text": str(item.get("err", ""))[:160] or "-"},
+            ],
+        } for item in unavailable[:max_rows] if isinstance(item, dict)]
+        page.append(_card(
+            "下载器异常（本轮已跳过，未做任何处置）", "mdi-lan-disconnect", info_c,
+            f"{len(unavailable)} 项", "info",
+            [_scroll_table(["下载器", "错误"], unavail_rows, min_width=680)
+             if unavail_rows else _empty_alert("全部下载器在线。")],
+        ))
+
+        # ④ 最近处置记录
+        handled_rows = [{
+            "component": "tr",
+            "content": [
+                {"component": "td", "props": {"class": "text-caption"},
+                 "text": item.get("time", "") or "-"},
+                {"component": "td", "props": {"class": "text-body-2"},
+                 "text": item.get("text", "") or "-"},
+            ],
+        } for item in handled[-20:] if isinstance(item, dict)]
+        page.append(_card(
+            "最近处置记录", "mdi-history", ok, f"{len(handled)} 条", "success",
+            [_scroll_table(["时间", "内容"], list(reversed(handled_rows)), min_width=680)
+             if handled_rows else _empty_alert("暂无处置记录。")],
+        ))
+
+        # ⑤ 口径说明
+        page.append(_footer([
+            "判定口径与安全边界",
+            "· 下载器连接失败或取任务报错 → 该下载器本轮跳过，绝不判孤儿；全部不可用 → 整轮中止。",
+            f"· 天数按实际扫描轮次累计（消失即清零），连续 {self._days} 次仍存在才按配置处置。",
+            "· 红种判定要求 tracker 全部通告失败；单下载器红种占比 ≥50% 时只通知不处置。",
+            "· 删除类处置需显式开启「允许删除」，未开启时只通知；表格每类最多显示前 200 项。",
+        ]))
+
+        return page
 
 
     def get_service(self) -> List[Dict[str, Any]]:
