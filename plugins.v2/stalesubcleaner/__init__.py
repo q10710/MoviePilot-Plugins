@@ -23,7 +23,7 @@ class StaleSubCleaner(_PluginBase):
     plugin_name = "过期订阅清理Q自用版"
     plugin_desc = "检查电视剧订阅，超过指定天数未下载新剧集则自动取消订阅。"
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/stalesubcleaner.png"
-    plugin_version = "1.1.8"
+    plugin_version = "1.1.9"
     plugin_label = "订阅"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -181,83 +181,256 @@ class StaleSubCleaner(_PluginBase):
         }
 
     def get_page(self) -> Optional[List[dict]]:
-        """返回插件详情页面。"""
+        """返回插件详情页面（2026-09-17 按统一界面标准改版，仅调整展示层）。"""
         if not self._enabled:
-            return [{"component": "VAlert", "props": {"type": "warning", "text": "插件未启用"}}]
+            return [{
+                "component": "VAlert",
+                "props": {
+                    "type": "warning",
+                    "variant": "tonal",
+                    "density": "compact",
+                    "prepend-icon": "mdi-alert-outline",
+                    "text": "插件未启用。启用后按周期检查电视剧订阅，闲置超过阈值的自动取消（置为停止，可恢复）。",
+                },
+            }]
 
-        last_run = self._last_run or "尚未运行"
-        page = [
-            {
-                "component": "VCard",
+        accent, ok, warn, info_c = "#6366f1", "#10b981", "#f59e0b", "#3b82f6"
+
+        def _rgba(hex_color: str, alpha: float) -> str:
+            h = hex_color.lstrip("#")
+            return f"rgba({int(h[0:2], 16)},{int(h[2:4], 16)},{int(h[4:6], 16)},{alpha})"
+
+        def _tile(icon: str, color: str, size: int = 44) -> dict:
+            return {
+                "component": "div",
+                "props": {
+                    "class": "d-flex align-center justify-center flex-shrink-0",
+                    "style": (f"width: {size}px; height: {size}px; border-radius: 12px; "
+                              f"background: {_rgba(color, 0.14)};"),
+                },
+                "content": [{
+                    "component": "VIcon",
+                    "props": {"size": int(size * 0.55), "style": f"color: {color};"},
+                    "text": icon,
+                }],
+            }
+
+        def _chip(text: str, icon: str, color: str) -> dict:
+            return {
+                "component": "VChip",
+                "props": {"size": "small", "variant": "tonal", "color": color},
                 "content": [
+                    {"component": "VIcon", "props": {"size": 14, "class": "mr-1"}, "text": icon},
+                    {"component": "span", "text": text},
+                ],
+            }
+
+        def _stat(value, label: str, hint: str, icon: str, color: str) -> dict:
+            return {
+                "component": "div",
+                "props": {
+                    "class": "d-flex align-center ga-3 h-100 pa-3",
+                    "style": (f"background: {_rgba(color, 0.08)}; border: 1px solid {_rgba(color, 0.22)}; "
+                              f"border-radius: 12px;"),
+                },
+                "content": [
+                    _tile(icon, color, 40),
                     {
-                        "component": "VCardTitle",
-                        "props": {"title": "过期订阅清理"},
-                    },
-                    {
-                        "component": "VCardText",
+                        "component": "div",
                         "content": [
-                            {
-                                "component": "VAlert",
-                                "props": {
-                                    "type": "info",
-                                    "text": (
-                                        f"上次检查: {last_run}\n"
-                                        f"过期天数阈值: {self._stale_days} 天\n"
-                                        f"累计取消: {self._total_cleaned} 个"
-                                    ),
-                                    "variant": "tonal",
-                                },
-                            }
-                        ],
-                    },
-                    {
-                        "component": "VCardActions",
-                        "content": [
-                            {
-                                "component": "VBtn",
-                                "props": {"color": "primary"},
-                                "text": "立即检查",
-                                "events": {
-                                    "click": {
-                                        "api": "plugin/StaleSubCleaner/check",
-                                        "method": "get",
-                                        "params": {"apikey": settings.API_TOKEN},
-                                    }
-                                },
-                            }
+                            {"component": "div",
+                             "props": {"class": "text-h5 font-weight-black", "style": "line-height: 1.1;"},
+                             "text": str(value)},
+                            {"component": "div", "props": {"class": "text-body-2 font-weight-medium"},
+                             "text": label},
+                            {"component": "div",
+                             "props": {"class": "text-caption text-medium-emphasis",
+                                       "style": "white-space: normal;"},
+                             "text": hint},
                         ],
                     },
                 ],
             }
-        ]
 
-        if self._last_cleaned:
-            page.append({
-                "component": "VCard",
-                "content": [
-                    {"component": "VCardTitle", "props": {"title": "最近取消的订阅"}},
-                    {
-                        "component": "VCardText",
-                        "content": [
-                            {
-                                "component": "VDataTable",
-                                "props": {
-                                    "headers": [
-                                        {"title": "订阅", "key": "name"},
-                                        {"title": "季", "key": "season"},
-                                        {"title": "最后下载", "key": "last_download"},
-                                        {"title": "闲置天数", "key": "stale_days"},
-                                        {"title": "时间", "key": "cleaned_time"},
+        last_run = self._last_run or "尚未运行"
+        cleaned = [c for c in (self._last_cleaned or []) if isinstance(c, dict)]
+        cron_text = getattr(self, "_cron", "") or "未设置"
+        notify_on = bool(getattr(self, "_notify", True))
+
+        page: List[dict] = []
+
+        # ① 概览头部
+        page.append({
+            "component": "VCard",
+            "props": {"variant": "flat", "rounded": "xl", "class": "mb-4 overflow-hidden",
+                      "style": "border: 1px solid rgba(128,128,128,0.18); position: relative;"},
+            "content": [
+                {"component": "div",
+                 "props": {"class": "d-none d-sm-flex",
+                           "style": (f"position: absolute; width: 180px; height: 180px; border-radius: 50%; "
+                                     f"top: -70px; left: -50px; background: {_rgba(accent, 0.08)};")}},
+                {"component": "div",
+                 "props": {"class": "d-none d-sm-flex",
+                           "style": (f"position: absolute; width: 220px; height: 220px; border-radius: 50%; "
+                                     f"bottom: -120px; right: -60px; background: {_rgba(ok, 0.07)};")}},
+                {
+                    "component": "div",
+                    "props": {"class": "pa-4", "style": "position: relative;"},
+                    "content": [
+                        {
+                            "component": "div",
+                            "props": {"class": "d-flex align-center ga-3"},
+                            "content": [
+                                _tile("mdi-timer-sand-empty", accent, 48),
+                                {
+                                    "component": "div",
+                                    "content": [
+                                        {"component": "div", "props": {"class": "text-h6 font-weight-bold"},
+                                         "text": "过期订阅清理"},
+                                        {"component": "div",
+                                         "props": {"class": "text-caption text-medium-emphasis"},
+                                         "text": "闲置超过阈值的电视剧订阅自动取消（置为停止，可恢复）"},
                                     ],
-                                    "items": self._last_cleaned[:50],
-                                    "itemsPerPage": 20,
                                 },
-                            }
-                        ],
-                    },
-                ],
-            })
+                                {"component": "VSpacer"},
+                                {
+                                    "component": "VBtn",
+                                    "props": {"color": "primary", "variant": "flat", "size": "small",
+                                              "prepend-icon": "mdi-magnify-scan"},
+                                    "text": "立即检查",
+                                    "events": {"click": {
+                                        "api": "plugin/StaleSubCleaner/check",
+                                        "method": "get",
+                                        "params": {"apikey": settings.API_TOKEN},
+                                    }},
+                                },
+                            ],
+                        },
+                        {"component": "VDivider", "props": {"class": "my-3"}},
+                        {
+                            "component": "div",
+                            "props": {"class": "d-flex flex-wrap ga-2"},
+                            "content": [
+                                _chip(f"上次检查 {last_run}", "mdi-clock-outline", "primary"),
+                                _chip(f"周期 {cron_text}", "mdi-calendar-clock", "info"),
+                                _chip(f"阈值 {self._stale_days} 天", "mdi-timer-sand", "warning"),
+                                _chip("通知 开启" if notify_on else "通知 关闭",
+                                      "mdi-bell-outline", "success" if notify_on else "secondary"),
+                            ],
+                        },
+                    ],
+                },
+            ],
+        })
+
+        # ② 统计卡片
+        page.append({
+            "component": "VRow",
+            "props": {"dense": True, "class": "mb-4"},
+            "content": [
+                {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 3},
+                 "content": [_stat(self._total_cleaned or 0, "累计取消订阅",
+                                   "历史累计置为停止的订阅数", "mdi-archive-cancel-outline", accent)]},
+                {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 3},
+                 "content": [_stat(len(cleaned), "最近一次取消",
+                                   "最近一轮检查取消的订阅数", "mdi-format-list-bulleted", ok)]},
+                {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 3},
+                 "content": [_stat(f"{self._stale_days} 天", "闲置阈值",
+                                   "最后一次成功下载距今超过该天数即取消", "mdi-timer-sand", warn)]},
+                {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 3},
+                 "content": [_stat("启用" if self._enabled else "停用", "运行状态",
+                                   f"上次运行 {last_run}", "mdi-shield-check-outline", info_c)]},
+            ],
+        })
+
+        # ③ 明细卡片
+        if cleaned:
+            rows: List[dict] = []
+            for item in cleaned[:50]:
+                season = item.get("season")
+                rows.append({
+                    "component": "tr",
+                    "content": [
+                        {"component": "td", "props": {"class": "text-body-2"},
+                         "text": item.get("name") or "-"},
+                        {"component": "td", "props": {"class": "text-body-2"},
+                         "text": f"S{season}" if season else "-"},
+                        {"component": "td", "props": {"class": "text-caption"},
+                         "text": item.get("last_download") or "-"},
+                        {"component": "td", "content": [{
+                            "component": "VChip",
+                            "props": {"size": "x-small", "variant": "tonal", "color": "warning"},
+                            "text": f"{item.get('stale_days') or '-'} 天",
+                        }]},
+                        {"component": "td", "props": {"class": "text-caption"},
+                         "text": item.get("cleaned_time") or "-"},
+                    ],
+                })
+            detail_content = [{
+                "component": "div",
+                "props": {"style": "max-height: 420px; overflow: auto; scrollbar-width: thin;"},
+                "content": [{
+                    "component": "VTable",
+                    "props": {"density": "comfortable", "hover": True, "style": "min-width: 560px;"},
+                    "content": [
+                        {"component": "thead", "content": [{"component": "tr", "content": [
+                            {"component": "th", "text": "订阅"},
+                            {"component": "th", "text": "季"},
+                            {"component": "th", "text": "最后下载"},
+                            {"component": "th", "text": "闲置天数"},
+                            {"component": "th", "text": "取消时间"},
+                        ]}]},
+                        {"component": "tbody", "content": rows},
+                    ],
+                }],
+            }]
+        else:
+            detail_content = [{
+                "component": "VAlert",
+                "props": {"type": "success", "variant": "tonal", "density": "compact",
+                          "prepend-icon": "mdi-check-circle-outline",
+                          "text": "最近一轮检查没有取消任何订阅。"},
+            }]
+
+        page.append({
+            "component": "VCard",
+            "props": {"variant": "flat", "rounded": "xl", "class": "mb-3 overflow-hidden",
+                      "style": "border: 1px solid rgba(128,128,128,0.18);"},
+            "content": [
+                {"component": "div",
+                 "props": {"class": "d-flex align-center ga-3 px-4 pt-4 pb-3"},
+                 "content": [
+                     _tile("mdi-format-list-bulleted", warn, 34),
+                     {"component": "div", "props": {"class": "text-subtitle-1 font-weight-bold"},
+                      "text": "最近取消的订阅"},
+                     {"component": "VSpacer"},
+                     _chip(f"{len(cleaned)} 条", "mdi-counter", "warning"),
+                 ]},
+                {"component": "VDivider"},
+                {"component": "VCardText", "props": {"class": "px-4 pt-3 pb-4"},
+                 "content": detail_content},
+            ],
+        })
+
+        # ④ 口径说明
+        page.append({
+            "component": "div",
+            "props": {"class": "d-flex ga-3 pa-3 mt-1",
+                      "style": "background: rgba(139,92,246,0.08); border-radius: 12px;"},
+            "content": [
+                {"component": "VIcon",
+                 "props": {"size": "small", "class": "mt-1", "style": f"color: {'#8b5cf6'};"},
+                 "text": "mdi-information-outline"},
+                {"component": "div", "props": {"class": "text-caption", "style": "line-height: 1.7;"},
+                 "content": [
+                     {"component": "div", "props": {"class": "font-weight-bold"}, "text": "判定口径"},
+                     {"component": "div", "text": "· 只处理电视剧订阅，洗版订阅跳过。"},
+                     {"component": "div",
+                      "text": f"· 闲置天数按「该订阅范围内最后一次成功下载」距今天数计算，超过 {self._stale_days} 天即取消。"},
+                     {"component": "div", "text": "· 取消 = 置为停止（S），记录保留，可手动恢复。"},
+                 ]},
+            ],
+        })
 
         return page
 
