@@ -123,7 +123,7 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/subscribeassistantenhancedq.png"
     # 插件版本
-    plugin_version = "0.10.16"
+    plugin_version = "0.10.17"
     _site_cache_candidate_helper_warned = False
     # 插件作者
     plugin_author = "Q"
@@ -1764,24 +1764,29 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
         logger.info(f"站点 H&R 时长自动刷新：抓到 {len(found)} 个站点，写入兜底配置 {len(updated)} 个"
                     f"{('；保留旧值 ' + '、'.join(kept)) if kept else ''}")
 
-    def _hr_site_names(self) -> set:
-        """从配置的站点 H&R 时长文本中解析出 H&R 站点名单。"""
+    def _full_hr_site_names(self) -> set:
+        """解析「全站H&R站点」名单；仅这些站点在缺少种子级标记时才按 H&R 兜底。
+
+        「站点H&R时长」只表示该站做种时长，不再代表该站所有种子都是 H&R。
+        兼容写成「站点名:小时」的条目（取冒号前的站点名）。
+        """
         names = set()
-        text = str(getattr(self._config, "site_hr_hours", "") or "")
+        text = str(getattr(self._config, "full_hr_sites", "") or "")
         for item in text.replace("；", ",").replace(";", ",").replace("\n", ",").split(","):
             item = item.strip()
-            if not item or ":" not in item:
+            if not item:
                 continue
-            name, _, _ = item.rpartition(":")
-            if name.strip():
-                names.add(name.strip())
+            name = item.rpartition(":")[0].strip() if ":" in item else item
+            if name:
+                names.add(name)
         return names
 
     def _is_hr_release(self, downloader, torrent_hash, torrent_task=None, subscribe=None) -> bool:
-        """判断种子是否属于 H&R：下载器标签为主判据，下载历史站点名兜底。
+        """判断种子是否属于 H&R：下载器标签为主判据，仅「全站H&R站点」名单兜底。
 
         标签在运行中可能丢失或被其它插件改写，所以标签未命中时用下载历史里的站点名
-        比对「站点H&R时长」名单，避免把普通种子也收容。
+        比对「全站H&R站点」名单；「站点H&R时长」只表示该站做种时长、不参与本判定，
+        避免把只有部分种子计 H&R 的站点（库非、彩虹岛、CARPT 等）的普通种子误判为 H&R。
         """
         # 主判据：下载器上的 H&R 标签（按用户要求以标签为主）
         try:
@@ -1795,11 +1800,11 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
                         return True
         except Exception as err:
             logger.debug(f"订阅收容：读取种子标签失败 {torrent_hash}：{err}")
-        # 兜底：站点命中配置的 H&R 站点名单（标签可能在运行中丢失）
+        # 兜底：仅「全站H&R站点」名单内的站点按 H&R 处理（标签可能在运行中丢失）
         site_name = str((torrent_task or {}).get("site_name") or "").strip()
         if not site_name:
             site_name = self._site_name_from_history(torrent_hash)
-        if site_name and site_name in self._hr_site_names():
+        if site_name and site_name in self._full_hr_site_names():
             # 有标签的是确证 H&R；无标签但站点在名单里的，由 H&R 助手下一轮自动补标
             has_tag = False
             try:
@@ -1813,7 +1818,7 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
             except Exception:
                 pass
             if not has_tag:
-                logger.info(f"订阅收容：站点 {site_name} 命中 H&R 名单但种子无标签，"
+                logger.info(f"订阅收容：站点 {site_name} 属于全站 H&R 站点但种子无标签，"
                             f"按 H&R 处理（H&R 助手将在下一轮自动补标）：{torrent_hash[:12]}")
             return True
         return False
