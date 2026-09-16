@@ -123,7 +123,7 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/subscribeassistantenhancedq.png"
     # 插件版本
-    plugin_version = "0.10.15"
+    plugin_version = "0.10.16"
     _site_cache_candidate_helper_warned = False
     # 插件作者
     plugin_author = "Q"
@@ -1800,6 +1800,21 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
         if not site_name:
             site_name = self._site_name_from_history(torrent_hash)
         if site_name and site_name in self._hr_site_names():
+            # 有标签的是确证 H&R；无标签但站点在名单里的，由 H&R 助手下一轮自动补标
+            has_tag = False
+            try:
+                service = self._downloader_helper.get_service(name=downloader) if self._downloader_helper else None
+                instance = getattr(service, "instance", None) if service else None
+                if instance:
+                    torrents, _ = instance.get_torrents(ids=torrent_hash)
+                    if torrents:
+                        tags = self._torrent_tags(torrents[0])
+                        has_tag = any(str(t).strip().upper() in ("H&R", "HR") for t in tags)
+            except Exception:
+                pass
+            if not has_tag:
+                logger.info(f"订阅收容：站点 {site_name} 命中 H&R 名单但种子无标签，"
+                            f"按 H&R 处理（H&R 助手将在下一轮自动补标）：{torrent_hash[:12]}")
             return True
         return False
 
