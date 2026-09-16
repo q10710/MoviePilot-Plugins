@@ -103,7 +103,7 @@ class ChannelUserBootstrap(_PluginBase):
     plugin_name = "渠道用户自动建号Q自用版"
     plugin_desc = "其他渠道账号首次发消息时，自动按渠道 userid 创建 MoviePilot 普通用户并完成绑定，使其能正常使用查询、搜索、订阅。"
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/channeluserbootstrap.png"
-    plugin_version = "1.0.2"
+    plugin_version = "1.0.3"
     plugin_label = "系统设置"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -257,7 +257,7 @@ class ChannelUserBootstrap(_PluginBase):
         }
 
     def get_page(self) -> Optional[List[dict]]:
-        """返回插件详情页：自动创建的账号清单。"""
+        """返回插件详情页：自动创建的账号清单（2026-09-17 按统一界面标准改版，仅调整展示层）。"""
         created = self.get_data(DATA_CREATED) or {}
         items = [
             {
@@ -267,57 +267,232 @@ class ChannelUserBootstrap(_PluginBase):
                 "username": info.get("username", ""),
             }
             for info in list(created.values())[-50:]
+            if isinstance(info, dict)
         ]
-        return [
-            {
-                "component": "VCard",
+        items = list(reversed(items))
+        channels = list(self._channels or [])
+        last_time = items[0]["time"] if items else "尚无记录"
+
+        accent, ok, warn, info_c = "#6366f1", "#10b981", "#f59e0b", "#3b82f6"
+
+        def _rgba(hex_color: str, alpha: float) -> str:
+            h = hex_color.lstrip("#")
+            return f"rgba({int(h[0:2], 16)},{int(h[2:4], 16)},{int(h[4:6], 16)},{alpha})"
+
+        def _tile(icon: str, color: str, size: int = 44) -> dict:
+            return {
+                "component": "div",
+                "props": {
+                    "class": "d-flex align-center justify-center flex-shrink-0",
+                    "style": (f"width: {size}px; height: {size}px; border-radius: 12px; "
+                              f"background: {_rgba(color, 0.14)};"),
+                },
+                "content": [{
+                    "component": "VIcon",
+                    "props": {"size": int(size * 0.55), "style": f"color: {color};"},
+                    "text": icon,
+                }],
+            }
+
+        def _chip(text: str, icon: str, color: str) -> dict:
+            return {
+                "component": "VChip",
+                "props": {"size": "small", "variant": "tonal", "color": color},
                 "content": [
-                    {"component": "VCardTitle", "props": {"title": "渠道用户自动建号"}},
+                    {"component": "VIcon", "props": {"size": 14, "class": "mr-1"}, "text": icon},
+                    {"component": "span", "text": text},
+                ],
+            }
+
+        def _stat(value, label: str, hint: str, icon: str, color: str) -> dict:
+            return {
+                "component": "div",
+                "props": {
+                    "class": "d-flex align-center ga-3 h-100 pa-3",
+                    "style": (f"background: {_rgba(color, 0.08)}; border: 1px solid {_rgba(color, 0.22)}; "
+                              f"border-radius: 12px;"),
+                },
+                "content": [
+                    _tile(icon, color, 40),
                     {
-                        "component": "VCardText",
+                        "component": "div",
                         "content": [
-                            {
-                                "component": "VAlert",
-                                "props": {
-                                    "type": "info",
-                                    "variant": "tonal",
-                                    "text": (
-                                        f"状态：{'启用' if self._enabled else '未启用'}\n"
-                                        f"生效渠道：{'、'.join(self._channels) if self._channels else '全部'}\n"
-                                        f"每小时上限：{self._hourly_limit} 个\n"
-                                        f"累计自动创建：{len(created)} 个账号"
-                                    ),
-                                },
-                            }
+                            {"component": "div",
+                             "props": {"class": "text-h5 font-weight-black", "style": "line-height: 1.1;"},
+                             "text": str(value)},
+                            {"component": "div", "props": {"class": "text-body-2 font-weight-medium"},
+                             "text": label},
+                            {"component": "div",
+                             "props": {"class": "text-caption text-medium-emphasis",
+                                       "style": "white-space: normal;"},
+                             "text": hint},
                         ],
                     },
                 ],
-            },
-            {
-                "component": "VCard",
-                "content": [
-                    {"component": "VCardTitle", "props": {"title": "最近创建"}},
-                    {
-                        "component": "VCardText",
-                        "content": [
-                            {
-                                "component": "VDataTable",
-                                "props": {
-                                    "headers": [
-                                        {"title": "时间", "key": "time"},
-                                        {"title": "渠道", "key": "channel"},
-                                        {"title": "渠道用户ID", "key": "userid"},
-                                        {"title": "账号", "key": "username"},
+            }
+
+        page: List[dict] = []
+
+        # ① 概览头部
+        page.append({
+            "component": "VCard",
+            "props": {"variant": "flat", "rounded": "xl", "class": "mb-4 overflow-hidden",
+                      "style": "border: 1px solid rgba(128,128,128,0.18); position: relative;"},
+            "content": [
+                {"component": "div",
+                 "props": {"class": "d-none d-sm-flex",
+                           "style": (f"position: absolute; width: 180px; height: 180px; border-radius: 50%; "
+                                     f"top: -70px; left: -50px; background: {_rgba(accent, 0.08)};")}},
+                {"component": "div",
+                 "props": {"class": "d-none d-sm-flex",
+                           "style": (f"position: absolute; width: 220px; height: 220px; border-radius: 50%; "
+                                     f"bottom: -120px; right: -60px; background: {_rgba(ok, 0.07)};")}},
+                {
+                    "component": "div",
+                    "props": {"class": "pa-4", "style": "position: relative;"},
+                    "content": [
+                        {
+                            "component": "div",
+                            "props": {"class": "d-flex align-center ga-3"},
+                            "content": [
+                                _tile("mdi-account-multiple-plus-outline", accent, 48),
+                                {
+                                    "component": "div",
+                                    "content": [
+                                        {"component": "div", "props": {"class": "text-h6 font-weight-bold"},
+                                         "text": "渠道用户自动建号"},
+                                        {"component": "div",
+                                         "props": {"class": "text-caption text-medium-emphasis"},
+                                         "text": "未绑定过的渠道账号首次发言时，自动按渠道用户ID创建普通用户并完成绑定"},
                                     ],
-                                    "items": items,
-                                    "itemsPerPage": 20,
                                 },
-                            }
-                        ],
-                    },
-                ],
-            },
-        ]
+                            ],
+                        },
+                        {"component": "VDivider", "props": {"class": "my-3"}},
+                        {
+                            "component": "div",
+                            "props": {"class": "d-flex flex-wrap ga-2"},
+                            "content": [
+                                _chip("运行中" if self._enabled else "未启用", "mdi-power",
+                                      "success" if self._enabled else "secondary"),
+                                _chip(f"生效渠道 {'、'.join(channels) if channels else '全部'}",
+                                      "mdi-broadcast", "primary"),
+                                _chip(f"每小时上限 {self._hourly_limit} 个", "mdi-speedometer", "info"),
+                                _chip("新账号提示 开启" if self._notify_user else "新账号提示 关闭",
+                                      "mdi-bell-outline", "warning" if self._notify_user else "secondary"),
+                            ],
+                        },
+                    ],
+                },
+            ],
+        })
+
+        # ② 统计卡片
+        page.append({
+            "component": "VRow",
+            "props": {"dense": True, "class": "mb-4"},
+            "content": [
+                {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 3},
+                 "content": [_stat(len(created), "累计自动创建", "历史上由本插件创建并绑定的账号数",
+                                   "mdi-account-plus-outline", accent)]},
+                {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 3},
+                 "content": [_stat(last_time, "最近创建时间", "最近一次自动建号的时刻",
+                                   "mdi-clock-outline", ok)]},
+                {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 3},
+                 "content": [_stat(self._hourly_limit, "每小时建号上限", "防刷限流，超出则本轮不建号",
+                                   "mdi-speedometer", warn)]},
+                {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 3},
+                 "content": [_stat(len(channels) if channels else "全部", "生效渠道范围",
+                                   "留空表示对所有渠道生效", "mdi-broadcast", info_c)]},
+            ],
+        })
+
+        # ③ 明细卡片
+        if items:
+            rows: List[dict] = []
+            for it in items[:50]:
+                rows.append({
+                    "component": "tr",
+                    "content": [
+                        {"component": "td", "props": {"class": "text-caption"},
+                         "text": it.get("time") or "-"},
+                        {"component": "td", "content": [{
+                            "component": "VChip",
+                            "props": {"size": "x-small", "variant": "tonal", "color": "primary"},
+                            "text": it.get("channel") or "-",
+                        }]},
+                        {"component": "td", "props": {"class": "text-body-2"},
+                         "text": it.get("userid") or "-"},
+                        {"component": "td", "props": {"class": "text-body-2"},
+                         "text": it.get("username") or "-"},
+                    ],
+                })
+            detail_content = [{
+                "component": "div",
+                "props": {"style": "max-height: 420px; overflow: auto; scrollbar-width: thin;"},
+                "content": [{
+                    "component": "VTable",
+                    "props": {"density": "comfortable", "hover": True, "style": "min-width: 560px;"},
+                    "content": [
+                        {"component": "thead", "content": [{"component": "tr", "content": [
+                            {"component": "th", "text": "时间"},
+                            {"component": "th", "text": "渠道"},
+                            {"component": "th", "text": "渠道用户ID"},
+                            {"component": "th", "text": "账号"},
+                        ]}]},
+                        {"component": "tbody", "content": rows},
+                    ],
+                }],
+            }]
+        else:
+            detail_content = [{
+                "component": "VAlert",
+                "props": {"type": "info", "variant": "tonal", "density": "compact",
+                          "prepend-icon": "mdi-information-outline",
+                          "text": "尚无自动创建的账号。其他渠道用户首次发消息后会自动建号并记录在这里。"},
+            }]
+
+        page.append({
+            "component": "VCard",
+            "props": {"variant": "flat", "rounded": "xl", "class": "mb-3 overflow-hidden",
+                      "style": "border: 1px solid rgba(128,128,128,0.18);"},
+            "content": [
+                {"component": "div",
+                 "props": {"class": "d-flex align-center ga-3 px-4 pt-4 pb-3"},
+                 "content": [
+                     _tile("mdi-account-details-outline", ok, 34),
+                     {"component": "div", "props": {"class": "text-subtitle-1 font-weight-bold"},
+                      "text": "最近创建（最多 50 条）"},
+                     {"component": "VSpacer"},
+                     _chip(f"{len(created)} 个账号", "mdi-counter", "success"),
+                 ]},
+                {"component": "VDivider"},
+                {"component": "VCardText", "props": {"class": "px-4 pt-3 pb-4"},
+                 "content": detail_content},
+            ],
+        })
+
+        # ④ 口径说明
+        page.append({
+            "component": "div",
+            "props": {"class": "d-flex ga-3 pa-3 mt-1",
+                      "style": "background: rgba(139,92,246,0.08); border-radius: 12px;"},
+            "content": [
+                {"component": "VIcon",
+                 "props": {"size": "small", "class": "mt-1", "style": "color: #8b5cf6;"},
+                 "text": "mdi-information-outline"},
+                {"component": "div", "props": {"class": "text-caption", "style": "line-height: 1.7;"},
+                 "content": [
+                     {"component": "div", "props": {"class": "font-weight-bold"}, "text": "运行口径与安全边界"},
+                     {"component": "div", "text": "· 用户名 = 渠道用户ID，同时写入对应的渠道绑定键，同一轮消息即可通过权限检查。"},
+                     {"component": "div", "text": "· 只做「查询 / 创建 / 绑定」，不修改任何已有用户，不授予管理员权限。"},
+                     {"component": "div", "text": f"· 每小时建号上限 {self._hourly_limit} 个；解析或建号失败只记日志，绝不阻断消息处理。"},
+                     {"component": "div", "text": "· 插件关闭后完全无副作用（钩子不生效）。"},
+                 ]},
+            ],
+        })
+
+        return page
 
     def stop_service(self) -> None:
         """本插件无需常驻服务。"""
