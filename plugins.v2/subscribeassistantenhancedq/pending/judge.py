@@ -10,7 +10,8 @@ from ..engine.types import CompletionSignal, PendingTimeoutManagerProtocol
 from ..shared.config import PluginConfig
 from ..shared.log import detail
 from ..shared.subscribe import subscribe_tmdb_id
-from ..shared.media import date_context, get_tv_season_air_date, get_tv_season_episode_count, parse_date
+from ..shared.media import (date_context, episode_field, get_tv_season_air_date,
+                            get_tv_season_episode_count, parse_date)
 from ..shared.subscribe import format_subscribe, resolve_subscribe_media_type
 from .state import PendingStateCoordinator
 
@@ -86,6 +87,15 @@ class PendingJudge:
         if pending_episodes and ep_count is not None and ep_count <= pending_episodes:
             if has_strong_completion():
                 return False, ""
+            # 该判据本意是「TMDB 季集数过少，数据可能不全，先别判完成」，但它原先没有出口：
+            # 只要 TMDB 不补数据，订阅就会永久待定（实测有订阅已待定 27 天）。
+            # 因此补「该季集数已定型」的跳过条件，否则仍按原逻辑进入待定。
+            if self._episode_count_settled(subscribe, episodes):
+                detail(
+                    f"待定判定：{format_subscribe(subscribe)} TMDB 该季集数为 {ep_count}，"
+                    f"但已定型（用户指定集数或末集已过季冷却期），不进入待定"
+                )
+                return False, ""
             return True, f"集数不足（{ep_count} ≤ {pending_episodes}）"
 
         signal_for_volatility = current_signal() if self._config.pending_use_volatility else None
@@ -158,6 +168,39 @@ class PendingJudge:
             return False
 
         return False
+
+    def _episode_count_settled(self, subscribe, episodes: list) -> bool:
+        """判断「TMDB 该季集数过少」是否已定型，不需要再按该理由等待增集。
+
+        只做保守判断：拿不到任何播出日期、或存在未播出的集时，一律返回 False（维持原有待定行为）。
+        仅在下列两种「继续等待已无依据」的情况下返回 True：
+
+        ① 用户在订阅上手动指定过总集数（``manual_total_episode``）——用户口径优先于 TMDB 的稀疏数据；
+        ② 该季分集表里没有任何未播出的集，且最后一集已播出超过「季冷却期」——
+           说明 TMDB 已把这一季登记完毕，再等也不会变。
+        """
+        if bool(getattr(subscribe, "manual_total_episode", 0)):
+            return True
+        from datetime import date
+        today = date.today()
+        last_air = None
+        for episode in (episodes or []):
+            air = parse_date(episode_field(episode, "air_date"))
+            if not air:
+                continue
+            if air > today:
+                # 存在未播出的集：确实可能在增集，继续等待
+                return False
+            if last_air is None or air > last_air:
+                last_air = air
+        if last_air is None:
+            # 完全没有播出日期信息：无法判断，保守等待
+            return False
+        try:
+            cooldown = int(self._config.season_cooldown_days or 0)
+        except (TypeError, ValueError):
+            cooldown = 0
+        return (today - last_air).days > cooldown
 
     @staticmethod
     def _is_strong_completion_signal(signal: Optional[CompletionSignal]) -> bool:
