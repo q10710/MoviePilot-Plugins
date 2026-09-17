@@ -67,7 +67,7 @@ class HitAndRunQ(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/hitandrunq.png"
     # 插件版本
-    plugin_version = "2.2.9"
+    plugin_version = "2.2.10"
     # 插件作者
     plugin_author = "Q"
     # 作者主页
@@ -1630,7 +1630,7 @@ class HitAndRunQ(_PluginBase):
                 if torrent_hash not in torrent_tasks:
                     torrent_task = self.__convert_torrent_info_to_task(context=context,
                                                                        torrent=torrent,
-                                                                       histories=histories)
+                                                                       histories=histories, hr_source="tag")
                     if not torrent_task:
                         continue
                     torrent_task.downloader = context.name
@@ -1708,7 +1708,8 @@ class HitAndRunQ(_PluginBase):
                     continue
                 # 尝试获取站点信息
                 torrent_task = self.__convert_torrent_info_to_task(
-                    context=context, torrent=torrent, histories=histories)
+                    context=context, torrent=torrent, histories=histories,
+                    hr_source="site")
                 if not torrent_task or not torrent_task.site_name:
                     continue
                 # 检查站点是否在 H&R 站点名单中
@@ -2240,6 +2241,9 @@ class HitAndRunQ(_PluginBase):
             logger.info(f"站点 {torrent_task.site_name}，种子 {torrent_task.identifier} 没有命中H&R，跳过处理")
             return
 
+        # 此处的 hit_and_run 直接来自下载时刻的站点标记（TorrentInfo.hit_and_run），属种子级确证
+        torrent_task.hr_source = "download"
+
         self.__update_torrent_tasks(torrent_tasks=torrent_task)
         self.__set_hit_and_run_tag(torrent_task=torrent_task)
 
@@ -2320,6 +2324,7 @@ class HitAndRunQ(_PluginBase):
             f"做种时间: {FormatHelper.format_hour(torrent_task.seeding_time)} 小时，"
             f"所需做种时间: {FormatHelper.format_hour(required_seeding_time, 'hour')} 小时，"
             f"所需分享率: {torrent_task.hr_ratio:.1f}，"
+            f"判定依据: {torrent_task.hr_source_label or '未记录'}，"
             f"截止时间: {torrent_task.formatted_deadline()}")
 
     @staticmethod
@@ -2489,9 +2494,13 @@ class HitAndRunQ(_PluginBase):
         return HitAndRunQ.__create_torrent_instance(torrent_hash, torrent_data, TorrentTask, task_type)
 
     def __convert_torrent_info_to_task(self, context: DownloaderContext, torrent: Any,
-                                       histories: Dict[str, TorrentHistory]) -> Optional[TorrentTask]:
+                                       histories: Dict[str, TorrentHistory],
+                                       hr_source: str = "tag") -> Optional[TorrentTask]:
         """
         根据提供的 torrent 和历史数据将 torrent 信息转换成 torrent 任务
+
+        :param hr_source: 本次认定 H&R 的依据（download/tag/site），只写入记录的 hr_source
+                          字段，用于区分「站点侧确证」与「标签/站点名单推断」；不参与任何判定。
         """
         torrent_info = context.torrent_helper.get_torrent_info(torrent=torrent)
         torrent_hash = torrent_info.get("hash", "")
@@ -2520,6 +2529,7 @@ class HitAndRunQ(_PluginBase):
                 # "seeding_time": torrent_info.get("seeding_time", 0),
                 "time": torrent_info.get("add_on", time.time()),
                 "hit_and_run": True,
+                "hr_source": hr_source,
                 "deleted": False,
                 "task_type": TaskType.NORMAL
             })
@@ -2528,6 +2538,7 @@ class HitAndRunQ(_PluginBase):
             return None
 
         torrent_task.hit_and_run = True
+        torrent_task.hr_source = hr_source
         torrent_task.downloader = context.name
         self.__init_hr_status(torrent_task=torrent_task)
         return torrent_task
@@ -2708,6 +2719,7 @@ class HitAndRunQ(_PluginBase):
                 "ratio": ("分享率", lambda x: FormatHelper.format_comparison(x, required_ratio, "")),
                 "deadline_time": ("截止时间", lambda x: torrent_task.formatted_deadline()),
                 "hr_status": ("状态", TorrentTask.format_to_chinese),
+                "hr_source": ("判定依据", lambda x: torrent_task.hr_source_label),
             }
         else:
             label_mapping = {
@@ -2722,6 +2734,7 @@ class HitAndRunQ(_PluginBase):
                 "hr_ratio": ("H&R分享率", lambda x: FormatHelper.format_value(value=x)),
                 "deadline_time": ("截止时间", lambda x: torrent_task.formatted_deadline()),
                 "hr_status": ("状态", TorrentTask.format_to_chinese),
+                "hr_source": ("判定依据", lambda x: torrent_task.hr_source_label),
             }
 
         for key, (label, formatter) in label_mapping.items():
