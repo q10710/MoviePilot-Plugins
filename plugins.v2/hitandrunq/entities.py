@@ -104,6 +104,24 @@ class TorrentTask(TorrentHistory):
     seeding_time_offset: Optional[float] = 0.0  # 转移到其它下载器前的累计做种时间（秒）
     uploaded_offset: Optional[float] = 0.0  # 转移到其它下载器前的累计上传量（字节）
     downloaded_offset: Optional[float] = 0.0  # 转移到其它下载器前的累计下载量（字节）
+    # H&R 判定依据，仅用于区分来源、便于排查，不参与任何判定与达标计算：
+    # download = 下载时刻的站点标记（TorrentInfo.hit_and_run，种子级确证）
+    # tag = 下载器上的 H&R 标签；site = 「全站H&R站点」名单兜底
+    # 三种情况都会使 hit_and_run=True（表示「本插件认定该种子计 H&R」），
+    # 但只有 download 属站点侧确证，tag/site 属推断来源，必须能事后区分。
+    hr_source: Optional[str] = None
+
+    @property
+    def hr_source_label(self) -> str:
+        """
+        H&R 判定依据的中文说明；未记录时返回空串，避免污染通知文案与日志
+        """
+        mapping = {
+            "download": "下载时站点标记",
+            "tag": "下载器H&R标签",
+            "site": "全站H&R站点",
+        }
+        return mapping.get(str(self.hr_source or "").strip().lower(), "")
 
     @property
     def identifier(self) -> str:
