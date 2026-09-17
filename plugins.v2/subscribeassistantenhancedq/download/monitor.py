@@ -135,11 +135,15 @@ class DownloadMonitor:
                 self._state.clear_active(subscribe, source="download_pending", reason="下载待定已清除")
 
     def has_active_downloads(self, subscribe_id: int) -> bool:
-        """检查订阅是否还有下载未整理完成。"""
+        """检查订阅是否还有下载未整理完成。
+
+        该结果被完结守卫、状态一致性检查、孤儿待定恢复与暂停探测共同当作闸门，
+        因此必须先清掉已失效的下载待定再判断，避免失效待定让订阅永久停留在 P。
+        """
         sid = str(subscribe_id)
         data = self._read("subscribes")
         task = data.get(sid, {})
-        return self._drop_expired_hashless_pending(subscribe_id, task)
+        return self._prune_inactive_pending(subscribe_id, task)
 
     def on_download(self, subscribe_id, torrent_hash: str, episodes=None,
                     downloader: Optional[str] = None, progress: float = 0.0,
@@ -485,31 +489,58 @@ class DownloadMonitor:
         if subscribe and self._state:
             self._state.mark_active(subscribe, source="download_pending", reason="下载器已创建任务，等待整理入库")
 
-    def _drop_expired_hashless_pending(self, subscribe_id: int, task: dict) -> bool:
-        """清理超过宽限期仍未补 hash 的下载待定，并返回是否仍有活跃下载。"""
+    def _prune_inactive_pending(self, subscribe_id: int, task: dict) -> bool:
+        """清理已失效的下载待定，并返回是否仍有活跃下载。
+
+        失效判定两类，均要求超出宽限期，避免与刚登记的任务产生竞态：
+
+        1. **无 hash**：发起下载后下载器始终没有创建任务（原有逻辑不变）。
+        2. **有 hash 但下载任务记录已不存在、或记录不属于本订阅**：说明种子任务记录与
+           下载待定已经脱钩，该待定再也不会收到 TransferComplete 或下载监控的解除事件。
+           这类残留会让 `has_active_downloads` 永远返回 True，导致订阅永久停留在待定（P）、
+           永不判定完成，因此必须在这里收口。
+
+        只清理失效项；仍有有效项时保持下载待定来源不动。
+        """
         pending = (task or {}).get("download_pending") or {}
         if not pending:
             return False
         now = time.time()
+        torrents = self._read("torrents") or {}
+        sid = str(subscribe_id)
         kept = {}
         changed = False
         for key, item in pending.items():
-            if item.get("hash"):
-                kept[key] = item
-                continue
             try:
                 started_at = float(item.get("started_at") or 0)
             except (TypeError, ValueError):
                 started_at = 0
-            if started_at > 0 and now - started_at <= self._pending_hash_grace_seconds:
-                kept[key] = item
+            in_grace = started_at > 0 and now - started_at <= self._pending_hash_grace_seconds
+            torrent_hash = item.get("hash")
+            if not torrent_hash:
+                if in_grace:
+                    kept[key] = item
+                    continue
+                changed = True
+                detail(
+                    f"下载待定：订阅 {subscribe_id} 发起下载后超过 "
+                    f"{self._pending_hash_grace_seconds} 秒仍未创建下载器任务，解除下载待定"
+                )
                 continue
-            changed = True
-            detail(f"下载待定：订阅 {subscribe_id} 发起下载后超过 {self._pending_hash_grace_seconds} 秒仍未创建下载器任务，解除下载待定")
+            record = torrents.get(torrent_hash)
+            owner = record.get("subscribe_id") if isinstance(record, dict) else None
+            if record is None or (owner is not None and str(owner) != sid):
+                if in_grace:
+                    kept[key] = item
+                    continue
+                changed = True
+                detail(
+                    f"下载待定：订阅 {subscribe_id} 的种子 {torrent_hash} 已无对应下载任务记录，解除下载待定"
+                )
+                continue
+            kept[key] = item
         if not changed:
             return True
-
-        sid = str(subscribe_id)
 
         def updater(data: dict) -> dict:
             sub_task = data.get(sid, {})
@@ -524,7 +555,8 @@ class DownloadMonitor:
         if not kept and self._state:
             subscribe = self._resolve_subscribe(subscribe_id)
             if subscribe:
-                self._state.clear_active(subscribe, source="download_pending", reason="下载器长时间未确认任务")
+                self._state.clear_active(
+                    subscribe, source="download_pending", reason="下载待定已失效（无对应下载任务记录）")
         return bool(kept)
 
     @staticmethod
