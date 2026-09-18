@@ -32,7 +32,7 @@ class SeedSourceGuard(_PluginBase):
     plugin_desc = ("检测本地源文件是否有下载器在做种、下载器是否存在文件丢失的无效做种或"
                    "tracker 全部失败的做种任务；连续N天异常可通知或按策略处置，杜绝无效做种与孤儿文件。")
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/seedsourceguard.png"
-    plugin_version = "1.1.12"
+    plugin_version = "1.1.13"
     plugin_label = "下载管理"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -806,8 +806,7 @@ class SeedSourceGuard(_PluginBase):
                     "id": "SeedSourceGuard",
                     "name": "做种守卫检测",
                     "trigger": CronTrigger.from_crontab(self._cron),
-                    "func": self._run_check,
-                    "kwargs": {"handle": True},
+                    "func": self._run_scheduled,
                 }
             ]
         return []
@@ -815,6 +814,17 @@ class SeedSourceGuard(_PluginBase):
     def stop_service(self) -> None:
         """停止插件后台服务并释放资源（定时任务由 MoviePilot 框架统一管理）。"""
         return None
+
+    def _run_scheduled(self) -> None:
+        """定时任务入口：按配置执行检测与处置（等价于命令行的 run）。
+
+        处置开关必须由本入口显式给出，不能写成服务字典的额外参数：
+        MoviePilot v3 的服务约定里 `kwargs` 属定时器参数（交给触发器，
+        CronTrigger 实例会静默忽略），传给插件方法的参数键是 `func_kwargs`；
+        写错键名不会报错，只会让 handle 一直落到默认值 False，
+        定时任务便永远停留在「仅检测」而从不执行已配置的删除/移动。
+        """
+        self._run_check(handle=True)
 
     # ── 调度与命令 ────────────────────────────────────────────
 
