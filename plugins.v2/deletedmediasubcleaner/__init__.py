@@ -43,7 +43,7 @@ class DeletedMediaSubCleaner(_PluginBase):
                    "连续达到宽限天数后按配置清理该订阅。")
     plugin_icon = ("https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/"
                    "main/icons/deletedmediasubcleaner.png")
-    plugin_version = "1.0.4"
+    plugin_version = "1.0.5"
     plugin_label = "订阅"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -147,8 +147,7 @@ class DeletedMediaSubCleaner(_PluginBase):
                     "id": "DeletedMediaSubCleaner",
                     "name": "删档订阅检查",
                     "trigger": CronTrigger.from_crontab(self._cron),
-                    "func": self.run_check,
-                    "kwargs": {"handle": True},
+                    "func": self._run_scheduled,
                 }
             ]
         return []
@@ -156,6 +155,17 @@ class DeletedMediaSubCleaner(_PluginBase):
     def stop_service(self) -> None:
         """停止插件后台服务（定时任务由 MoviePilot 框架统一管理）。"""
         return None
+
+    def _run_scheduled(self) -> None:
+        """定时任务入口：按配置执行检测与处置。
+
+        处置开关必须由本入口显式给出，不能写成服务字典的额外参数：
+        MoviePilot v3 的服务约定里 `kwargs` 属定时器参数（交给触发器，
+        CronTrigger 实例会静默忽略），传给插件方法的参数键是 `func_kwargs`；
+        写错键名不会报错，只会让 handle 一直落到默认值 False，
+        定时任务便永远停留在「仅检测」而从不执行已配置的暂停/删除订阅。
+        """
+        self.run_check(handle=True)
 
     @eventmanager.register(EventType.PluginAction)
     def handle_command(self, event: Event = None) -> None:
