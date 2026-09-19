@@ -40,7 +40,7 @@ class CompletionGuard:
         输入（subscribe/mediainfo）与输出（cancel/source/reason）一律操作 event.event_data；
         每个否决分支都写 source，避免主程序日志打出 [未知来源]。
         """
-        data: SubscribeCompletionCheckEventData = event.event_data
+        data: SubscribeCompletionCheckEventData = getattr(event, "event_data", None)
         if data is None:
             return
         try:
@@ -51,9 +51,12 @@ class CompletionGuard:
             logger.error(
                 f"完成守卫：完成检查复核异常，本次保守否决完成：{err}", exc_info=True
             )
-            data.cancel = True
-            data.source = "subscribeassistantenhanced"
-            data.reason = "完成守卫复核异常，本次保守否决，等待下轮复核"
+            try:
+                data.cancel = True
+                data.source = "subscribeassistantenhanced"
+                data.reason = "完成守卫复核异常，本次保守否决，等待下轮复核"
+            except Exception as write_err:  # noqa: BLE001
+                logger.error(f"完成守卫：写入保守否决失败（无法阻止本次完成判定）：{write_err}")
 
     def _evaluate_completion(self, data: SubscribeCompletionCheckEventData) -> None:
         """完成检查的实质复核；任何异常由 handle 统一按保守否决处理。"""
