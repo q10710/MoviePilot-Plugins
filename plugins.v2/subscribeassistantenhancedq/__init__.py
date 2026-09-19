@@ -123,7 +123,7 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/subscribeassistantenhancedq.png"
     # 插件版本
-    plugin_version = "0.10.27"
+    plugin_version = "0.10.28"
     _site_cache_candidate_helper_warned = False
     # 插件作者
     plugin_author = "Q"
@@ -1416,6 +1416,12 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
         """整理拦截 → 订阅清理目标媒体文件。"""
         if self._event_proxy:
             self._event_proxy.on_transfer_intercept(event)
+
+    @eventmanager.register(ChainEventType.TransferOverwriteCheck)
+    def on_overwrite_check(self, event):
+        """覆盖检查 → 洗版清理范围内的同名旧文件授权覆盖（不依赖目录覆盖模式）。"""
+        if self._event_proxy:
+            self._event_proxy.on_overwrite_check(event)
 
     @eventmanager.register(EventType.PluginAction)
     def on_plugin_action(self, event):
