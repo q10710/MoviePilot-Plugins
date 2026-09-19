@@ -145,7 +145,7 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/subscribeassistantenhancedq.png"
     # 插件版本
-    plugin_version = "0.10.32"
+    plugin_version = "0.10.33"
     _site_cache_candidate_helper_warned = False
     # 插件作者
     plugin_author = "Q"
@@ -517,6 +517,7 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
             get_subscribe_image_fn=self._get_subscribe_image,
             torrent_exists_fn=self._torrent_exists,
             protect_hr_fn=self._protect_hr_seed_from_cleanup,
+            download_names_fn=self._download_torrent_names,
             cleanup_history_type=cfg.subscription_cleanup_history_type,
             cleanup_history_scenes=cfg.subscription_cleanup_history_scenes,
         )
@@ -1145,6 +1146,28 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
             )
         except Exception:
             return None
+
+    def _download_torrent_names(self, download_hashes) -> dict:
+        """按下载 hash 反查主程序下载记录里的种子名，用于识别「同一个包」。
+
+        供订阅清理判断：本次要下载的资源如果与即将清理的旧文件同源（同一个种子名），
+        就没有旧版本需要替换，跳过清理可避免白下一遍，并防止「源文件删除事件」的
+        监听方把刚加入的同名任务一并删除。查不到时返回空，调用方按原逻辑清理。
+        """
+        names = {}
+        hashes = [str(h) for h in (download_hashes or []) if h]
+        if not hashes or not self._downloadhistory_oper:
+            return names
+        try:
+            records = self._downloadhistory_oper.get_by_hashes(hashes) or {}
+        except Exception as err:
+            logger.warning(f"订阅清理：按 hash 反查下载记录失败：{err}")
+            return names
+        for download_hash, record in (records or {}).items():
+            torrent_name = getattr(record, "torrent_name", None)
+            if download_hash and torrent_name:
+                names[str(download_hash)] = str(torrent_name)
+        return names
 
     def _related_download_histories(self, subscribe, raise_on_error: bool = False) -> list:
         """获取同一订阅完成后的分集下载历史，用于判断是否应自动洗版。"""
