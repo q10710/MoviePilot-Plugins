@@ -597,9 +597,14 @@ class SubscriptionCleanup:
         return None, None, []
 
     def _consume_clear_history_task(self, task: dict, event_episodes: list[int]) -> tuple[dict, Optional[dict]]:
-        """按本次整理集数拆分待清理记录；普通订阅和分集洗版只消费当前集。"""
-        if (task or {}).get("scene") not in {"normal", "best_version_episode"}:
-            return task, None
+        """按本次整理集数拆分待清理记录：能定位到具体集时只消费这些记录。
+
+        这样每条记录都在「它自己那一集正在整理」时被评估，从而可以按目标路径做精确判断
+        （路径相同 → 交给主程序覆盖、不删；路径不同 → 照常清理旧版本）。
+        整季洗版原先一次性消费整批，单次事件只带一个 target_path，无法对整批做精确判断，
+        且在长达数十秒的删除过程中会撞上主程序写入（2026-09-19《超级宝贝JOJO》S01E66 即此因）。
+        无法解析集数（整包/目录整理）时仍退回整批消费，由调用方按「同目录 + 集号」近似判断。
+        """
         event_episode_set = set(self._normalize_episode_numbers(event_episodes))
         if not event_episode_set:
             return task, None
@@ -612,9 +617,12 @@ class SubscriptionCleanup:
             else:
                 remaining_histories.append(history)
         if not consumed_histories:
-            return task, None
+            # 本次事件未命中任何记录：不消费，等该集自己的整理事件再判断（过期由 36 小时 TTL 兜底）
+            return None, None
         consumed_task = dict(task or {})
         consumed_task["histories"] = consumed_histories
+        # 标记本次为「已定位到具体集」：删除前按目标路径做精确判断，路径不同即照常清理旧版本
+        consumed_task["_episode_scoped"] = True
         consumed_episodes = sorted(
             set(self._normalize_episode_numbers((task or {}).get("target_episodes"))) & event_episode_set
         )
@@ -837,8 +845,11 @@ class SubscriptionCleanup:
             return False
         if norm_path == norm_target:
             return True
-        if (task or {}).get("scene") in {"normal", "best_version_episode"}:
-            # 逐集场景已有精确 target_path，未命中即不走近似判断
+        if (task or {}).get("_episode_scoped") or (task or {}).get("scene") in {
+            "normal",
+            "best_version_episode",
+        }:
+            # 已能精确定位到该集：未命中同名，说明新版本会落到别的路径，旧版本照常清理
             return False
         if os.path.dirname(norm_path) != os.path.dirname(norm_target):
             return False
