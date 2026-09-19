@@ -347,6 +347,12 @@ class EventProxy:
         if subscription_cleanup and subscription_cleanup.handle_history_clear(event):
             detail("整理拦截事件：已完成订阅清理记录处理")
 
+    def on_overwrite_check(self, event):
+        """TransferOverwriteCheck → 为洗版清理范围内的同名旧文件授权覆盖。"""
+        subscription_cleanup = self.get("subscription_cleanup")
+        if subscription_cleanup and subscription_cleanup.handle_overwrite_check(event):
+            detail("覆盖检查事件：已为洗版旧版本授权同名覆盖")
+
     def on_resource_selection(self, event):
         """ResourceSelection → 洗版下载串行控制 + 识别增强 + 剔除近期删除资源防重选。
 
