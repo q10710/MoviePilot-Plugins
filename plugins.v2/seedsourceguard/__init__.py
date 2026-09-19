@@ -9,7 +9,9 @@
 三类异常均按"连续 N 天"宽限期追踪，达标后按配置的动作处理（仅通知 / 移动 / 删除），
 支持 qBittorrent、Transmission、rTorrent 等所有 MoviePilot 已配置的下载器实例。
 安全设计：下载器连接失败时本轮直接跳过对应下载器，绝不把任何文件误判为孤儿；
-红种占做种数达 80% 阈值时判定站点/网络级故障，自动保护不处置。
+红种占做种数达 80% 阈值时判定站点/网络级故障，自动保护不处置；
+整站失联（该站全部种子都连不上、并经站点连通性二次验证确认）时不计红种、不处置，
+改为每 7 天提醒一次，由用户自行决定是否清理。
 """
 
 from datetime import datetime, timedelta
@@ -23,6 +25,7 @@ from app.core.event import eventmanager, Event
 from app.log import logger
 from app.plugins import _PluginBase
 from app.schemas.types import EventType, NotificationType
+from app.adapters.network.http import RequestUtils
 
 
 class SeedSourceGuard(_PluginBase):
@@ -32,7 +35,7 @@ class SeedSourceGuard(_PluginBase):
     plugin_desc = ("检测本地源文件是否有下载器在做种、下载器是否存在文件丢失的无效做种或"
                    "tracker 全部失败的做种任务；连续N天异常可通知或按策略处置，杜绝无效做种与孤儿文件。")
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/seedsourceguard.png"
-    plugin_version = "1.1.16"
+    plugin_version = "1.1.17"
     plugin_label = "下载管理"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -56,10 +59,10 @@ class SeedSourceGuard(_PluginBase):
     _red_action: str = "delete"
     _move_path: str = ""
     _allow_delete: bool = False
-    # 站点失联豁免：tracker 全部失败但失败原因是「连不上站点」时不计红种、不处置
+    # 整站失联豁免：某站种子全部连不上且站点本身不可达时，不计红种、不处置
     _skip_unreachable: bool = True
-    # 站点长期失联提醒：连续失联达到该天数只提醒不处置（0 表示不提醒）
-    _site_offline_alert_days: int = 30
+    # 整站失联提醒：连续失联达到该天数后开始提醒，此后每 7 天再提醒一次（0 表示不提醒）
+    _site_offline_alert_days: int = 7
 
     # 红种做种保护：单下载器红种占做种候选数比例达标时视为站点/网络故障，本轮只通知不处置
     _RED_PROTECT_RATIO: float = 0.8
@@ -68,17 +71,19 @@ class SeedSourceGuard(_PluginBase):
     # 判定「整站失联」的最少任务数与失败占比（该站任务普遍连不上才算站挂了）
     _SITE_MIN_TASKS: int = 3
     _SITE_FAIL_RATIO: float = 0.9
+    # 站点连通性二次验证的单次探测超时（秒）
+    _PROBE_TIMEOUT: int = 8
 
     # tracker 失败原因归类（小写匹配）：
-    # ① 站点/链路不可达（含换域名、站点维护、DNS 失效、证书问题）→ 不算真红种；
-    # ② 站点明确回「无此种子」→ 真死种，照常计入红种并处置；
-    # ③ 其余（如 403 风控）→ 原因不明，保守豁免、只在通知里列出。
+    # ① 站点/链路不可达（含换域名、站点维护、DNS 失效、TLS 失败）→ 属于「连不上」，
+    #    只有在整站种子全部连不上、且站点连通性二次验证确认不可达时才豁免；
+    # ② 站点有应答（「无此种子」、403/405 等）→ 一律算红种，照常计入轮次并处置。
     _UNREACHABLE_HINTS = (
         "could not connect", "connection refused", "connection timed out",
         "timed out", "timeout", "unable to resolve", "no route to host",
         "network is unreachable", "ssl", "certificate", "tls", "handshake",
         "connection reset", "name resolution", "name or service not known",
-        "host not found", "bad gateway", "service unavailable", "http response 5",
+        "host not found",
     )
     _DEAD_HINTS = (
         "not registered", "unregistered", "torrent not exists", "torrent not found",
@@ -138,12 +143,12 @@ class SeedSourceGuard(_PluginBase):
         self._allow_delete = bool(config.get("allow_delete"))
         # 缺省开启：站点失联/换域名属于站侧或链路问题，不该当红种删掉本地文件
         self._skip_unreachable = bool(config.get("skip_unreachable", True))
-        # 长期失联提醒天数：0 或不填表示不提醒（三个提醒档位默认 30 天）
+        # 整站失联提醒天数：0 或不填表示不提醒（默认 7 天，之后每 7 天一次）
         try:
             self._site_offline_alert_days = max(0, int(config.get("site_offline_alert_days")
                                                        or self._site_offline_alert_days))
         except (TypeError, ValueError):
-            self._site_offline_alert_days = 30
+            self._site_offline_alert_days = 7
 
     @staticmethod
     def _build_cron(times: int) -> str:
@@ -471,8 +476,8 @@ class SeedSourceGuard(_PluginBase):
                             "type": "warning",
                             "variant": "tonal",
                             "text": ("安全规则：下载器连接失败或取不到任务列表时，本轮自动跳过该下载器，"
-                                     "绝不会把任何文件判为孤儿；站点失联豁免开启时，"
-                                     "因站点不可达/换域名而红种的任务不计轮次也不处置；"
+                                     "绝不会把任何文件判为孤儿；整站失联豁免开启时，"
+                                     "该站种子全部连不上且站点二次验证不可达的，不计轮次也不处置；"
                                      "红种占做种数达 80% 阈值时自动保护不处置。"
                                      "删除/移动类处置要求：连续 N 次扫描仍异常（按实际扫描轮次累计，关机/停用期不计数） + 本页开关已打开。"),
                         },
@@ -488,11 +493,12 @@ class SeedSourceGuard(_PluginBase):
                                         "component": "VSwitch",
                                         "props": {
                                             "model": "skip_unreachable",
-                                            "label": "站点失联豁免（建议开启）",
-                                            "hint": ("tracker 全部失败但原因是无法连接站点、域名失效、超时或证书错误时，"
-                                                     "视为站点侧或链路故障：不计入红种轮次、不执行删除，"
-                                                     "站点恢复或换好 tracker 后继续累计已有轮次。"
-                                                     "站点明确回「无此种子」的仍按红种处理。"),
+                                            "label": "整站失联豁免（建议开启）",
+                                            "hint": ("某站的种子全部连不上、且直接访问该站点域名也不可达时，"
+                                                     "判定为整站失联：该站全部种子不计入红种轮次、不执行删除，"
+                                                     "改为按下方天数定期提醒；站点恢复后继续累计已有轮次。"
+                                                     "站点能访问（仅部分种子连不上，或站点回「无此种子」、403/405 等）"
+                                                     "一律照常算红种。"),
                                             "persistent-hint": True,
                                         },
                                     }
@@ -511,10 +517,10 @@ class SeedSourceGuard(_PluginBase):
                                         "component": "VTextField",
                                         "props": {
                                             "model": "site_offline_alert_days",
-                                            "label": "站点长期失联提醒天数",
+                                            "label": "整站失联提醒天数",
                                             "type": "number",
-                                            "hint": ("某站点任务普遍无法正常通告、连续达到该天数时发提醒，"
-                                                     "此后每 7 天再提醒一次；只提醒，不做任何处置。"
+                                            "hint": ("整站失联连续达到该天数后发第一次提醒，"
+                                                     "之后每 7 天提醒一次；只提醒，不做任何处置。"
                                                      "填 0 表示不提醒。"),
                                             "persistent-hint": True,
                                         },
@@ -530,11 +536,11 @@ class SeedSourceGuard(_PluginBase):
                                         "props": {
                                             "type": "info",
                                             "variant": "tonal",
-                                            "text": ("整站失联判定：该 tracker 域名下任务不少于 3 个，"
-                                                     "且其中 ≥90% 无法正常通告（连不上站点、域名失效、超时、"
-                                                     "证书错误或原因不明）。"
-                                                     "达到提醒天数只发通知并在插件页列出，"
-                                                     "插件不会自动删除这类种子；恢复到正常通告则自动移出跟踪。"),
+                                            "text": ("整站失联判定（两级）：① 该 tracker 域名下做种任务不少于 3 个，"
+                                                     "且其中 ≥90% 报「连不上站点」；② 再直接访问该站点域名，"
+                                                     "确认也不可达。两级都成立才豁免并进入跟踪。"
+                                                     "达到提醒天数后只发通知并在插件页列出，插件不会自动删除这类种子；"
+                                                     "站点恢复可达则自动移出跟踪。"),
                                         },
                                     }
                                 ],
@@ -558,7 +564,7 @@ class SeedSourceGuard(_PluginBase):
             "move_path": "",
             "allow_delete": False,
             "skip_unreachable": True,
-            "site_offline_alert_days": 30,
+            "site_offline_alert_days": 7,
         }
 
     def get_page(self) -> Optional[List[dict]]:
@@ -846,7 +852,7 @@ class SeedSourceGuard(_PluginBase):
 
         red_rows = _seed_rows(red, "purple")
         page.append(_card(
-            "红种做种（tracker 全部失败且站点确认无此种子）", "mdi-record-circle-outline", purple,
+            "红种做种（tracker 全部失败，站点仍在应答）", "mdi-record-circle-outline", purple,
             f"{len(red)} 项", "warning",
             [_scroll_table(["下载器", "种子", "已持续"], red_rows, min_width=760)
              if red_rows
@@ -871,9 +877,14 @@ class SeedSourceGuard(_PluginBase):
                 ],
             } for item in red_exempt[:max_rows]]
             page.append(_card(
-                "站点失联豁免（连不上站点/换域名/原因不明，不计红种也不处置）",
+                "整站失联豁免（该站种子全部连不上且站点不可达，不计红种也不处置）",
                 "mdi-lan-disconnect", info_c, f"{len(red_exempt)} 项", "info",
                 [_scroll_table(["下载器", "种子", "失败原因"], exempt_rows, min_width=900)]
+                + [{"component": "div",
+                    "props": {"class": "text-caption text-medium-emphasis mt-2"},
+                    "text": ("豁免判据：该站做种任务普遍连不上（≥3 个且 ≥90%），"
+                             "且直接访问该站点域名同样不可达；站点恢复后自动退出豁免，"
+                             "并回归红种判定。")}]
                 + ([{"component": "div",
                      "props": {"class": "text-caption text-medium-emphasis mt-2"},
                      "text": f"表格最多显示前 {max_rows} 项。"}]
@@ -895,14 +906,15 @@ class SeedSourceGuard(_PluginBase):
                 ],
             } for item in site_offline[:max_rows]]
             page.append(_card(
-                f"站点长期失联跟踪（连续 ≥{self._site_offline_alert_days} 天只提醒不处置）",
+                f"整站失联跟踪（连续 ≥{self._site_offline_alert_days} 天起每 7 天提醒，不处置）",
                 "mdi-alert-decagram-outline", warn, f"{len(site_offline)} 个站", "warning",
-                [_scroll_table(["站点", "连续失联", "通告失败/总任务", "起始日期"],
+                [_scroll_table(["站点", "连续失联", "连不上/总任务", "起始日期"],
                                offline_rows, min_width=900)]
                 + [{"component": "div",
                     "props": {"class": "text-caption text-medium-emphasis mt-2"},
-                    "text": ("这类站点对本地文件不做任何处置，仅在此列出并在达到阈值时提醒；"
-                             "确认站点已废弃后可自行清理对应种子。")}],
+                    "text": ("判定依据：该站做种任务 ≥90% 连不上，且直接访问站点域名同样不可达"
+                             "（两级都成立才计入）。这类站点对本地文件不做任何处置，"
+                             "仅在此列出并每 7 天提醒一次；确认站点已废弃后可自行清理对应种子。")}],
             ))
 
         unavail_rows = [{
@@ -1200,9 +1212,10 @@ class SeedSourceGuard(_PluginBase):
         """检测红种做种任务：处于做种状态但 tracker 全部通告失败。
 
         返回 (红种明细列表, 各下载器做种候选数, 各站点任务统计)。每个明细项带 kind：
-        dead=站点明确回「无此种子」（真死种）；unreachable=连不上站点（含换域名、
-        维护、DNS/证书问题）；unknown=原因不明。后两类由结算阶段按站点失联豁免处理。
-        站点统计按 tracker 域名聚合该站任务总数与「连不上」任务数，供长期失联提醒使用。
+        unreachable=连不上站点（含换域名、维护、DNS/证书问题）；dead=站点明确回
+        「无此种子」；unknown=站点有应答但原因不明（如 403/405）。除 unreachable
+        之外全部按红种处置。站点统计按 tracker 域名聚合该站任务总数与「连不上」任务数，
+        供整站失联判定使用。
         qBittorrent 需逐任务查询 tracker 状态，候选超过上限时跳过；
         Transmission 直接使用任务自带的 trackerStats，无额外请求开销。
         """
@@ -1247,8 +1260,8 @@ class SeedSourceGuard(_PluginBase):
                         logger.debug(f"下载器 {dl_name} 查询 tracker 状态失败 {hash_value}：{err}")
                         continue
                     verdict = self._torrent_red(task, trackers)
-                    # 仅「连不上/原因不明」计入站点失联统计；dead 说明站点仍在应答
-                    _record_hosts(trackers, bool(verdict) and verdict[0] != "dead")
+                    # 只有「连不上」计入站点失联统计：dead / 403 等说明站点仍在应答
+                    _record_hosts(trackers, bool(verdict) and verdict[0] == "unreachable")
                     if verdict:
                         red.append(self._red_item(task, dl_name, verdict[0], verdict[1],
                                                   self._primary_host(trackers)))
@@ -1257,7 +1270,7 @@ class SeedSourceGuard(_PluginBase):
             for task in candidates:
                 tracker_stats = task.get("tracker_stats")
                 verdict = self._torrent_red(task, tracker_stats)
-                _record_hosts(tracker_stats, bool(verdict) and verdict[0] != "dead")
+                _record_hosts(tracker_stats, bool(verdict) and verdict[0] == "unreachable")
                 if verdict:
                     red.append(self._red_item(task, dl_name, verdict[0], verdict[1],
                                               self._primary_host(tracker_stats)))
@@ -1605,26 +1618,30 @@ class SeedSourceGuard(_PluginBase):
                 "text": (f"站点级故障保护：{item.get('dl', '')} 红种 {protected[key]}，"
                          "本轮不处置，仅通知"),
             })
-        # 站点失联豁免：失败原因是「连不上站点」（含换域名、站点维护、DNS/证书问题）
-        # 或原因不明时，不计入红种轮次、不处置；既有计数保留，站点恢复后继续累计。
-        exempt_red: Dict[str, Any] = {}
+        # 整站失联：某站的种子「全部连不上」时先判为疑似站点故障，再做一次站点连通性
+        # 二次验证；只有确认站点也不可达，才豁免该站全部种子（不计红种、不处置），
+        # 并按 7 天一次提醒。站点能访问（如仅 announce 异常）或只有部分种子连不上，
+        # 仍按红种处理。站点明确回「无此种子」以及 403/405 等应答类失败一律算红种。
+        site_offline_now: Dict[str, Dict[str, Any]] = {}
         if self._skip_unreachable:
-            exempt_red = {
-                key: item for key, item in red_map.items()
-                if key not in protected and item.get("kind") != "dead"
-            }
+            site_offline_now = self._detect_site_offline(red_map, host_stats or {})
+        exempt_red: Dict[str, Any] = {
+            key: item for key, item in red_map.items()
+            if item.get("host") and item.get("host") in site_offline_now
+        } if site_offline_now else {}
+        # 站点级 80% 保护仍按原样生效（整站失联已单独判定，这里只保留其原有用途）
         if exempt_red:
             logger.warning(
-                f"站点失联豁免：{len(exempt_red)} 个红种任务因 tracker 无法连接或原因不明，"
-                "本轮不计入红种轮次、不处置（站点恢复或换域名后继续累计）"
+                f"整站失联豁免：{len(exempt_red)} 个红种任务所属站点经连通性验证确认不可达，"
+                "本轮不计入红种轮次、不处置（站点恢复后继续累计）"
             )
         report["red_exempt"] = list(exempt_red.values())
-        site_alerts, site_tracking = self._track_site_offline(host_stats or {})
+        site_alerts, site_tracking = self._track_site_offline(site_offline_now)
         report["site_offline"] = site_alerts
         report["site_offline_tracking"] = site_tracking
         red_map_active = {k: v for k, v in red_map.items() if k not in protected}
         red_map_active = {k: v for k, v in red_map_active.items() if k not in exempt_red}
-        # 供通知统计使用：只含真正计入红种（站点确认无此种子）的项
+        # 供通知统计使用：只含豁免后仍按红种处置的项
         report["red_active"] = list(red_map_active.values())
         # 正常辅种覆盖判定集合：排除本轮无效/红种任务根路径后，仅“正常任务”可覆盖源文件
         bad_roots = set()
@@ -1722,18 +1739,74 @@ class SeedSourceGuard(_PluginBase):
                 )
         return protected
 
-    def _track_site_offline(self, host_stats: Dict[str, Dict[str, int]]
+    def _detect_site_offline(self, red_map: Dict[str, Any],
+                             host_stats: Dict[str, Dict[str, int]]
+                             ) -> Dict[str, Dict[str, Any]]:
+        """判定本轮哪些站点属于「整站失联」，并对疑似站点做二次连通性验证。
+
+        两级判据：
+        ① 该 tracker 域名下做种任务数不少于 `_SITE_MIN_TASKS`，且其中「连不上站点」
+           的任务占比不低于 `_SITE_FAIL_RATIO` —— 即该站种子普遍连不上，而非个别种子；
+        ② 对疑似站点直接请求其域名，确认站点本身也不可达。
+        只有两级都成立才返回，避免把「单个 tracker 地址抽风」误判成站点故障。
+        返回 {tracker 域名: {total, failed, probe}}；未通过二次验证的站点不返回。
+        """
+        suspects: Dict[str, Dict[str, Any]] = {}
+        for host, stat in (host_stats or {}).items():
+            total = int(stat.get("total") or 0)
+            failed = int(stat.get("failed") or 0)
+            if total >= self._SITE_MIN_TASKS and failed / total >= self._SITE_FAIL_RATIO:
+                suspects[host] = {"total": total, "failed": failed}
+        if not suspects:
+            return {}
+        confirmed: Dict[str, Dict[str, Any]] = {}
+        for host, stat in suspects.items():
+            reachable, note = self._probe_host(host)
+            if reachable:
+                logger.info(
+                    f"站点 {host} 有 {stat['failed']}/{stat['total']} 个种子连不上，"
+                    f"但站点本身可访问（{note}），不按整站失联处理，仍按红种判定"
+                )
+                continue
+            stat["probe"] = note
+            confirmed[host] = stat
+            logger.warning(
+                f"站点 {host} 经二次验证确认不可达（{note}），"
+                f"该站 {stat['failed']}/{stat['total']} 个种子本轮不计红种、不处置"
+            )
+        return confirmed
+
+    def _probe_host(self, host: str) -> Tuple[bool, str]:
+        """二次验证：直接请求站点域名，判断站点是否可达。
+
+        返回 (是否可达, 说明)。拿到任意 HTTP 响应即视为可达（说明网络与站点服务都在，
+        仅 announce 接口异常不足以判定站点失联）；连接被拒、超时、域名解析失败、
+        TLS 握手失败等一律视为不可达。探测超时由 `_PROBE_TIMEOUT` 控制。
+        """
+        detail = "未发起探测"
+        for scheme in ("https", "http"):
+            url = f"{scheme}://{host}/"
+            try:
+                res = RequestUtils(timeout=self._PROBE_TIMEOUT).get_res(url)
+            except Exception as err:  # noqa: BLE001 - 探测失败即视为不可达
+                detail = f"{scheme} 探测异常：{str(err)[:80]}"
+                continue
+            if res is not None:
+                return True, f"{scheme} HTTP {res.status_code}"
+            detail = f"{scheme} 无响应"
+        return False, detail
+
+    def _track_site_offline(self, offline_now: Dict[str, Dict[str, Any]]
                             ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-        """跟踪整站失联的连续轮次，并在长期失联时给出提醒清单。
+        """跟踪整站失联的连续轮次，并每 7 天提醒一次。
 
-        判据：某 tracker 域名下任务数不少于 `_SITE_MIN_TASKS`，且其中
-        「连不上站点」的任务占比不低于 `_SITE_FAIL_RATIO`，即视为该站整体失联。
-        连续轮次按「每个 tracker 域名的实际扫描轮次」累计，恢复即清除记录；
-        达到 `site_offline_alert_days`（换算为扫描轮次）后提醒，此后每 7 天再提醒一次，
-        避免只提醒一次被忽略、也不会每轮刷屏。**本方法只做提醒，不做任何处置。**
+        入参为 `_detect_site_offline` 已确认不可达的站点（含 total/failed/probe）。
+        连续轮次按实际扫描轮次累计，站点恢复可达即立即移出跟踪；已累计轮次不清零，
+        站点再次失联时从原轮次继续累计。首次提醒在连续失联达到
+        `_site_offline_alert_days` 天时发出，之后每 7 天再提醒一次（均换算为扫描轮次），
+        避免每轮刷屏。**本方法只做提醒，不对任何种子或文件做处置。**
 
-        返回 (本轮需要提醒的站点清单, 全部在跟踪中的失联站点清单)；
-        提醒天数配置为 0 时不产生提醒，但仍继续跟踪。
+        返回 (本轮提醒清单, 全部在跟踪中的失联站点清单)。
         """
         if not self._site_offline_alert_days:
             self.save_data("site_offline", {})
@@ -1741,13 +1814,6 @@ class SeedSourceGuard(_PluginBase):
         stored = self.get_data("site_offline") or {}
         today = datetime.now().strftime("%Y-%m-%d")
         alerts: List[Dict[str, Any]] = []
-
-        offline_now: Dict[str, Dict[str, int]] = {}
-        for host, stat in (host_stats or {}).items():
-            total = int(stat.get("total") or 0)
-            failed = int(stat.get("failed") or 0)
-            if total >= self._SITE_MIN_TASKS and total and failed / total >= self._SITE_FAIL_RATIO:
-                offline_now[host] = {"total": total, "failed": failed}
 
         for host, stat in offline_now.items():
             record = dict(stored.get(host) or {})
@@ -2000,7 +2066,7 @@ class SeedSourceGuard(_PluginBase):
             else:
                 lines.append("  - 数量较多，不逐条推送，请到插件页查看明细")
         if red:
-            lines.append(f"红种做种任务 {len(red)} 个（tracker 全部通告失败，站点确认无此种子）")
+            lines.append(f"红种做种任务 {len(red)} 个（tracker 全部通告失败，站点仍在应答）")
             if len(red) <= 5:
                 for item in red:
                     lines.append(f"  - [{item.get('dl', '')}] {item.get('name', '')}")
@@ -2009,25 +2075,25 @@ class SeedSourceGuard(_PluginBase):
         exempt_red = report.get("red_exempt") or []
         if exempt_red:
             lines.append(
-                f"站点失联豁免 {len(exempt_red)} 个（tracker 无法连接/域名失效/原因不明，"
-                "不计入红种也不处置，站点恢复或换好 tracker 后继续累计）"
+                f"整站失联豁免 {len(exempt_red)} 个（所属站点种子全部连不上且站点域名不可达，"
+                "不计入红种也不处置，站点恢复后继续累计）"
             )
             for item in exempt_red[:5]:
                 reason = item.get("reason", "") or item.get("kind", "")
                 lines.append(f"  - [{item.get('dl', '')}] {item.get('name', '')}｜{reason}")
             if len(exempt_red) > 5:
-                lines.append("  - 其余请到插件页「站点失联豁免」表查看")
+                lines.append("  - 其余请到插件页「整站失联豁免」表查看")
         site_offline = report.get("site_offline") or []
         if site_offline:
             lines.append(
-                f"站点长期失联提醒 {len(site_offline)} 个（连续失联已达 "
-                f"{self._site_offline_alert_days} 天以上，仅提醒不处置；"
+                f"【站点长期失联提醒】{len(site_offline)} 个站点已连续失联 "
+                f"{self._site_offline_alert_days} 天以上（每 7 天提醒一次，仅提醒不处置；"
                 "若站点已放弃可自行清理对应种子，插件不会自动删除）"
             )
             for item in site_offline[:5]:
                 lines.append(
                     f"  - {item.get('host', '')}｜连续约 {item.get('days', 0)} 天｜"
-                    f"无法正常通告 {item.get('failed', 0)}/{item.get('total', 0)} 个任务"
+                    f"连不上 {item.get('failed', 0)}/{item.get('total', 0)} 个任务"
                     f"（自 {item.get('first_seen', '')} 起）"
                 )
             if len(site_offline) > 5:
