@@ -19,6 +19,8 @@ from ..shared.subscribe import (
 
 SUBSCRIPTION_CLEANUP_TTL_SECONDS = 36 * 3600
 SUBSCRIPTION_CLEANUP_SNAPSHOT_KEY = "subscription_cleanup_histories"
+# 清理快照目标路径的缓存时长：覆盖授权会被主程序在每次同名判定时询问，不能每次都反序列化整份快照
+_PENDING_DEST_TTL_SECONDS = 15
 # 清理事务中只在本轮消费内有效的标记：写回快照前剥掉，避免状态残留影响后续判断
 _CLEAR_TASK_RUNTIME_KEYS = frozenset({"_task_key", "_episode_scoped", "_already_notified", "_notified", "_failed_histories"})
 
@@ -62,6 +64,7 @@ class SubscriptionCleanup:
         self._sleep = sleep_fn or time.sleep
         self._cleanup_history_type = cleanup_history_type
         self._cleanup_history_scenes = list(cleanup_history_scenes or [])
+        self._pending_dest_cache: Optional[tuple] = None
 
     def handle_resource_download_history_clear(self, subscribe, context=None, episodes=None) -> bool:
         """清理旧整理记录并等待关联下载任务释放，允许继续下载时返回 True。
@@ -767,15 +770,17 @@ class SubscriptionCleanup:
         for history in histories:
             dest_fileitem = history.get("dest_fileitem") if isinstance(history, dict) else None
             if dest_fileitem and self._delete_media_file:
+                dest_path_text = self._fileitem_path(dest_fileitem) or str(dest_fileitem)
                 # 第一道（确定性判据）：该记录的目标路径会被本次整理同名覆盖 → 不删，
                 # 交由主程序按目录覆盖模式替换（避免「先查后删」撞上主程序写入的竞态）。
                 if self._will_be_overwritten_by_same_name(history, target_path, task):
                     skipped_same_path += 1
                     detail(
                         f"订阅整理拦截：{mode_label}跳过删除将被同名覆盖的媒体库文件 "
-                        f"{self._fileitem_path(dest_fileitem) or dest_fileitem}"
+                        f"{dest_path_text}"
                         "（交由主程序按目录覆盖模式替换）"
                     )
+                    detail(f"清理探针：同名跳过 {self._probe_file_state(dest_path_text)}")
                     continue
                 # 第二道（启发式兜底）：本次清理只针对快照建立前就存在的旧文件：洗版/重下时
                 # 新文件可能先落库、随后才触发本拦截，若照样删除就会把刚入库的新文件删掉。
@@ -783,16 +788,22 @@ class SubscriptionCleanup:
                     skipped_fresh += 1
                     detail(
                         f"订阅整理拦截：{mode_label}跳过删除刚写入的媒体库文件 "
-                        f"{self._fileitem_path(dest_fileitem) or dest_fileitem}"
+                        f"{dest_path_text}"
                     )
+                    detail(f"清理探针：新鲜度跳过 {self._probe_file_state(dest_path_text)}")
                     continue
+                detail(f"清理探针：删除前 {self._probe_file_state(dest_path_text)}")
                 try:
                     delete_state = self._delete_media_file(dest_fileitem)
                 except Exception as err:
                     delete_state = False
-                    logger.warning(f"订阅整理拦截：媒体库文件删除异常 {self._fileitem_path(dest_fileitem) or dest_fileitem}：{err}")
+                    logger.warning(f"订阅整理拦截：媒体库文件删除异常 {dest_path_text}：{err}")
+                detail(
+                    f"清理探针：删除后（delete_state={delete_state}）"
+                    f"{self._probe_file_state(dest_path_text)}"
+                )
                 if delete_state is False:
-                    failed_dest_paths.append(self._fileitem_path(dest_fileitem) or str(dest_fileitem))
+                    failed_dest_paths.append(dest_path_text)
                     failed_histories.append(history)
             dest_path = self._fileitem_path(dest_fileitem) or (history.get("dest") if isinstance(history, dict) else None)
             if dest_path:
@@ -832,6 +843,91 @@ class SubscriptionCleanup:
         if isinstance(fileitem, dict):
             return fileitem.get("path")
         return None
+
+    @staticmethod
+    def _norm_path(path) -> str:
+        """规整路径用于比较；失败时退回原文，避免影响调用方。"""
+        try:
+            return os.path.normpath(str(path))
+        except Exception:  # noqa: BLE001
+            return str(path)
+
+    @classmethod
+    def _probe_file_state(cls, path) -> str:
+        """只读探针：记录媒体库文件当前状态，用于定位「到底是谁删掉了文件」。
+
+        2026-09-19 排查《超级宝贝JOJO》S01E66 去向时缺少可复现的直接证据，
+        这里把删除前后的 exists/inode/nlink/mtime 落日志：只要下轮再触发，就能看清
+        文件是在插件删除前还是之后消失、以及消失时是否还是同一个 inode。
+        """
+        if not path:
+            return "path=(空)"
+        try:
+            if not os.path.exists(path):
+                return f"exists=False path={path}"
+            stat = os.lstat(path)
+            return (
+                f"exists=True inode={stat.st_ino} nlink={stat.st_nlink} "
+                f"mtime={int(stat.st_mtime)} path={path}"
+            )
+        except Exception as err:  # noqa: BLE001
+            return f"probe_error={err} path={path}"
+
+    def pending_dest_paths(self) -> set:
+        """返回清理快照中尚未消费的媒体库目标路径集合（短 TTL 缓存）。
+
+        供覆盖授权判定使用：只对「本插件洗版清理范围」内的目标路径授权覆盖，
+        范围之外的任何同名文件都不受影响。
+        """
+        now = time.time()
+        cache = self._pending_dest_cache
+        if cache and now - cache[0] < _PENDING_DEST_TTL_SECONDS:
+            return cache[1]
+        paths = set()
+        try:
+            snapshots = self._read(SUBSCRIPTION_CLEANUP_SNAPSHOT_KEY) if self._read else {}
+            for task in (snapshots or {}).values():
+                for history in (task or {}).get("histories") or []:
+                    dest_fileitem = history.get("dest_fileitem") if isinstance(history, dict) else None
+                    path = self._fileitem_path(dest_fileitem) or (
+                        history.get("dest") if isinstance(history, dict) else None
+                    )
+                    if path:
+                        paths.add(self._norm_path(path))
+        except Exception as err:  # noqa: BLE001
+            logger.debug(f"订阅整理拦截：读取清理快照目标路径失败：{err}")
+        self._pending_dest_cache = (now, paths)
+        return paths
+
+    def handle_overwrite_check(self, event) -> bool:
+        """TransferOverwriteCheck → 为洗版清理范围内的同名旧文件授权覆盖。
+
+        主程序默认按「整理目录」的覆盖模式决定同名文件是否替换：never 直接跳过、
+        size 只在更大时替换，都会让洗版对同名文件静默失效（旧版本替换不掉，订阅反复重下）。
+        这里只对**本插件清理快照内的目标路径**返回覆盖决策，由主程序自行完成删除与写入，
+        因此既不依赖目录覆盖模式，也不存在「插件先查后删」撞上主程序写入的竞态。
+        """
+        data = getattr(event, "event_data", None)
+        if not data or getattr(data, "overwrite", None) is not None:
+            return False
+        target_path = getattr(data, "target_path", None)
+        if not target_path:
+            return False
+        if self._norm_path(target_path) not in self.pending_dest_paths():
+            return False
+        mode = getattr(data, "overwrite_mode", "") or ""
+        target_state = self._probe_file_state(target_path)
+        data.overwrite = True
+        data.source = "订阅助手Q自用版"
+        data.reason = (
+            f"洗版同名覆盖授权（目录覆盖模式={mode or '未设置'}）："
+            "该路径在订阅清理快照内，确认可用新版本替换旧文件"
+        )
+        detail(
+            f"清理探针：覆盖授权 {target_path}（覆盖模式={mode or '未设置'}，"
+            f"{target_state}）"
+        )
+        return True
 
     @classmethod
     def _will_be_overwritten_by_same_name(cls, history, target_path, task) -> bool:
