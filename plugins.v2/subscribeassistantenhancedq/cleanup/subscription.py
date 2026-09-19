@@ -44,6 +44,7 @@ class SubscriptionCleanup:
                  season_of_fn: Optional[Callable] = None,
                  torrent_exists_fn: Optional[Callable] = None,
                  protect_hr_fn: Optional[Callable] = None,
+                 download_names_fn: Optional[Callable] = None,
                  sleep_fn: Optional[Callable] = None,
                  cleanup_history_type: str = "no",
                  cleanup_history_scenes: Optional[list] = None):
@@ -61,6 +62,9 @@ class SubscriptionCleanup:
         # protect_hr_fn(hash, source_path, subscribe) -> bool：
         # 命中 H&R 种子时由插件接管保种（移入收容目录），调用方跳过删源文件与 DownloadFileDeleted。
         self._protect_hr = protect_hr_fn
+        # download_names_fn([hash, ...]) -> {hash: 下载时的种子名}：
+        # 用于识别「本次要下载的资源」与「即将清理的旧文件」是否同一个包。
+        self._download_names = download_names_fn
         self._sleep = sleep_fn or time.sleep
         self._cleanup_history_type = cleanup_history_type
         self._cleanup_history_scenes = list(cleanup_history_scenes or [])
@@ -120,6 +124,12 @@ class SubscriptionCleanup:
                 f"查询季号={season or '无'}，跳过清理"
             )
             return True
+        # 同一个包重下：本次资源与旧文件同源，没有「旧版本」需要替换。
+        # 删掉它既白下一遍，又会触发「源文件删除事件」的监听方（如 DownloaderHelper 判
+        # 源文件已不存在）把刚加入的同名任务一并删除。直接跳过清理，交给主程序按
+        # 「下载任务已存在」复用现有文件。
+        if self._same_package_as_pending_cleanup(subscribe, context, histories):
+            return True
         protected_hashes = self.clear_transfer_src_histories(
             subscribe=subscribe,
             histories=histories,
@@ -140,6 +150,56 @@ class SubscriptionCleanup:
                 f"{len(protected_hashes)} 个 H&R 种子已转入保种目录，跳过删除与等待"
             )
         return self._wait_for_torrents_removed(subscribe=subscribe, download_hashes=old_hashes)
+
+    def _same_package_as_pending_cleanup(self, subscribe, context, histories) -> bool:
+        """本次要下载的资源与即将清理的旧文件是否属于同一个包。
+
+        同一个包重下时清理源文件没有意义：没有旧版本需要替换，删了还要原样下回来，
+        而且「源文件被删除」会让监听该事件的一方（例如 DownloaderHelper 判定种子数据
+        已不存在）把刚加入的同名任务连文件一并删除，造成源文件与下载任务同时丢失。
+
+        判据：用旧整理记录的 download_hash 反查主程序下载记录里的种子名，
+        与本次资源的标题逐字比较。任何一步取不到证据（标题缺失、记录缺失、查询异常）
+        都返回 False，即按原逻辑清理，保持既有行为不变。
+        """
+        new_title = ""
+        torrent_info = getattr(context, "torrent_info", None) if context else None
+        if torrent_info:
+            new_title = str(getattr(torrent_info, "title", "") or "").strip()
+        if not new_title or not self._download_names:
+            return False
+        download_hashes = []
+        for history in histories or []:
+            value = self._field(history, "download_hash")
+            if value:
+                download_hashes.append(str(value))
+        download_hashes = list(dict.fromkeys(download_hashes))
+        if not download_hashes:
+            return False
+        try:
+            names = self._download_names(download_hashes) or {}
+        except Exception as err:
+            logger.warning(
+                f"订阅清理：{format_subscribe_desc(subscribe)} 反查旧包下载记录失败（{err}），"
+                "按原逻辑清理旧源文件"
+            )
+            return False
+        matched = [
+            str(name).strip()
+            for name in names.values()
+            if str(name or "").strip() == new_title
+        ]
+        if not matched:
+            return False
+        logger.info(
+            f"订阅清理：{format_subscribe_desc(subscribe)} 本次资源与旧文件为同一个包"
+            f"（{new_title}），跳过源文件清理以避免重复下载"
+        )
+        detail(
+            f"订阅清理：{format_subscribe_desc(subscribe)} 同包跳过清理，"
+            f"旧 hash {len(download_hashes)} 个，命中种子名 {matched[0]}"
+        )
+        return True
 
     def migrate_snapshot_identities(self) -> int:
         """把旧 TMDB 清理快照转换为 V3 规范媒体身份，返回迁移记录数。
