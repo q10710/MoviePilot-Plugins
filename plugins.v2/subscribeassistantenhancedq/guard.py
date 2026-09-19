@@ -43,6 +43,20 @@ class CompletionGuard:
         data: SubscribeCompletionCheckEventData = event.event_data
         if data is None:
             return
+        try:
+            self._evaluate_completion(data)
+        except Exception as err:  # noqa: BLE001
+            # 证据链异常必须保守否决：链式事件处理器抛出的异常会被事件总线吞掉，
+            # 主程序读不到 cancel 就会按「未被否决」处理，等于放行未复核的完成判定。
+            logger.error(
+                f"完成守卫：完成检查复核异常，本次保守否决完成：{err}", exc_info=True
+            )
+            data.cancel = True
+            data.source = "subscribeassistantenhanced"
+            data.reason = "完成守卫复核异常，本次保守否决，等待下轮复核"
+
+    def _evaluate_completion(self, data: SubscribeCompletionCheckEventData) -> None:
+        """完成检查的实质复核；任何异常由 handle 统一按保守否决处理。"""
         subscribe = data.subscribe
 
         media_type = resolve_subscribe_media_type(subscribe)
