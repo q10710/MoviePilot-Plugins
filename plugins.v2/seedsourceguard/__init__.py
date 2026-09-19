@@ -32,7 +32,7 @@ class SeedSourceGuard(_PluginBase):
     plugin_desc = ("检测本地源文件是否有下载器在做种、下载器是否存在文件丢失的无效做种或"
                    "tracker 全部失败的做种任务；连续N天异常可通知或按策略处置，杜绝无效做种与孤儿文件。")
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/seedsourceguard.png"
-    plugin_version = "1.1.13"
+    plugin_version = "1.1.14"
     plugin_label = "下载管理"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -56,11 +56,29 @@ class SeedSourceGuard(_PluginBase):
     _red_action: str = "delete"
     _move_path: str = ""
     _allow_delete: bool = False
+    # 站点失联豁免：tracker 全部失败但失败原因是「连不上站点」时不计红种、不处置
+    _skip_unreachable: bool = True
 
     # 红种做种保护：单下载器红种占做种候选数比例达标时视为站点/网络故障，本轮只通知不处置
     _RED_PROTECT_RATIO: float = 0.8
     # qBittorrent 需逐任务查询 tracker 状态，任务数超过该上限时跳过红种检测
     _QB_TRACKER_QUERY_LIMIT: int = 500
+
+    # tracker 失败原因归类（小写匹配）：
+    # ① 站点/链路不可达（含换域名、站点维护、DNS 失效、证书问题）→ 不算真红种；
+    # ② 站点明确回「无此种子」→ 真死种，照常计入红种并处置；
+    # ③ 其余（如 403 风控）→ 原因不明，保守豁免、只在通知里列出。
+    _UNREACHABLE_HINTS = (
+        "could not connect", "connection refused", "connection timed out",
+        "timed out", "timeout", "unable to resolve", "no route to host",
+        "network is unreachable", "ssl", "certificate", "tls", "handshake",
+        "connection reset", "name resolution", "name or service not known",
+        "host not found", "bad gateway", "service unavailable", "http response 5",
+    )
+    _DEAD_HINTS = (
+        "not registered", "unregistered", "torrent not exists", "torrent not found",
+        "no such torrent", "torrent does not exist", "http response 404",
+    )
 
     # 下载中/排队下载等不应视为异常的状态（文件未就绪）
     _IGNORE_STATES = {
@@ -113,6 +131,8 @@ class SeedSourceGuard(_PluginBase):
         self._red_action = str(config.get("red_action") or "delete")
         self._move_path = str(config.get("move_path") or "").strip()
         self._allow_delete = bool(config.get("allow_delete"))
+        # 缺省开启：站点失联/换域名属于站侧或链路问题，不该当红种删掉本地文件
+        self._skip_unreachable = bool(config.get("skip_unreachable", True))
 
     @staticmethod
     def _build_cron(times: int) -> str:
@@ -388,6 +408,9 @@ class SeedSourceGuard(_PluginBase):
                                             "type": "info",
                                             "variant": "tonal",
                                             "text": ("红种判定：做种任务的全部 tracker 连续通告失败。"
+                                                     "其中失败原因为「无法连接站点、域名失效、超时、证书错误」的，"
+                                                     "视为站点侧或链路故障，不计入红种轮次也不处置（站点恢复后继续累计）；"
+                                                     "只有站点明确回「无此种子」的才按红种处置。"
                                                      "删除种子时自动判断：该源文件仍被其它正常任务覆盖则只删种子保留文件；"
                                                      "无任何其它正常辅种时删除种子并连同源文件一起删除。"
                                                      "单下载器红种占做种数 80% 以上时触发站点/网络级故障保护，本轮只通知不处置。"),
@@ -437,9 +460,34 @@ class SeedSourceGuard(_PluginBase):
                             "type": "warning",
                             "variant": "tonal",
                             "text": ("安全规则：下载器连接失败或取不到任务列表时，本轮自动跳过该下载器，"
-                                     "绝不会把任何文件判为孤儿；红种占做种数达 80% 阈值时自动保护不处置。"
+                                     "绝不会把任何文件判为孤儿；站点失联豁免开启时，"
+                                     "因站点不可达/换域名而红种的任务不计轮次也不处置；"
+                                     "红种占做种数达 80% 阈值时自动保护不处置。"
                                      "删除/移动类处置要求：连续 N 次扫描仍异常（按实际扫描轮次累计，关机/停用期不计数） + 本页开关已打开。"),
                         },
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "skip_unreachable",
+                                            "label": "站点失联豁免（建议开启）",
+                                            "hint": ("tracker 全部失败但原因是无法连接站点、域名失效、超时或证书错误时，"
+                                                     "视为站点侧或链路故障：不计入红种轮次、不执行删除，"
+                                                     "站点恢复或换好 tracker 后继续累计已有轮次。"
+                                                     "站点明确回「无此种子」的仍按红种处理。"),
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
                     },
                 ],
             }
@@ -457,6 +505,7 @@ class SeedSourceGuard(_PluginBase):
             "red_action": "delete",
             "move_path": "",
             "allow_delete": False,
+            "skip_unreachable": True,
         }
 
     def get_page(self) -> Optional[List[dict]]:
@@ -477,6 +526,7 @@ class SeedSourceGuard(_PluginBase):
         no_seed = state.get("no_seed_active") or []
         invalid = state.get("invalid_active") or []
         red = state.get("red_active") or []
+        red_exempt = state.get("red_exempt_active") or []
         unavailable = state.get("unavailable") or []
         last_run = state.get("last_run") or "尚未运行"
         handled = state.get("handled") or []
@@ -742,17 +792,39 @@ class SeedSourceGuard(_PluginBase):
 
         red_rows = _seed_rows(red, "purple")
         page.append(_card(
-            "红种做种（tracker 全部通告失败）", "mdi-record-circle-outline", purple,
+            "红种做种（tracker 全部失败且站点确认无此种子）", "mdi-record-circle-outline", purple,
             f"{len(red)} 项", "warning",
             [_scroll_table(["下载器", "种子", "已持续"], red_rows, min_width=760)
              if red_rows
              else _empty_alert("未发现红种做种任务。")]
             + ([{"component": "div",
                  "props": {"class": "text-caption text-medium-emphasis mt-2"},
-                 "text": f"单下载器红种占做种数 50% 以上时只通知不处置（本机最近一轮做种数："
-                         f"{len(red)} 项红种）；表格最多显示前 {max_rows} 项。"}]
+                 "text": f"单下载器红种占做种数 80% 以上时只通知不处置；"
+                         f"表格最多显示前 {max_rows} 项。"}]
                if len(red) > max_rows else []),
         ))
+
+        if red_exempt:
+            exempt_rows = [{
+                "component": "tr",
+                "content": [
+                    {"component": "td", "props": {"class": "text-body-2"},
+                     "text": item.get("dl", "") or "-"},
+                    {"component": "td", "props": {"class": "text-caption"},
+                     "text": item.get("name", "") or "-"},
+                    {"component": "td", "props": {"class": "text-caption"},
+                     "text": item.get("reason", "") or item.get("kind", "") or "-"},
+                ],
+            } for item in red_exempt[:max_rows]]
+            page.append(_card(
+                "站点失联豁免（连不上站点/换域名/原因不明，不计红种也不处置）",
+                "mdi-lan-disconnect", info_c, f"{len(red_exempt)} 项", "info",
+                [_scroll_table(["下载器", "种子", "失败原因"], exempt_rows, min_width=900)]
+                + ([{"component": "div",
+                     "props": {"class": "text-caption text-medium-emphasis mt-2"},
+                     "text": f"表格最多显示前 {max_rows} 项。"}]
+                   if len(red_exempt) > max_rows else []),
+            ))
 
         unavail_rows = [{
             "component": "tr",
@@ -1045,9 +1117,11 @@ class SeedSourceGuard(_PluginBase):
                     services: Optional[dict] = None) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
         """检测红种做种任务：处于做种状态但 tracker 全部通告失败。
 
-        返回 (红种明细列表, 各下载器做种候选数)。qBittorrent 需逐任务查询
-        tracker 状态，候选超过上限时跳过；Transmission 直接使用任务自带的
-        trackerStats，无额外请求开销。
+        返回 (红种明细列表, 各下载器做种候选数)。每个明细项带 kind：
+        dead=站点明确回「无此种子」（真死种）；unreachable=连不上站点（含换域名、
+        维护、DNS/证书问题）；unknown=原因不明。后两类由结算阶段按站点失联豁免处理。
+        qBittorrent 需逐任务查询 tracker 状态，候选超过上限时跳过；
+        Transmission 直接使用任务自带的 trackerStats，无额外请求开销。
         """
         red: List[Dict[str, Any]] = []
         hold_count: Dict[str, int] = {}
@@ -1079,13 +1153,15 @@ class SeedSourceGuard(_PluginBase):
                         # 单任务查询失败不影响其余任务的红种检测
                         logger.debug(f"下载器 {dl_name} 查询 tracker 状态失败 {hash_value}：{err}")
                         continue
-                    if self._torrent_red(task, trackers):
-                        red.append(self._red_item(task, dl_name))
+                    verdict = self._torrent_red(task, trackers)
+                    if verdict:
+                        red.append(self._red_item(task, dl_name, verdict[0], verdict[1]))
                 continue
             # Transmission / 其它：优先使用任务自带 trackerStats
             for task in candidates:
-                if self._torrent_red(task, task.get("tracker_stats")):
-                    red.append(self._red_item(task, dl_name))
+                verdict = self._torrent_red(task, task.get("tracker_stats"))
+                if verdict:
+                    red.append(self._red_item(task, dl_name, verdict[0], verdict[1]))
         return red, hold_count
 
     @staticmethod
@@ -1103,30 +1179,51 @@ class SeedSourceGuard(_PluginBase):
         return "unknown"
 
     @staticmethod
-    def _red_item(task: Dict[str, Any], dl_name: str) -> Dict[str, Any]:
-        """构造红种明细项。"""
+    def _red_item(task: Dict[str, Any], dl_name: str,
+                  kind: str = "", reason: str = "") -> Dict[str, Any]:
+        """构造红种明细项，附带失败归类 kind 与原始失败原因 reason。"""
         return {
             "dl": dl_name,
             "hash": task.get("hash", ""),
             "name": task.get("name", ""),
             "root": task.get("root", ""),
             "state": task.get("state", ""),
+            "kind": kind,
+            "reason": reason,
         }
 
-    def _torrent_red(self, task: Dict[str, Any], tracker_stats: Any) -> bool:
-        """判定单个任务是否为红种：做种状态、文件完好且 tracker 全部失败。"""
+    def _torrent_red(self, task: Dict[str, Any],
+                     tracker_stats: Any) -> Optional[Tuple[str, str]]:
+        """判定单个任务的红种类型：做种状态、文件完好且 tracker 全部失败。
+
+        非红种返回 None；红种返回 (kind, 失败原因摘要)。
+        """
         state = task.get("state", "")
         if state in self._INVALID_STATES or not self._is_hold_state(state):
-            return False
+            return None
         if not self._path_ok(task.get("root", "")):
             # 文件丢失/目录为空归无效做种处理，不在红种路径重复计数
-            return False
-        return self._tracker_all_failed(tracker_stats)
+            return None
+        return self._tracker_red_verdict(tracker_stats)
 
     @staticmethod
-    def _tracker_all_failed(tracker_stats: Any) -> bool:
-        """解析 tracker 数据：存在失败记录且无任何成功通告时判红。
+    def _classify_tracker_failure(text: str) -> str:
+        """按通告失败原因归类：dead / unreachable / unknown。"""
+        low = str(text or "").lower()
+        if any(hint in low for hint in SeedSourceGuard._DEAD_HINTS):
+            return "dead"
+        if any(hint in low for hint in SeedSourceGuard._UNREACHABLE_HINTS):
+            return "unreachable"
+        return "unknown"
 
+    @staticmethod
+    def _tracker_red_verdict(tracker_stats: Any) -> Optional[Tuple[str, str]]:
+        """解析 tracker 数据，返回红种归类与失败原因；非红种返回 None。
+
+        判定顺序：只要有任一真实 tracker 通告成功就不算红种；全部失败时，
+        只要有一个 tracker 明确回「无此种子」即判 dead（站点还能应答，说明是
+        种子在站上没了）；否则，若全部失败都是连接类故障即判 unreachable
+        （站点失联/换域名），其余情况判 unknown。
         兼容 qBittorrent 的 torrents_trackers（status 字段）与 Transmission 的
         trackerStats（lastAnnounceSucceeded / lastAnnounceTime 字段）。
         """
@@ -1143,7 +1240,7 @@ class SeedSourceGuard(_PluginBase):
                 continue
             real.append(item)
         if not real:
-            return False
+            return None
 
         def fget(it: Any, key: str, default: Any = None) -> Any:
             """兼容 dict 与对象的字段读取，并同时兼容 camelCase / snake_case 字段名。
@@ -1167,13 +1264,18 @@ class SeedSourceGuard(_PluginBase):
             return default
         announced = False
         succeeded = False
+        kinds: List[str] = []
+        reasons: List[str] = []
         for it in real:
             if fget(it, "status") is not None:  # qBittorrent tracker 状态
                 status = int(fget(it, "status") or 0)
                 if status in (2, 3):  # working / updating：至少一个正常则不红
-                    return False
+                    return None
                 if status == 4:  # notWorking：明确通告失败
                     announced = True
+                    message = str(fget(it, "msg") or fget(it, "message") or "")
+                    reasons.append(message)
+                    kinds.append(SeedSourceGuard._classify_tracker_failure(message))
                 continue
             # Transmission trackerStats
             succ = fget(it, "lastAnnounceSucceeded")
@@ -1185,9 +1287,27 @@ class SeedSourceGuard(_PluginBase):
                 succeeded = True
             if result and "Success" in result:
                 succeeded = True
-        if succeeded:
-            return False
-        return announced
+            if atime > 0 and not succ:
+                reasons.append(result)
+                kinds.append(SeedSourceGuard._classify_tracker_failure(result))
+        if succeeded or not announced:
+            return None
+        if not kinds:
+            return "unknown", ""
+        if any(kind == "dead" for kind in kinds):
+            return "dead", SeedSourceGuard._short_reason(reasons)
+        if all(kind == "unreachable" for kind in kinds):
+            return "unreachable", SeedSourceGuard._short_reason(reasons)
+        return "unknown", SeedSourceGuard._short_reason(reasons)
+
+    @staticmethod
+    def _short_reason(reasons: List[str]) -> str:
+        """把多条失败原因压缩为一条可读摘要（去重后取首条，最多 60 字）。"""
+        for reason in reasons:
+            text = str(reason or "").strip()
+            if text:
+                return text[:60]
+        return ""
 
     @staticmethod
     def _is_hold_state(state: Any) -> bool:
@@ -1358,7 +1478,22 @@ class SeedSourceGuard(_PluginBase):
                 "text": (f"站点级故障保护：{item.get('dl', '')} 红种 {protected[key]}，"
                          "本轮不处置，仅通知"),
             })
+        # 站点失联豁免：失败原因是「连不上站点」（含换域名、站点维护、DNS/证书问题）
+        # 或原因不明时，不计入红种轮次、不处置；既有计数保留，站点恢复后继续累计。
+        exempt_red: Dict[str, Any] = {}
+        if self._skip_unreachable:
+            exempt_red = {
+                key: item for key, item in red_map.items()
+                if key not in protected and item.get("kind") != "dead"
+            }
+        if exempt_red:
+            logger.warning(
+                f"站点失联豁免：{len(exempt_red)} 个红种任务因 tracker 无法连接或原因不明，"
+                "本轮不计入红种轮次、不处置（站点恢复或换域名后继续累计）"
+            )
+        report["red_exempt"] = list(exempt_red.values())
         red_map_active = {k: v for k, v in red_map.items() if k not in protected}
+        red_map_active = {k: v for k, v in red_map_active.items() if k not in exempt_red}
         # 正常辅种覆盖判定集合：排除本轮无效/红种任务根路径后，仅“正常任务”可覆盖源文件
         bad_roots = set()
         for item in list(invalid_map.values()) + list(red_map.values()):
@@ -1388,7 +1523,8 @@ class SeedSourceGuard(_PluginBase):
                     days_data.pop(old_key, None)
                 elif prefix == "invalid:" and body not in invalid_map:
                     days_data.pop(old_key, None)
-                elif prefix == "red:" and body not in red_map_active:
+                elif (prefix == "red:" and body not in red_map_active
+                      and body not in exempt_red):
                     days_data.pop(old_key, None)
 
         self.save_data("days", days_data)
@@ -1411,10 +1547,19 @@ class SeedSourceGuard(_PluginBase):
                 "name": item.get("name", ""),
                 "days": self._calc_days(days_data, f"red:{key}", today),
             })
+        active_red_exempt = []
+        for item in (report.get("red_exempt") or []):
+            active_red_exempt.append({
+                "dl": item.get("dl", ""),
+                "name": item.get("name", ""),
+                "reason": item.get("reason", ""),
+                "kind": item.get("kind", ""),
+            })
         self.save_data("active", {
             "no_seed_active": active_no_seed,
             "invalid_active": active_invalid,
             "red_active": active_red,
+            "red_exempt_active": active_red_exempt,
         })
         return handled_list
 
@@ -1643,12 +1788,23 @@ class SeedSourceGuard(_PluginBase):
             else:
                 lines.append("  - 数量较多，不逐条推送，请到插件页查看明细")
         if red:
-            lines.append(f"红种做种任务 {len(red)} 个（tracker 全部通告失败）")
+            lines.append(f"红种做种任务 {len(red)} 个（tracker 全部通告失败，站点确认无此种子）")
             if len(red) <= 5:
                 for item in red:
                     lines.append(f"  - [{item.get('dl', '')}] {item.get('name', '')}")
             else:
                 lines.append("  - 数量较多，不逐条推送，请到插件页查看明细")
+        exempt_red = report.get("red_exempt") or []
+        if exempt_red:
+            lines.append(
+                f"站点失联豁免 {len(exempt_red)} 个（tracker 无法连接/域名失效/原因不明，"
+                "不计入红种也不处置，站点恢复或换好 tracker 后继续累计）"
+            )
+            for item in exempt_red[:5]:
+                reason = item.get("reason", "") or item.get("kind", "")
+                lines.append(f"  - [{item.get('dl', '')}] {item.get('name', '')}｜{reason}")
+            if len(exempt_red) > 5:
+                lines.append("  - 其余请到插件页「站点失联豁免」表查看")
         if unavailable:
             lines.append(f"下载器异常 {len(unavailable)} 个（已跳过，未做任何处置）")
             for item in unavailable[:5]:
