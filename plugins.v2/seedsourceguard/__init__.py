@@ -1494,6 +1494,8 @@ class SeedSourceGuard(_PluginBase):
         report["red_exempt"] = list(exempt_red.values())
         red_map_active = {k: v for k, v in red_map.items() if k not in protected}
         red_map_active = {k: v for k, v in red_map_active.items() if k not in exempt_red}
+        # 供通知统计使用：只含真正计入红种（站点确认无此种子）的项
+        report["red_active"] = list(red_map_active.values())
         # 正常辅种覆盖判定集合：排除本轮无效/红种任务根路径后，仅“正常任务”可覆盖源文件
         bad_roots = set()
         for item in list(invalid_map.values()) + list(red_map.values()):
@@ -1770,7 +1772,11 @@ class SeedSourceGuard(_PluginBase):
         lines = []
         no_seed = report.get("no_seed") or []
         invalid = report.get("invalid") or []
-        red = report.get("red") or []
+        # 只把真正计入红种的项纳入「红种做种」统计：站点失联/原因不明的项
+        # 单独列在豁免段落，避免与「站点失联豁免」重复计数。
+        red = report.get("red_active")
+        if red is None:
+            red = report.get("red") or []
         unavailable = report.get("unavailable") or []
         # 单项超过 5 个只报汇总计数，避免消息过长；少量时逐条列出
         if no_seed:
