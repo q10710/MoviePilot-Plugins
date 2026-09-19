@@ -629,6 +629,10 @@ class SubscriptionCleanup:
         # 逐集消费会让同一事务被消费 N 次，通知必须收敛为「每事务一条」，
         # 否则一次整季洗版会推送上百条重复通知（2026-09-19 评估影响时发现）。
         consumed_task["_already_notified"] = bool((task or {}).get("_notified"))
+        # 记录本次清理事务的原始总条数：逐集消费后单次只有 1 条，通知若直接取本次条数会误导
+        consumed_task["_total_histories"] = int(
+            (task or {}).get("_total_histories") or len(histories)
+        )
         consumed_episodes = sorted(
             set(self._normalize_episode_numbers((task or {}).get("target_episodes"))) & event_episode_set
         )
@@ -638,6 +642,7 @@ class SubscriptionCleanup:
         remaining_task = dict(task or {})
         remaining_task["histories"] = remaining_histories
         remaining_task["_notified"] = True
+        remaining_task["_total_histories"] = consumed_task["_total_histories"]
         remaining_episode_set = set()
         for history in remaining_histories:
             remaining_episode_set.update(self._history_episode_numbers(history))
@@ -814,7 +819,8 @@ class SubscriptionCleanup:
         if self._notify and not (task or {}).get("_already_notified"):
             self._notify(
                 f"{(task or {}).get('subscribe_desc', '订阅')} "
-                f"即将开始{mode_label}整理，已处理 {len(histories)} 条整理记录对应的媒体库文件",
+                f"即将开始{mode_label}整理，已处理 "
+                f"{int((task or {}).get('_total_histories') or len(histories))} 条整理记录对应的媒体库文件",
                 text=self._single_episode_cleanup_text((task or {}).get("target_episodes"), dest_paths),
                 image=(task or {}).get("subscribe_image"),
             )
