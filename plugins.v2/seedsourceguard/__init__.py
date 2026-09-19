@@ -32,7 +32,7 @@ class SeedSourceGuard(_PluginBase):
     plugin_desc = ("检测本地源文件是否有下载器在做种、下载器是否存在文件丢失的无效做种或"
                    "tracker 全部失败的做种任务；连续N天异常可通知或按策略处置，杜绝无效做种与孤儿文件。")
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/seedsourceguard.png"
-    plugin_version = "1.1.14"
+    plugin_version = "1.1.15"
     plugin_label = "下载管理"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -58,11 +58,16 @@ class SeedSourceGuard(_PluginBase):
     _allow_delete: bool = False
     # 站点失联豁免：tracker 全部失败但失败原因是「连不上站点」时不计红种、不处置
     _skip_unreachable: bool = True
+    # 站点长期失联提醒：连续失联达到该天数只提醒不处置（0 表示不提醒）
+    _site_offline_alert_days: int = 30
 
     # 红种做种保护：单下载器红种占做种候选数比例达标时视为站点/网络故障，本轮只通知不处置
     _RED_PROTECT_RATIO: float = 0.8
     # qBittorrent 需逐任务查询 tracker 状态，任务数超过该上限时跳过红种检测
     _QB_TRACKER_QUERY_LIMIT: int = 500
+    # 判定「整站失联」的最少任务数与失败占比（该站任务普遍连不上才算站挂了）
+    _SITE_MIN_TASKS: int = 3
+    _SITE_FAIL_RATIO: float = 0.9
 
     # tracker 失败原因归类（小写匹配）：
     # ① 站点/链路不可达（含换域名、站点维护、DNS 失效、证书问题）→ 不算真红种；
@@ -133,6 +138,12 @@ class SeedSourceGuard(_PluginBase):
         self._allow_delete = bool(config.get("allow_delete"))
         # 缺省开启：站点失联/换域名属于站侧或链路问题，不该当红种删掉本地文件
         self._skip_unreachable = bool(config.get("skip_unreachable", True))
+        # 长期失联提醒天数：0 或不填表示不提醒（三个提醒档位默认 30 天）
+        try:
+            self._site_offline_alert_days = max(0, int(config.get("site_offline_alert_days")
+                                                       or self._site_offline_alert_days))
+        except (TypeError, ValueError):
+            self._site_offline_alert_days = 30
 
     @staticmethod
     def _build_cron(times: int) -> str:
@@ -489,6 +500,46 @@ class SeedSourceGuard(_PluginBase):
                             },
                         ],
                     },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "site_offline_alert_days",
+                                            "label": "站点长期失联提醒天数",
+                                            "type": "number",
+                                            "hint": ("某站点任务普遍连不上、连续达到该天数时发提醒，"
+                                                     "此后每 7 天再提醒一次；只提醒，不做任何处置。"
+                                                     "填 0 表示不提醒。"),
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 8},
+                                "content": [
+                                    {
+                                        "component": "VAlert",
+                                        "props": {
+                                            "type": "info",
+                                            "variant": "tonal",
+                                            "text": ("整站失联判定：该 tracker 域名下任务不少于 3 个，"
+                                                     "且其中 ≥90% 报「连不上站点」。"
+                                                     "达到提醒天数只发通知并在插件页列出，"
+                                                     "插件不会自动删除这类种子；恢复到正常通告则自动移出跟踪。"),
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
+                    },
                 ],
             }
         ], {
@@ -506,6 +557,7 @@ class SeedSourceGuard(_PluginBase):
             "move_path": "",
             "allow_delete": False,
             "skip_unreachable": True,
+            "site_offline_alert_days": 30,
         }
 
     def get_page(self) -> Optional[List[dict]]:
@@ -527,6 +579,7 @@ class SeedSourceGuard(_PluginBase):
         invalid = state.get("invalid_active") or []
         red = state.get("red_active") or []
         red_exempt = state.get("red_exempt_active") or []
+        site_offline = state.get("site_offline_active") or []
         unavailable = state.get("unavailable") or []
         last_run = state.get("last_run") or "尚未运行"
         handled = state.get("handled") or []
@@ -826,6 +879,31 @@ class SeedSourceGuard(_PluginBase):
                    if len(red_exempt) > max_rows else []),
             ))
 
+        if site_offline:
+            offline_rows = [{
+                "component": "tr",
+                "content": [
+                    {"component": "td", "props": {"class": "text-body-2"},
+                     "text": item.get("host", "") or "-"},
+                    {"component": "td", "props": {"class": "text-caption"},
+                     "text": f"{item.get('days', 0)} 天（{item.get('rounds', 0)} 次扫描）"},
+                    {"component": "td", "props": {"class": "text-caption"},
+                     "text": f"{item.get('failed', 0)}/{item.get('total', 0)}"},
+                    {"component": "td", "props": {"class": "text-caption"},
+                     "text": item.get("first_seen", "") or "-"},
+                ],
+            } for item in site_offline[:max_rows]]
+            page.append(_card(
+                f"站点长期失联跟踪（连续 ≥{self._site_offline_alert_days} 天只提醒不处置）",
+                "mdi-alert-decagram-outline", warn, f"{len(site_offline)} 个站", "warning",
+                [_scroll_table(["站点", "连续失联", "连不上/总任务", "起始日期"],
+                               offline_rows, min_width=900)]
+                + [{"component": "div",
+                    "props": {"class": "text-caption text-medium-emphasis mt-2"},
+                    "text": ("这类站点对本地文件不做任何处置，仅在此列出并在达到阈值时提醒；"
+                             "确认站点已废弃后可自行清理对应种子。")}],
+            ))
+
         unavail_rows = [{
             "component": "tr",
             "content": [
@@ -977,16 +1055,18 @@ class SeedSourceGuard(_PluginBase):
         report["invalid"] = invalid_candidates
 
         # 3b. 红种做种检测（tracker 全部通告失败）
-        red_candidates, hold_count = self._detect_red(task_index, services)
+        red_candidates, hold_count, host_stats = self._detect_red(task_index, services)
         report["red"] = red_candidates
         report["hold_count"] = hold_count
+        report["host_stats"] = host_stats
 
         # 4. 孤儿源文件检测
         no_seed_candidates = self._detect_no_seed(task_index)
         report["no_seed"] = no_seed_candidates
 
         # 5. 按天计数并处置
-        handled_list = self._settle(report, handle=handle, task_index=task_index)
+        handled_list = self._settle(report, handle=handle, task_index=task_index,
+                                    host_stats=host_stats)
 
         # 6. 落盘与通知
         self._save_report(report, handled_list=handled_list)
@@ -1114,17 +1194,29 @@ class SeedSourceGuard(_PluginBase):
         return invalid
 
     def _detect_red(self, task_index: Dict[str, list],
-                    services: Optional[dict] = None) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+                    services: Optional[dict] = None
+                    ) -> Tuple[List[Dict[str, Any]], Dict[str, int], Dict[str, Dict[str, int]]]:
         """检测红种做种任务：处于做种状态但 tracker 全部通告失败。
 
-        返回 (红种明细列表, 各下载器做种候选数)。每个明细项带 kind：
+        返回 (红种明细列表, 各下载器做种候选数, 各站点任务统计)。每个明细项带 kind：
         dead=站点明确回「无此种子」（真死种）；unreachable=连不上站点（含换域名、
         维护、DNS/证书问题）；unknown=原因不明。后两类由结算阶段按站点失联豁免处理。
+        站点统计按 tracker 域名聚合该站任务总数与「连不上」任务数，供长期失联提醒使用。
         qBittorrent 需逐任务查询 tracker 状态，候选超过上限时跳过；
         Transmission 直接使用任务自带的 trackerStats，无额外请求开销。
         """
         red: List[Dict[str, Any]] = []
         hold_count: Dict[str, int] = {}
+        host_stats: Dict[str, Dict[str, int]] = {}
+
+        def _record_hosts(tracker_stats: Any, failed: bool) -> None:
+            """累计每个 tracker 域名的任务总数与「连不上」任务数。"""
+            for host in self._tracker_hosts(tracker_stats):
+                stat = host_stats.setdefault(host, {"total": 0, "failed": 0})
+                stat["total"] += 1
+                if failed:
+                    stat["failed"] += 1
+
         for dl_name, tasks in task_index.items():
             candidates = [t for t in tasks if self._is_hold_state(t["state"])]
             hold_count[dl_name] = len(candidates)
@@ -1154,15 +1246,21 @@ class SeedSourceGuard(_PluginBase):
                         logger.debug(f"下载器 {dl_name} 查询 tracker 状态失败 {hash_value}：{err}")
                         continue
                     verdict = self._torrent_red(task, trackers)
+                    # 仅「连不上/原因不明」计入站点失联统计；dead 说明站点仍在应答
+                    _record_hosts(trackers, bool(verdict) and verdict[0] != "dead")
                     if verdict:
-                        red.append(self._red_item(task, dl_name, verdict[0], verdict[1]))
+                        red.append(self._red_item(task, dl_name, verdict[0], verdict[1],
+                                                  self._primary_host(trackers)))
                 continue
             # Transmission / 其它：优先使用任务自带 trackerStats
             for task in candidates:
-                verdict = self._torrent_red(task, task.get("tracker_stats"))
+                tracker_stats = task.get("tracker_stats")
+                verdict = self._torrent_red(task, tracker_stats)
+                _record_hosts(tracker_stats, bool(verdict) and verdict[0] != "dead")
                 if verdict:
-                    red.append(self._red_item(task, dl_name, verdict[0], verdict[1]))
-        return red, hold_count
+                    red.append(self._red_item(task, dl_name, verdict[0], verdict[1],
+                                              self._primary_host(tracker_stats)))
+        return red, hold_count, host_stats
 
     @staticmethod
     def _provider_kind(instance: Any) -> str:
@@ -1180,8 +1278,8 @@ class SeedSourceGuard(_PluginBase):
 
     @staticmethod
     def _red_item(task: Dict[str, Any], dl_name: str,
-                  kind: str = "", reason: str = "") -> Dict[str, Any]:
-        """构造红种明细项，附带失败归类 kind 与原始失败原因 reason。"""
+                  kind: str = "", reason: str = "", host: str = "") -> Dict[str, Any]:
+        """构造红种明细项，附带失败归类 kind、原始失败原因 reason 与 tracker 域名 host。"""
         return {
             "dl": dl_name,
             "hash": task.get("hash", ""),
@@ -1190,7 +1288,33 @@ class SeedSourceGuard(_PluginBase):
             "state": task.get("state", ""),
             "kind": kind,
             "reason": reason,
+            "host": host,
         }
+
+    @staticmethod
+    def _tracker_hosts(tracker_stats: Any) -> List[str]:
+        """提取真实 tracker 域名列表（排除 DHT/PeX/LSD 等内置项），全部小写去重。"""
+        hosts: List[str] = []
+        for item in (tracker_stats or []):
+            if not item:
+                continue
+            if isinstance(item, dict):
+                url = str(item.get("url") or item.get("host") or "")
+            else:
+                url = str(getattr(item, "url", "") or getattr(item, "host", ""))
+            if not url or url.startswith("**"):
+                continue
+            # 去掉协议与端口，形如 https://tracker.xxx.com:443/announce -> tracker.xxx.com
+            rest = url.split("://", 1)[-1]
+            host = rest.split("/", 1)[0].split(":", 1)[0].strip().lower()
+            if host and host not in hosts:
+                hosts.append(host)
+        return hosts
+
+    def _primary_host(self, tracker_stats: Any) -> str:
+        """取该任务的主 tracker 域名，用于把红种项归到具体站点。"""
+        hosts = self._tracker_hosts(tracker_stats)
+        return hosts[0] if hosts else ""
 
     def _torrent_red(self, task: Dict[str, Any],
                      tracker_stats: Any) -> Optional[Tuple[str, str]]:
@@ -1430,7 +1554,9 @@ class SeedSourceGuard(_PluginBase):
     # ── 计数与处置 ────────────────────────────────────────────
 
     def _settle(self, report: Dict[str, Any], handle: bool,
-                task_index: Optional[Dict[str, list]] = None) -> List[Dict[str, Any]]:
+                task_index: Optional[Dict[str, list]] = None,
+                host_stats: Optional[Dict[str, Dict[str, int]]] = None
+                ) -> List[Dict[str, Any]]:
         """按连续天数阈值推进记录，并执行达标项的处置动作。"""
         days_data = self.get_data("days") or {}
         handled_list = []
@@ -1492,6 +1618,9 @@ class SeedSourceGuard(_PluginBase):
                 "本轮不计入红种轮次、不处置（站点恢复或换域名后继续累计）"
             )
         report["red_exempt"] = list(exempt_red.values())
+        site_alerts, site_tracking = self._track_site_offline(host_stats or {})
+        report["site_offline"] = site_alerts
+        report["site_offline_tracking"] = site_tracking
         red_map_active = {k: v for k, v in red_map.items() if k not in protected}
         red_map_active = {k: v for k, v in red_map_active.items() if k not in exempt_red}
         # 供通知统计使用：只含真正计入红种（站点确认无此种子）的项
@@ -1562,6 +1691,7 @@ class SeedSourceGuard(_PluginBase):
             "invalid_active": active_invalid,
             "red_active": active_red,
             "red_exempt_active": active_red_exempt,
+            "site_offline_active": report.get("site_offline_tracking") or [],
         })
         return handled_list
 
@@ -1590,6 +1720,81 @@ class SeedSourceGuard(_PluginBase):
                     "判定站点/网络故障，本轮保护不处置"
                 )
         return protected
+
+    def _track_site_offline(self, host_stats: Dict[str, Dict[str, int]]
+                            ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """跟踪整站失联的连续轮次，并在长期失联时给出提醒清单。
+
+        判据：某 tracker 域名下任务数不少于 `_SITE_MIN_TASKS`，且其中
+        「连不上站点」的任务占比不低于 `_SITE_FAIL_RATIO`，即视为该站整体失联。
+        连续轮次按「每个 tracker 域名的实际扫描轮次」累计，恢复即清除记录；
+        达到 `site_offline_alert_days`（换算为扫描轮次）后提醒，此后每 7 天再提醒一次，
+        避免只提醒一次被忽略、也不会每轮刷屏。**本方法只做提醒，不做任何处置。**
+
+        返回 (本轮需要提醒的站点清单, 全部在跟踪中的失联站点清单)；
+        提醒天数配置为 0 时不产生提醒，但仍继续跟踪。
+        """
+        if not self._site_offline_alert_days:
+            self.save_data("site_offline", {})
+            return [], []
+        stored = self.get_data("site_offline") or {}
+        today = datetime.now().strftime("%Y-%m-%d")
+        alerts: List[Dict[str, Any]] = []
+
+        offline_now: Dict[str, Dict[str, int]] = {}
+        for host, stat in (host_stats or {}).items():
+            total = int(stat.get("total") or 0)
+            failed = int(stat.get("failed") or 0)
+            if total >= self._SITE_MIN_TASKS and total and failed / total >= self._SITE_FAIL_RATIO:
+                offline_now[host] = {"total": total, "failed": failed}
+
+        for host, stat in offline_now.items():
+            record = dict(stored.get(host) or {})
+            record["rounds"] = int(record.get("rounds") or 0) + 1
+            record.setdefault("first_seen", today)
+            record["last_seen"] = today
+            record["total"] = stat["total"]
+            record["failed"] = stat["failed"]
+            stored[host] = record
+
+            threshold = max(1, int(self._site_offline_alert_days) * int(self._scan_times))
+            if record["rounds"] >= threshold:
+                last_alert = int(record.get("alert_rounds") or 0)
+                if not last_alert or record["rounds"] - last_alert >= 7 * int(self._scan_times):
+                    record["alert_rounds"] = record["rounds"]
+                    alerts.append({
+                        "host": host,
+                        "rounds": record["rounds"],
+                        "days": round(record["rounds"] / max(1, int(self._scan_times)), 1),
+                        "failed": stat["failed"],
+                        "total": stat["total"],
+                        "first_seen": record.get("first_seen", today),
+                    })
+
+        # 已恢复（本轮不再整体失联）的站点立即移出跟踪
+        for host in [h for h in stored if h not in offline_now]:
+            stored.pop(host, None)
+        if alerts:
+            logger.warning(
+                f"站点长期失联提醒：{len(alerts)} 个站点连续失联已达 "
+                f"{self._site_offline_alert_days} 天以上（"
+                + "、".join(f"{a['host']}({a['days']}天)" for a in alerts[:5])
+                + "），仅提醒不处置"
+            )
+        self.save_data("site_offline", stored)
+        tracking = [
+            {
+                "host": host,
+                "rounds": int(record.get("rounds") or 0),
+                "days": round(int(record.get("rounds") or 0) / max(1, int(self._scan_times)), 1),
+                "failed": int(record.get("failed") or 0),
+                "total": int(record.get("total") or 0),
+                "first_seen": record.get("first_seen", today),
+            }
+            for host, record in sorted(stored.items(),
+                                       key=lambda kv: -int(kv[1].get("rounds") or 0))
+        ]
+        return alerts, tracking
 
     def _bump_days(self, days_data: dict, prefix: str,
                    current: Dict[str, Any], today: str) -> Dict[str, int]:
@@ -1811,6 +2016,21 @@ class SeedSourceGuard(_PluginBase):
                 lines.append(f"  - [{item.get('dl', '')}] {item.get('name', '')}｜{reason}")
             if len(exempt_red) > 5:
                 lines.append("  - 其余请到插件页「站点失联豁免」表查看")
+        site_offline = report.get("site_offline") or []
+        if site_offline:
+            lines.append(
+                f"站点长期失联提醒 {len(site_offline)} 个（连续失联已达 "
+                f"{self._site_offline_alert_days} 天以上，仅提醒不处置；"
+                "若站点已放弃可自行清理对应种子，插件不会自动删除）"
+            )
+            for item in site_offline[:5]:
+                lines.append(
+                    f"  - {item.get('host', '')}｜连续约 {item.get('days', 0)} 天｜"
+                    f"连不上 {item.get('failed', 0)}/{item.get('total', 0)} 个任务"
+                    f"（自 {item.get('first_seen', '')} 起）"
+                )
+            if len(site_offline) > 5:
+                lines.append("  - 其余请到插件页查看")
         if unavailable:
             lines.append(f"下载器异常 {len(unavailable)} 个（已跳过，未做任何处置）")
             for item in unavailable[:5]:
