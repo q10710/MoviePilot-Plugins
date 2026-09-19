@@ -104,6 +104,28 @@ class SummaryPayload(BaseModel):
     monitored_torrents: int
 
 
+def _register_optional_event(event_name: str):
+    """按主程序是否提供该事件选择性注册。
+
+    新增的覆盖授权依赖主程序事件 ``transfer.overwrite.check``。该事件并非所有 MoviePilot
+    版本都有，而 ``@eventmanager.register`` 在**类定义期**求值并会对无效类型抛 ValueError
+    （缺失成员则直接 AttributeError）——不处理会让整个插件在旧版本上加载失败。
+    这里做成「有就注册，没有就静默跳过」：旧版本退回「同名不删、由主程序按自身覆盖模式处理」，
+    插件本身始终可正常加载使用。
+    """
+    event_type = getattr(ChainEventType, event_name, None)
+    if event_type is None:
+        logger.debug(
+            f"事件 {event_name} 在当前 MoviePilot 版本不存在，跳过注册（覆盖授权不可用，插件其余功能不受影响）"
+        )
+
+        def _passthrough(func):
+            return func
+
+        return _passthrough
+    return eventmanager.register(event_type)
+
+
 class SubscribeAssistantEnhancedQ(_PluginBase):
     """订阅助手 Q 改版——插件入口。
 
@@ -123,7 +145,7 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/subscribeassistantenhancedq.png"
     # 插件版本
-    plugin_version = "0.10.28"
+    plugin_version = "0.10.29"
     _site_cache_candidate_helper_warned = False
     # 插件作者
     plugin_author = "Q"
@@ -1417,11 +1439,15 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
         if self._event_proxy:
             self._event_proxy.on_transfer_intercept(event)
 
-    @eventmanager.register(ChainEventType.TransferOverwriteCheck)
+    @_register_optional_event("TransferOverwriteCheck")
     def on_overwrite_check(self, event):
-        """覆盖检查 → 洗版清理范围内的同名旧文件授权覆盖（不依赖目录覆盖模式）。"""
+        """覆盖检查 → 为洗版清理范围内的同名旧文件授权覆盖（不依赖目录覆盖模式）。
+
+        主程序不提供该事件时本方法不会被注册，插件其余功能不受影响。
+        """
         if self._event_proxy:
             self._event_proxy.on_overwrite_check(event)
+
 
     @eventmanager.register(EventType.PluginAction)
     def on_plugin_action(self, event):
