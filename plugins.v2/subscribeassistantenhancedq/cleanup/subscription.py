@@ -19,6 +19,8 @@ from ..shared.subscribe import (
 
 SUBSCRIPTION_CLEANUP_TTL_SECONDS = 36 * 3600
 SUBSCRIPTION_CLEANUP_SNAPSHOT_KEY = "subscription_cleanup_histories"
+# 清理事务中只在本轮消费内有效的标记：写回快照前剥掉，避免状态残留影响后续判断
+_CLEAR_TASK_RUNTIME_KEYS = frozenset({"_task_key", "_episode_scoped", "_already_notified", "_notified", "_failed_histories"})
 
 
 class SubscriptionCleanup:
@@ -541,9 +543,10 @@ class SubscriptionCleanup:
             return
 
         def updater(data: dict) -> dict:
+            # 写入快照前剥掉运行时标记，避免把「本次消费」的状态残留到后续消费中
             restored_task = {
                 key: value for key, value in task.items()
-                if key != "_task_key"
+                if key not in _CLEAR_TASK_RUNTIME_KEYS
             }
             current_task = data.get(task_key)
             if not current_task:
@@ -623,6 +626,9 @@ class SubscriptionCleanup:
         consumed_task["histories"] = consumed_histories
         # 标记本次为「已定位到具体集」：删除前按目标路径做精确判断，路径不同即照常清理旧版本
         consumed_task["_episode_scoped"] = True
+        # 逐集消费会让同一事务被消费 N 次，通知必须收敛为「每事务一条」，
+        # 否则一次整季洗版会推送上百条重复通知（2026-09-19 评估影响时发现）。
+        consumed_task["_already_notified"] = bool((task or {}).get("_notified"))
         consumed_episodes = sorted(
             set(self._normalize_episode_numbers((task or {}).get("target_episodes"))) & event_episode_set
         )
@@ -631,6 +637,7 @@ class SubscriptionCleanup:
             return consumed_task, None
         remaining_task = dict(task or {})
         remaining_task["histories"] = remaining_histories
+        remaining_task["_notified"] = True
         remaining_episode_set = set()
         for history in remaining_histories:
             remaining_episode_set.update(self._history_episode_numbers(history))
@@ -804,7 +811,7 @@ class SubscriptionCleanup:
             + (f"，同名交由主程序覆盖 {skipped_same_path} 个" if skipped_same_path else "")
             + (f"，跳过刚写入 {skipped_fresh} 个" if skipped_fresh else "")
         )
-        if self._notify:
+        if self._notify and not (task or {}).get("_already_notified"):
             self._notify(
                 f"{(task or {}).get('subscribe_desc', '订阅')} "
                 f"即将开始{mode_label}整理，已处理 {len(histories)} 条整理记录对应的媒体库文件",
