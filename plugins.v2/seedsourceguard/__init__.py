@@ -32,7 +32,7 @@ class SeedSourceGuard(_PluginBase):
     plugin_desc = ("检测本地源文件是否有下载器在做种、下载器是否存在文件丢失的无效做种或"
                    "tracker 全部失败的做种任务；连续N天异常可通知或按策略处置，杜绝无效做种与孤儿文件。")
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/seedsourceguard.png"
-    plugin_version = "1.1.15"
+    plugin_version = "1.1.16"
     plugin_label = "下载管理"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -513,7 +513,7 @@ class SeedSourceGuard(_PluginBase):
                                             "model": "site_offline_alert_days",
                                             "label": "站点长期失联提醒天数",
                                             "type": "number",
-                                            "hint": ("某站点任务普遍连不上、连续达到该天数时发提醒，"
+                                            "hint": ("某站点任务普遍无法正常通告、连续达到该天数时发提醒，"
                                                      "此后每 7 天再提醒一次；只提醒，不做任何处置。"
                                                      "填 0 表示不提醒。"),
                                             "persistent-hint": True,
@@ -531,7 +531,8 @@ class SeedSourceGuard(_PluginBase):
                                             "type": "info",
                                             "variant": "tonal",
                                             "text": ("整站失联判定：该 tracker 域名下任务不少于 3 个，"
-                                                     "且其中 ≥90% 报「连不上站点」。"
+                                                     "且其中 ≥90% 无法正常通告（连不上站点、域名失效、超时、"
+                                                     "证书错误或原因不明）。"
                                                      "达到提醒天数只发通知并在插件页列出，"
                                                      "插件不会自动删除这类种子；恢复到正常通告则自动移出跟踪。"),
                                         },
@@ -896,7 +897,7 @@ class SeedSourceGuard(_PluginBase):
             page.append(_card(
                 f"站点长期失联跟踪（连续 ≥{self._site_offline_alert_days} 天只提醒不处置）",
                 "mdi-alert-decagram-outline", warn, f"{len(site_offline)} 个站", "warning",
-                [_scroll_table(["站点", "连续失联", "连不上/总任务", "起始日期"],
+                [_scroll_table(["站点", "连续失联", "通告失败/总任务", "起始日期"],
                                offline_rows, min_width=900)]
                 + [{"component": "div",
                     "props": {"class": "text-caption text-medium-emphasis mt-2"},
@@ -2026,7 +2027,7 @@ class SeedSourceGuard(_PluginBase):
             for item in site_offline[:5]:
                 lines.append(
                     f"  - {item.get('host', '')}｜连续约 {item.get('days', 0)} 天｜"
-                    f"连不上 {item.get('failed', 0)}/{item.get('total', 0)} 个任务"
+                    f"无法正常通告 {item.get('failed', 0)}/{item.get('total', 0)} 个任务"
                     f"（自 {item.get('first_seen', '')} 起）"
                 )
             if len(site_offline) > 5:
