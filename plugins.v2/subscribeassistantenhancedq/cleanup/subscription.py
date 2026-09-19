@@ -480,7 +480,9 @@ class SubscriptionCleanup:
         if not clear_task:
             return False
         try:
-            if self.clear_transfer_dest_histories(clear_task):
+            if self.clear_transfer_dest_histories(
+                clear_task, target_path=getattr(data, "target_path", None)
+            ):
                 return True
         except Exception as err:
             logger.warning(
@@ -724,8 +726,15 @@ class SubscriptionCleanup:
             return True
         return time.time() - created_at > SUBSCRIPTION_CLEANUP_TTL_SECONDS
 
-    def clear_transfer_dest_histories(self, task) -> bool:
-        """删除清理快照中的媒体库目标文件；空快照也视为已处理。"""
+    def clear_transfer_dest_histories(self, task, target_path=None) -> bool:
+        """删除清理快照中的媒体库目标文件；空快照也视为已处理。
+
+        target_path 为本次整理事件即将写入的目标路径（主程序已算好）。与旧记录路径相同的
+        文件一律不删：那个位置马上会被主程序按目录覆盖模式替换，本插件再去删属于重复动作，
+        且「先查后删」存在竞态——检查时还是旧文件、删除时已被换成新文件，会把刚入库的文件删掉
+        （2026-09-19《超级宝贝JOJO》S01E66 丢失即此因）。委派给主程序替换还避免了依赖文件时间、
+        存储类型（网盘无 inode）、整理方式等差异，换任何环境都成立。
+        """
         histories = (task or {}).get("histories") or []
         mode_label = (task or {}).get("mode_label") or "订阅"
         if histories:
@@ -734,11 +743,22 @@ class SubscriptionCleanup:
         failed_dest_paths = []
         failed_histories = []
         skipped_fresh = 0
+        skipped_same_path = 0
         for history in histories:
             dest_fileitem = history.get("dest_fileitem") if isinstance(history, dict) else None
             if dest_fileitem and self._delete_media_file:
-                # 本次清理只针对快照建立前就存在的旧文件：洗版/重下时新文件可能先落库、
-                # 随后才触发本拦截，若照样删除就会把刚入库的新文件删掉（库内只剩零星集数）。
+                # 第一道（确定性判据）：该记录的目标路径会被本次整理同名覆盖 → 不删，
+                # 交由主程序按目录覆盖模式替换（避免「先查后删」撞上主程序写入的竞态）。
+                if self._will_be_overwritten_by_same_name(history, target_path, task):
+                    skipped_same_path += 1
+                    detail(
+                        f"订阅整理拦截：{mode_label}跳过删除将被同名覆盖的媒体库文件 "
+                        f"{self._fileitem_path(dest_fileitem) or dest_fileitem}"
+                        "（交由主程序按目录覆盖模式替换）"
+                    )
+                    continue
+                # 第二道（启发式兜底）：本次清理只针对快照建立前就存在的旧文件：洗版/重下时
+                # 新文件可能先落库、随后才触发本拦截，若照样删除就会把刚入库的新文件删掉。
                 if self._is_fresh_dest_file(dest_fileitem, task):
                     skipped_fresh += 1
                     detail(
@@ -771,8 +791,9 @@ class SubscriptionCleanup:
             return False
         logger.info(
             f"订阅整理拦截：{(task or {}).get('subscribe_desc', '订阅')} "
-            f"{mode_label}媒体库文件清理完成，目标文件 {dest_file_total - skipped_fresh}/"
-            f"{len(histories)} 个"
+            f"{mode_label}媒体库文件清理完成，目标文件 "
+            f"{dest_file_total - skipped_fresh - skipped_same_path}/{len(histories)} 个"
+            + (f"，同名交由主程序覆盖 {skipped_same_path} 个" if skipped_same_path else "")
             + (f"，跳过刚写入 {skipped_fresh} 个" if skipped_fresh else "")
         )
         if self._notify:
@@ -790,6 +811,40 @@ class SubscriptionCleanup:
         if isinstance(fileitem, dict):
             return fileitem.get("path")
         return None
+
+    @classmethod
+    def _will_be_overwritten_by_same_name(cls, history, target_path, task) -> bool:
+        """判断该旧整理记录的目标路径是否会被本次整理「同名覆盖」（是则不删除）。
+
+        判据分两级，都是确定性比较，不依赖文件时间、inode 或存储类型（远端存储同样成立）：
+        1) 精确：记录目标路径与本次整理事件即将写入的 target_path 完全相同 → 主程序会按目录
+           覆盖模式替换该位置的文件，本插件再去删属于重复动作，且「先查后删」存在竞态
+           （检查时还是旧文件、删除时已换成新文件，会把刚入库的文件删掉）。
+        2) 整季洗版近似：整季洗版一次性消费整批记录，而单个整理事件只带一个 target_path。
+           此时若记录与 target_path 同目录、且记录集号落在本次整理集范围内，说明该集正在被
+           重新整理，同样按「会被同名覆盖」处理。
+        """
+        if not isinstance(history, dict):
+            return False
+        path = cls._fileitem_path(history.get("dest_fileitem")) or history.get("dest")
+        if not path or not target_path:
+            return False
+        try:
+            norm_path = os.path.normpath(str(path))
+            norm_target = os.path.normpath(str(target_path))
+        except Exception as err:  # noqa: BLE001
+            logger.debug(f"订阅整理拦截：比较目标路径失败 {path} / {target_path}：{err}")
+            return False
+        if norm_path == norm_target:
+            return True
+        if (task or {}).get("scene") in {"normal", "best_version_episode"}:
+            # 逐集场景已有精确 target_path，未命中即不走近似判断
+            return False
+        if os.path.dirname(norm_path) != os.path.dirname(norm_target):
+            return False
+        task_episodes = set(cls._normalize_episode_numbers((task or {}).get("target_episodes")))
+        history_episodes = cls._history_episode_numbers(history)
+        return bool(task_episodes and history_episodes and task_episodes & history_episodes)
 
     @staticmethod
     def _is_fresh_dest_file(fileitem, task) -> bool:
