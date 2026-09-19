@@ -615,6 +615,10 @@ class SubscriptionCleanup:
         if not event_episode_set:
             return task, None
         histories = (task or {}).get("histories") or []
+        # 电影记录天然没有集号（或个别记录缺集号）：此时按集拆分无从下手，
+        # 必须退回整批消费，否则这些记录永远匹配不上、旧目标文件只能等 TTL 被放弃清理。
+        if not any(self._history_episode_numbers(history) for history in histories):
+            return task, None
         consumed_histories = []
         remaining_histories = []
         for history in histories:
