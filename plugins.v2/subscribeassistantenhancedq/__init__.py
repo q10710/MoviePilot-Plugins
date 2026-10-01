@@ -152,7 +152,7 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/subscribeassistantenhancedq.png"
     # 插件版本
-    plugin_version = "0.10.35"
+    plugin_version = "0.10.36"
     _site_cache_candidate_helper_warned = False
     # 插件作者
     plugin_author = "Q"
@@ -3263,7 +3263,10 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
         records = self._relocate_records_snapshot() or {}
 
         def _norm(text) -> str:
-            return re.sub(r"[^0-9a-z一-鿿]+", "", str(text or "").lower())
+            # 归一化后去掉前导中文：种子名可能是「永恒族Eternals...」而记录/历史标题是
+            # 「Eternals...」，不去前缀会把正常在管条目误判成残留，天天误报。
+            value = re.sub(r"[^0-9a-z一-鿿]+", "", str(text or "").lower())
+            return re.sub(r"^[^0-9a-z]+", "", value)
 
         try:
             names = [entry.name for entry in os.scandir(relocate_dir) if entry.is_dir()]
