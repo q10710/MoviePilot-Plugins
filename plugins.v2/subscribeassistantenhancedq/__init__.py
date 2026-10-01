@@ -95,6 +95,13 @@ HR_ROUND_GRACE_HOURS = 24
 # _hr_round_clear 属于锁重入（threading.Lock 不可重入），会导致整轮永久卡死。
 RELOCATE_LOCK_TIMEOUT = 30
 
+# 到期且种子已不在任何下载器时，收容记录不再立即移出：连续缺失满该天数才移出，
+# 避免补搜重下、下载器短暂不可见导致记录被误删，收容目录从此无人清理。
+RELOCATE_MISSING_GRACE_DAYS = 7
+
+# 收容目录反查的节流间隔（秒）：目录与记录对不齐时每天兜底核对一次。
+RELOCATE_AUDIT_INTERVAL = 24 * 3600
+
 
 class SummaryPayload(BaseModel):
     """订阅助手概览接口的业务数据模型。"""
@@ -145,7 +152,7 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/subscribeassistantenhancedq.png"
     # 插件版本
-    plugin_version = "0.10.33"
+    plugin_version = "0.10.34"
     _site_cache_candidate_helper_warned = False
     # 插件作者
     plugin_author = "Q"
@@ -1052,6 +1059,7 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
         if self._config.download_monitor_enabled:
             tasks.append(("删除记录清理", self.run_deletes_cleanup))
         tasks.append(("收容到期清理", self._relocate_expired))
+        tasks.append(("收容目录反查", self._relocate_dir_audit))
         tasks.append(("完成快照清理", self.run_completion_snapshot_cleanup))
         tasks.append(("订阅清理事务清理", self.run_subscription_cleanup_expired))
 
@@ -2374,6 +2382,13 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
             if not self._move_torrent_location(instance, torrent_hash, media_dir):
                 logger.warning(f"订阅收容：{record_title} 搬回影视目录 {media_dir} 未成功，本轮保留种子")
                 return RELOCATE_RETAINED
+            # 搬回后核对实际保存目录：接口返回成功但数据仍在收容目录时必须保留收容记录，
+            # 否则记录被移出后，这份数据再也没人按到期清理。
+            actual_dir = self._torrent_save_path(downloader, torrent_hash)
+            if actual_dir and os.path.normpath(actual_dir) == os.path.normpath(relocate_dir):
+                logger.warning(f"订阅收容：{record_title} 搬回影视目录 {media_dir} 未生效"
+                               f"（保存目录仍在收容目录），保留收容记录待下一轮重试")
+                return RELOCATE_RETAINED
             if last_round:
                 # 先进观察期再清收容记录：观察期记录要续用原收容时间与到期点，
                 # 否则期满搬回收容目录时会把「未完成清理」14 天计时重置。
@@ -3091,18 +3106,31 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
                     record["copies_checked_at"] = now.strftime("%Y-%m-%d %H:%M:%S")
                     dirty.add("copies_checked_at")
             if not copies:
-                # 未到期时可能是下载器临时不可用，先保留；到期后仍找不到才移出记录，
-                # 且只有「遍历全部下载器都无报错」才认定种子已不存在，否则保留等下一轮
+                # 未到期时可能是下载器临时不可用，先保留；到期后仍找不到才进入缺失观察，
+                # 且只有「遍历全部下载器都无报错」才认定种子确实不在，否则保留等下一轮
                 deadline_missing = self._parse_datetime_text(record.get("deadline"))
                 if deadline_missing and now >= deadline_missing:
                     if conclusive:
-                        logger.info(f"订阅收容：{record.get('title') or torrent_hash} "
-                                    f"已不在任何下载器，移出收容记录")
-                        drop_record = True
+                        # 到期且确实找不到也不立即丢记录：标记缺失起点，连续满
+                        # RELOCATE_MISSING_GRACE_DAYS 天仍不存在才移出——补搜重下会把任务加回来。
+                        missing_since = self._parse_datetime_text(record.get("missing_since"))
+                        if not missing_since:
+                            record["missing_since"] = now.strftime("%Y-%m-%d %H:%M:%S")
+                            dirty.add("missing_since")
+                            logger.info(f"订阅收容：{record.get('title') or torrent_hash} 已到期且不在任何下载器，"
+                                        f"标记缺失观察（连续 {RELOCATE_MISSING_GRACE_DAYS} 天不存在才移出记录）")
+                        elif (now - missing_since).days >= RELOCATE_MISSING_GRACE_DAYS:
+                            logger.info(f"订阅收容：{record.get('title') or torrent_hash} 已连续 "
+                                        f"{(now - missing_since).days} 天不在任何下载器，移出收容记录")
+                            drop_record = True
                     else:
                         logger.warning(f"订阅收容：{record.get('title') or torrent_hash} 已到期但"
                                        f"下载器状态不可判定，保留收容记录等下一轮重试")
                 return
+            if record.get("missing_since") is not None:
+                # 任务回来了：清掉缺失观察标记，恢复正常到期管理
+                record["missing_since"] = None
+                dirty.add("missing_since")
             # 同一份种子可能有多份副本（自动转移做种 / 辅种）：优先取已完成的那份，
             # 到期按「完成时间 + 站点 H&R 时长」计算；清理时把全部副本一并删除，不留孤儿。
             downloader, raw, _instance, finished, completed_at = picked
@@ -3131,6 +3159,16 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
                 detail(f"订阅收容：{record.get('title') or torrent_hash} 在 "
                        f"{len(copies)} 个下载器均有副本（{'/'.join(name for name, _, _ in copies)}），"
                        f"按{'已完成' if finished else '未完成'}副本计算到期")
+            if not finished and not completed_at and record.get("completed_at"):
+                # 记录里已固化过「下载完成时间」：到期一律从该时间起算。
+                # 防止唯一副本退化成未完成（辅种残留、数据被替换）时，
+                # 把到期点回退到「收容后 14 天」而无限延后清理。
+                fallback_completed = self._parse_datetime_text(record.get("completed_at"))
+                if fallback_completed:
+                    completed_at = fallback_completed
+                    finished = True
+                    logger.info(f"订阅收容：{record.get('title') or torrent_hash} 当前副本未完成但记录已完成，"
+                                f"按完成时间 {record.get('completed_at')} 计算到期")
             if not finished:
                 # 站点 H&R 从下载完成才开始考察，一直下不完的种子不会进入考察，
                 # 因此超过「未完成清理天数」后按「站点不计 H&R」删除任务与文件；未到阈值只跳过
@@ -3202,6 +3240,93 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
         finally:
             self._relocate_record_commit(
                 torrent_hash, {key: record[key] for key in dirty}, drop_record)
+
+    def _relocate_dir_audit(self) -> None:
+        """收容目录反查：目录里有、但收容记录里没有的种子补登记；反查不到的只上报。
+
+        到期清理只遍历收容记录、不会扫目录，所以记录一旦丢失（搬回后误移出、
+        下载器短暂不可见被移出），目录里的数据会永远无人清理。这里每天兜底一次：
+        1) 目录名能对上现有记录 → 正常；
+        2) 能从下载历史反查到 hash 且任务仍在某个下载器 → 补登记，纳入正常到期清理；
+        3) 反查不到任务 → 列入残留上报（只通知不删除，删除交人工确认）。
+        """
+        cfg = self._config
+        relocate_dir = str(getattr(cfg, "relocate_dir", "") or "").strip() if cfg else ""
+        if not relocate_dir or not os.path.isdir(relocate_dir):
+            return
+        try:
+            last = float(self.get_data("relocate_audit_at") or 0)
+        except (TypeError, ValueError):
+            last = 0.0
+        if time.time() - last < RELOCATE_AUDIT_INTERVAL:
+            return
+        records = self._relocate_records_snapshot() or {}
+
+        def _norm(text) -> str:
+            return re.sub(r"[^0-9a-z一-鿿]+", "", str(text or "").lower())
+
+        try:
+            names = [entry.name for entry in os.scandir(relocate_dir) if entry.is_dir()]
+        except Exception as err:
+            logger.warning(f"订阅收容反查：读取收容目录失败 {relocate_dir}：{err}")
+            return
+        known_titles = {
+            _norm(value.get("title"))
+            for value in records.values()
+            if isinstance(value, dict) and value.get("title")
+        }
+        unmatched = [name for name in names if _norm(name) not in known_titles]
+        # 标题 → hash 索引：来自订阅下载历史与删除记录（收容种子都源于订阅下载）
+        index = {}
+        for data_key in ("torrents", "deletes"):
+            blob = self.get_data(data_key) or {}
+            if not isinstance(blob, dict):
+                continue
+            for item_hash, info in blob.items():
+                if isinstance(info, dict) and info.get("title"):
+                    index.setdefault(_norm(info["title"]), (item_hash, info.get("downloader")))
+        registered, orphan = [], []
+        for name in unmatched:
+            key = _norm(name)
+            hit = index.get(key)
+            if not hit and len(key) >= 20:
+                candidates = [
+                    value for candidate, value in index.items()
+                    if len(candidate) >= 20
+                    and (candidate.startswith(key[:20]) or key.startswith(candidate[:20]))
+                ]
+                hit = candidates[0] if len(candidates) == 1 else None
+            if not hit:
+                orphan.append(name)
+                continue
+            item_hash, preferred = hit
+            if item_hash in records:
+                continue
+            downloader = self._find_torrent_downloader(item_hash, preferred=preferred)
+            if not downloader:
+                orphan.append(name)
+                continue
+            entry = self._register_relocate_record(
+                downloader, item_hash, None, {"title": name}, 0)
+            registered.append(name)
+            logger.info(f"订阅收容反查：{name} 无收容记录，已补登记"
+                        f"（下载器 {downloader}，到期 {entry.get('deadline')}）")
+        # 无论是否有发现都推进节流时间，避免空目录时每轮扫描
+        self.save_data("relocate_audit_at", time.time())
+        if registered or orphan:
+            lines = []
+            if registered:
+                lines.append("已补登记：" + "、".join(registered))
+            if orphan:
+                lines.append("无记录且未找到任务（残留，待人工确认）：" + "、".join(orphan))
+            if getattr(cfg, "notify", True):
+                try:
+                    self.post_message(
+                        title="【订阅收容反查】",
+                        text="\n".join(lines) + f"\n收容目录：{relocate_dir}",
+                    )
+                except Exception as err:
+                    logger.debug(f"订阅收容反查：通知发送失败：{err}")
 
     def _relocate_records_snapshot(self) -> dict:
         """在收容锁内取收容记录快照；取锁超时返回空字典（本轮跳过）。"""
