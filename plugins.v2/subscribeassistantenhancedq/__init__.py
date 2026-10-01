@@ -152,7 +152,7 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/subscribeassistantenhancedq.png"
     # 插件版本
-    plugin_version = "0.10.36"
+    plugin_version = "0.10.37"
     _site_cache_candidate_helper_warned = False
     # 插件作者
     plugin_author = "Q"
@@ -2385,7 +2385,13 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
             # 搬回后核对实际保存目录：接口返回成功但数据仍在收容目录时必须保留收容记录，
             # 否则记录被移出后，这份数据再也没人按到期清理。
             actual_dir = self._torrent_save_path(downloader, torrent_hash)
-            if actual_dir and os.path.normpath(actual_dir) == os.path.normpath(relocate_dir):
+            if not actual_dir:
+                # 读不到实际路径（下载器瞬断/任务刚消失）无法证明已离开收容目录：
+                # 保守保留记录，到期清理会跨下载器确认、连续 7 天找不到才移出，绝不因此丢记录。
+                logger.warning(f"订阅收容：{record_title} 搬回影视目录 {media_dir} 后读不到实际保存目录，"
+                               f"保留收容记录待下一轮核对")
+                return RELOCATE_RETAINED
+            if os.path.normpath(actual_dir) == os.path.normpath(relocate_dir):
                 logger.warning(f"订阅收容：{record_title} 搬回影视目录 {media_dir} 未生效"
                                f"（保存目录仍在收容目录），保留收容记录待下一轮重试")
                 return RELOCATE_RETAINED
@@ -3246,8 +3252,9 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
 
         到期清理只遍历收容记录、不会扫目录，所以记录一旦丢失（搬回后误移出、
         下载器短暂不可见被移出），目录里的数据会永远无人清理。这里每天兜底一次：
-        1) 目录名能对上现有记录 → 正常；
-        2) 能从下载历史反查到 hash 且任务仍在某个下载器 → 补登记，纳入正常到期清理；
+        1) 目录名能对上现有记录（相等 / 双向包含 / 同前 20 字符）→ 在管，不误报；
+        2) 对不上的先按「各下载器里保存在收容目录的实际任务」反查，再用插件
+           下载/删除索引兜底；唯一命中且任务确实在收容目录 → 补登记纳入正常到期清理；
         3) 反查不到任务 → 列入残留上报（只通知不删除，删除交人工确认）。
         """
         cfg = self._config
@@ -3268,6 +3275,31 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
             value = re.sub(r"[^0-9a-z一-鿿]+", "", str(text or "").lower())
             return re.sub(r"^[^0-9a-z]+", "", value)
 
+        def _related(left: str, right: str) -> bool:
+            # 目录名多是整季名，记录/任务名常带集数（S01 对 S01E407），精确相等必然漏；
+            # 用「相等 / 双向包含 / 同前 20 字符」对齐。包含只对足够长的标题生效、
+            # 前缀要求双方都够长，避免短词串门把无关条目判成在管。
+            if not left or not right:
+                return False
+            if left == right:
+                return True
+            if min(len(left), len(right)) >= 12 and (left in right or right in left):
+                return True
+            return len(left) >= 20 and len(right) >= 20 and left[:20] == right[:20]
+
+        def _raw_value(raw, *keys) -> str:
+            for key in keys:
+                if isinstance(raw, dict):
+                    value = raw.get(key)
+                else:
+                    try:
+                        value = getattr(raw, key, None)
+                    except Exception:
+                        value = None
+                if value:
+                    return str(value).strip()
+            return ""
+
         try:
             names = [entry.name for entry in os.scandir(relocate_dir) if entry.is_dir()]
         except Exception as err:
@@ -3278,7 +3310,10 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
             for value in records.values()
             if isinstance(value, dict) and value.get("title")
         }
-        unmatched = [name for name in names if _norm(name) not in known_titles]
+        unmatched = [
+            name for name in names
+            if not any(_related(_norm(name), title) for title in known_titles)
+        ]
         # 标题 → hash 索引：来自订阅下载历史与删除记录（收容种子都源于订阅下载）
         index = {}
         for data_key in ("torrents", "deletes"):
@@ -3288,26 +3323,73 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
             for item_hash, info in blob.items():
                 if isinstance(info, dict) and info.get("title"):
                     index.setdefault(_norm(info["title"]), (item_hash, info.get("downloader")))
-        registered, orphan = [], []
+        # 反查源二：各下载器当前任务，只收保存目录在收容目录内的。任务名就是目录名的
+        # 来源，天然可信；限定收容目录可排除「同名任务其实在别的目录」的误登记
+        # （例如雷神2 的任务在 tr 的外语电影目录，hr 里那份是无任务残留）。
+        hr_norm = os.path.normpath(relocate_dir)
+        hr_tasks: Dict[str, List[Tuple[str, str]]] = {}
+        if self._downloader_helper:
+            try:
+                services = self._downloader_helper.get_services() or {}
+            except Exception as err:
+                logger.debug(f"订阅收容反查：获取下载器列表失败：{err}")
+                services = {}
+            for dl_name in services.keys():
+                try:
+                    service = self._downloader_helper.get_service(name=dl_name)
+                    instance = getattr(service, "instance", None) if service else None
+                    if not instance:
+                        continue
+                    torrents, error = instance.get_torrents()
+                except Exception as err:
+                    logger.debug(f"订阅收容反查：枚举下载器 {dl_name} 任务失败：{err}")
+                    continue
+                if error:
+                    continue
+                for raw in torrents or []:
+                    task_name = _raw_value(raw, "name")
+                    task_hash = _raw_value(raw, "hash", "hashString").lower()
+                    task_path = os.path.normpath(
+                        _raw_value(raw, "save_path", "download_dir", "downloadDir") or "")
+                    if not task_name or not task_hash or not task_path:
+                        continue
+                    if task_path != hr_norm and not task_path.startswith(hr_norm + os.sep):
+                        continue
+                    hr_tasks.setdefault(_norm(task_name), []).append((task_hash, dl_name))
+        registered, orphan, ambiguous = [], [], []
         for name in unmatched:
             key = _norm(name)
-            hit = index.get(key)
-            if not hit and len(key) >= 20:
-                candidates = [
-                    value for candidate, value in index.items()
-                    if len(candidate) >= 20
-                    and (candidate.startswith(key[:20]) or key.startswith(candidate[:20]))
-                ]
-                hit = candidates[0] if len(candidates) == 1 else None
-            if not hit:
+            # 源二优先：收容目录内的实际任务，按宽松关系匹配
+            hits: Dict[str, str] = {}
+            for task_key, entries in hr_tasks.items():
+                if _related(key, task_key):
+                    for item_hash, dl_name in entries:
+                        hits.setdefault(item_hash, dl_name)
+            # 源一兜底：插件下载/删除索引反查 hash；仍须确认任务当前确实在收容目录内
+            if not hits:
+                hit = index.get(key)
+                if not hit and len(key) >= 20:
+                    related = [
+                        value for candidate, value in index.items()
+                        if len(candidate) >= 20
+                        and (candidate.startswith(key[:20]) or key.startswith(candidate[:20]))
+                    ]
+                    hit = related[0] if len(related) == 1 else None
+                if hit:
+                    item_hash, preferred = hit
+                    downloader = self._find_torrent_downloader(item_hash, preferred=preferred)
+                    actual = self._torrent_save_path(downloader, item_hash) if downloader else ""
+                    actual_norm = os.path.normpath(actual) if actual else ""
+                    if actual_norm == hr_norm or actual_norm.startswith(hr_norm + os.sep):
+                        hits.setdefault(item_hash, downloader)
+            if not hits:
                 orphan.append(name)
                 continue
-            item_hash, preferred = hit
+            if len(hits) > 1:
+                ambiguous.append(name)
+                continue
+            item_hash, downloader = next(iter(hits.items()))
             if item_hash in records:
-                continue
-            downloader = self._find_torrent_downloader(item_hash, preferred=preferred)
-            if not downloader:
-                orphan.append(name)
                 continue
             entry = self._register_relocate_record(
                 downloader, item_hash, None, {"title": name}, 0)
@@ -3316,10 +3398,12 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
                         f"（下载器 {downloader}，到期 {entry.get('deadline')}）")
         # 无论是否有发现都推进节流时间，避免空目录时每轮扫描
         self.save_data("relocate_audit_at", time.time())
-        if registered or orphan:
+        if registered or orphan or ambiguous:
             lines = []
             if registered:
                 lines.append("已补登记：" + "、".join(registered))
+            if ambiguous:
+                lines.append("匹配到多个收容任务，未自动登记（待人工确认）：" + "、".join(ambiguous))
             if orphan:
                 lines.append("无记录且未找到任务（残留，待人工确认）：" + "、".join(orphan))
             if getattr(cfg, "notify", True):
