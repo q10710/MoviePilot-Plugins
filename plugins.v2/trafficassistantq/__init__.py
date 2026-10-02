@@ -46,7 +46,7 @@ class TrafficAssistantQ(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/trafficassistantq.png"
     # 插件版本
-    plugin_version = "2.0.6"
+    plugin_version = "2.0.7"
     # 插件作者
     plugin_author = "Q"
     # 作者主页
@@ -616,7 +616,8 @@ class TrafficAssistantQ(_PluginBase):
             }
 
     def get_page(self) -> List[dict]:
-        return None
+        """不提供详情页，函数体保持占位使框架判定 has_page=False，点击卡片直接进入配置页。"""
+        pass
 
     def get_service(self) -> List[Dict[str, Any]]:
         """
