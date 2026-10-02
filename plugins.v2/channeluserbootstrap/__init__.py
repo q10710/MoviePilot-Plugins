@@ -63,7 +63,7 @@ CHANNEL_USERID_KEYS: Dict[str, Tuple[Tuple[str, ...], ...]] = {
                ("event", "sender", "sender_id", "open_id"),
                ("event", "operator", "operator_id", "open_id"),
                ("sender", "sender_id", "user_id"), ("open_id",), ("user_id",)),
-    "slack": (("event", "user"), ("user",), ("event", "bot_id")),
+    "slack": (("event", "user"), ("user",)),
     "discord": (("d", "author", "id"), ("author", "id"), ("d", "user_id")),
     "qq": (("d", "author", "id"), ("author", "id"), ("d", "user_openid"), ("user_openid",)),
     "vocechat": (("from_uid",), ("from_user", "uid"), ("user_id",)),
@@ -81,6 +81,7 @@ GENERIC_USERID_KEYS: Tuple[str, ...] = (
 # 明显不是用户 id 的取值（避免把机器人自身或会话 id 当成用户）
 EXCLUDED_KEYS: Tuple[str, ...] = (
     "ToUserName", "to_user_id", "chat_id", "chatid", "chatId",
+    "bot_id", "botId",
     "conversation_id", "conversationId", "message_id", "msgId", "msg_id",
 )
 
@@ -95,6 +96,7 @@ DEFAULT_PERMISSIONS = {
 DATA_CREATED = "created_users"
 DATA_CACHE = "seen_bindings"
 DATA_RATE = "rate_window"
+DATA_CACHE_VER = "seen_bindings_ver"
 
 
 class ChannelUserBootstrap(_PluginBase):
@@ -103,7 +105,7 @@ class ChannelUserBootstrap(_PluginBase):
     plugin_name = "渠道用户自动建号Q自用版"
     plugin_desc = "其他渠道账号首次发消息时，自动按渠道 userid 创建 MoviePilot 普通用户并完成绑定，使其能正常使用查询、搜索、订阅。"
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/channeluserbootstrap.png"
-    plugin_version = "1.0.3"
+    plugin_version = "1.0.4"
     plugin_label = "系统设置"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -126,6 +128,7 @@ class ChannelUserBootstrap(_PluginBase):
         self._channels = []
         self._hourly_limit = 20
         self._user_oper = UserOper()
+        self._migrate_cache()
         if not config:
             return
         self._enabled = bool(config.get("enabled"))
@@ -147,6 +150,20 @@ class ChannelUserBootstrap(_PluginBase):
     def get_state(self) -> bool:
         """返回插件启用状态。"""
         return self._enabled
+
+    def _migrate_cache(self) -> None:
+        """绑定缓存一次性失效：1.0.4 起缓存只写「真实渠道绑定」。
+
+        旧版本曾把「同名账号」也写进缓存，升级后若沿用会绕过新的绑定校验，
+        因此缓存结构版本变化时清空一次，首条消息按新规则重建（代价仅一次全表扫描）。
+        """
+        try:
+            if str(self.get_data(DATA_CACHE_VER) or "") == self.plugin_version:
+                return
+            self.save_data(DATA_CACHE, {})
+            self.save_data(DATA_CACHE_VER, self.plugin_version)
+        except Exception as err:
+            logger.debug(f"渠道用户自动建号：绑定缓存迁移失败：{err}")
 
     def get_module(self) -> Dict[str, Any]:
         """向宿主注册模块方法：消息解析前置钩子。"""
@@ -510,7 +527,8 @@ class ChannelUserBootstrap(_PluginBase):
         if not self._enabled:
             return None
         try:
-            userid, channel_type = self._extract_userid(source=source, body=body, args=args)
+            userid, channel_type = self._extract_userid(source=source, body=body,
+                                                        form=form, args=args)
             if not userid or not channel_type:
                 logger.debug(
                     f"渠道用户自动建号：未能识别渠道用户（source={source}），"
@@ -525,14 +543,17 @@ class ChannelUserBootstrap(_PluginBase):
         return None
 
     def _extract_userid(self, source: Optional[str], body: Any,
-                        args: Any = None) -> Tuple[Optional[str], Optional[str]]:
+                        form: Any = None, args: Any = None) -> Tuple[Optional[str], Optional[str]]:
         """从消息原始内容中提取 (渠道用户ID, 渠道类型)。
 
-        先按明文解析（JSON / XML）；企业微信等渠道使用加密回调时，报文是密文，
-        此处按渠道密钥解密后再次解析，保证加密渠道同样能识别用户。
+        先按明文解析（JSON / XML，body 优先、form 兜底）；企业微信等渠道使用
+        加密回调时，报文是密文，此处按渠道密钥解密后再次解析，保证加密渠道同样
+        能识别用户。
         """
         channel_type = self._detect_channel_type(source)
         payload = self._load_payload(body)
+        if payload is None:
+            payload = self._load_payload(form)
         if payload is not None:
             channel_type = channel_type or self._infer_channel_type(payload)
             userid = self._collect_userid(payload, channel_type, source=source)
@@ -841,6 +862,7 @@ class ChannelUserBootstrap(_PluginBase):
         if not created:
             # 并发请求已建好同一账号：仅复用，不再记录与通知
             return username
+        self._count_new_user()
         self._record_created(channel_type, userid, username)
         logger.info(
             f"渠道用户自动建号：{channel_type}/{userid} → {username}"
@@ -850,7 +872,12 @@ class ChannelUserBootstrap(_PluginBase):
         return username
 
     def _resolve_existing(self, binding_key: str, userid: str) -> Optional[str]:
-        """判断该渠道用户是否已有绑定或同名账号。"""
+        """判断该渠道用户是否已有同渠道的绑定账号。
+
+        只认「本渠道 userid 绑定」这一种关系：仅同名但没有绑定的本地账号一律不复用，
+        避免渠道侧可自选的 ID（如 SynologyChat 用户名）恰好撞上本地账号名时被免密接管。
+        未绑定的同名账号由 _unique_name 生成唯一名称另建新号。
+        """
         cache = self.get_data(DATA_CACHE) or {}
         cached = cache.get(f"{binding_key}:{userid}")
         if cached:
@@ -865,9 +892,6 @@ class ChannelUserBootstrap(_PluginBase):
             if getattr(user, "is_active", True) and str(settings.get(binding_key) or "") == userid:
                 self._remember_binding(binding_key, userid, user.name)
                 return user.name
-            if str(getattr(user, "name", "")) == userid:
-                self._remember_binding(binding_key, userid, user.name)
-                return user.name
         return None
 
     def _remember_binding(self, binding_key: str, userid: str, username: str) -> None:
@@ -879,7 +903,17 @@ class ChannelUserBootstrap(_PluginBase):
         self.save_data(DATA_CACHE, cache)
 
     def _allow_new_user(self) -> bool:
-        """按每小时上限限制建号频率。"""
+        """按每小时上限检查是否允许建号（只读检查，成功建号后由 _count_new_user 计数）。"""
+        window = self.get_data(DATA_RATE) or {}
+        now = time.time()
+        started = float(window.get("start") or 0)
+        count = int(window.get("count") or 0)
+        if not started or now - started >= 3600:
+            return True
+        return count < self._hourly_limit
+
+    def _count_new_user(self) -> None:
+        """仅在实际创建账号成功后计入限流窗口，避免解析/建号失败白白消耗额度。"""
         window = self.get_data(DATA_RATE) or {}
         now = time.time()
         started = float(window.get("start") or 0)
@@ -887,11 +921,8 @@ class ChannelUserBootstrap(_PluginBase):
         if not started or now - started >= 3600:
             window = {"start": now, "count": 0}
             count = 0
-        if count >= self._hourly_limit:
-            return False
         window["count"] = count + 1
         self.save_data(DATA_RATE, window)
-        return True
 
     def _create_user(self, binding_key: str, userid: str) -> Tuple[Optional[str], bool]:
         """按渠道用户ID创建普通用户并写入绑定，返回 (用户名, 是否本次新建)。"""
