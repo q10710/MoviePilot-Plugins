@@ -11,9 +11,11 @@
 安全设计：下载器连接失败时本轮直接跳过对应下载器，绝不把任何文件误判为孤儿；
 红种占做种数达 80% 阈值时判定站点/网络级故障，自动保护不处置；
 整站失联（该站全部种子都连不上、并经站点连通性二次验证确认）时不计红种、不处置，
-改为每 7 天提醒一次，由用户自行决定是否清理。
+改为每 7 天提醒一次；可选开启「整站失联超期删除」，连续失联达到自定义天数后
+删除该站全部种子任务（源文件仍被其它正常种子覆盖则只删任务保留文件）。
 """
 
+import json
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -35,7 +37,7 @@ class SeedSourceGuard(_PluginBase):
     plugin_desc = ("检测本地源文件是否有下载器在做种、下载器是否存在文件丢失的无效做种或"
                    "tracker 全部失败的做种任务；连续N天异常可通知或按策略处置，杜绝无效做种与孤儿文件。")
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/seedsourceguard.png"
-    plugin_version = "1.1.17"
+    plugin_version = "1.1.18"
     plugin_label = "下载管理"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -63,6 +65,10 @@ class SeedSourceGuard(_PluginBase):
     _skip_unreachable: bool = True
     # 整站失联提醒：连续失联达到该天数后开始提醒，此后每 7 天再提醒一次（0 表示不提醒）
     _site_offline_alert_days: int = 7
+    # 整站失联超期删除：独立开关（默认关闭）；开启后连续失联达到设定天数即删除该站全部种子任务
+    _site_offline_delete: bool = False
+    # 整站失联超期删除天数：0 表示永不删除（仅提醒）；填 30/50 等自定义天数
+    _site_offline_delete_days: int = 0
 
     # 红种做种保护：单下载器红种占做种候选数比例达标时视为站点/网络故障，本轮只通知不处置
     _RED_PROTECT_RATIO: float = 0.8
@@ -149,6 +155,13 @@ class SeedSourceGuard(_PluginBase):
                                                        or self._site_offline_alert_days))
         except (TypeError, ValueError):
             self._site_offline_alert_days = 7
+        # 整站失联超期删除：独立开关，默认关闭；关闭时维持只提醒不处置
+        self._site_offline_delete = bool(config.get("site_offline_delete"))
+        # 超期天数自定义（30/50 等），0 或不填 = 永不删除只提醒
+        try:
+            self._site_offline_delete_days = max(0, int(config.get("site_offline_delete_days") or 0))
+        except (TypeError, ValueError):
+            self._site_offline_delete_days = 0
 
     @staticmethod
     def _build_cron(times: int) -> str:
@@ -477,7 +490,8 @@ class SeedSourceGuard(_PluginBase):
                             "variant": "tonal",
                             "text": ("安全规则：下载器连接失败或取不到任务列表时，本轮自动跳过该下载器，"
                                      "绝不会把任何文件判为孤儿；整站失联豁免开启时，"
-                                     "该站种子全部连不上且站点二次验证不可达的，不计轮次也不处置；"
+                                     "该站种子全部连不上且站点二次验证不可达的，不计红种轮次、不按红种删除"
+                                     "（是否超期后整站删除由「整站失联超期删除」开关单独控制）；"
                                      "红种占做种数达 80% 阈值时自动保护不处置。"
                                      "删除/移动类处置要求：连续 N 次扫描仍异常（按实际扫描轮次累计，关机/停用期不计数） + 本页开关已打开。"),
                         },
@@ -495,8 +509,8 @@ class SeedSourceGuard(_PluginBase):
                                             "model": "skip_unreachable",
                                             "label": "整站失联豁免（建议开启）",
                                             "hint": ("某站的种子全部连不上、且直接访问该站点域名也不可达时，"
-                                                     "判定为整站失联：该站全部种子不计入红种轮次、不执行删除，"
-                                                     "改为按下方天数定期提醒；站点恢复后继续累计已有轮次。"
+                                                     "判定为整站失联：该站全部种子不计入红种轮次、不按红种删除，"
+                                                     "改为按下方天数定期提醒（可再开启「整站失联超期删除」）；站点恢复后继续累计已有轮次。"
                                                      "站点能访问（仅部分种子连不上，或站点回「无此种子」、403/405 等）"
                                                      "一律照常算红种。"),
                                             "persistent-hint": True,
@@ -520,7 +534,8 @@ class SeedSourceGuard(_PluginBase):
                                             "label": "整站失联提醒天数",
                                             "type": "number",
                                             "hint": ("整站失联连续达到该天数后发第一次提醒，"
-                                                     "之后每 7 天提醒一次；只提醒，不做任何处置。"
+                                                     "之后每 7 天提醒一次；本项只管提醒节奏，"
+                                                     "是否到天数自动删除由下方「整站失联超期删除」开关控制。"
                                                      "填 0 表示不提醒。"),
                                             "persistent-hint": True,
                                         },
@@ -539,8 +554,65 @@ class SeedSourceGuard(_PluginBase):
                                             "text": ("整站失联判定（两级）：① 该 tracker 域名下做种任务不少于 3 个，"
                                                      "且其中 ≥90% 报「连不上站点」；② 再直接访问该站点域名，"
                                                      "确认也不可达。两级都成立才豁免并进入跟踪。"
-                                                     "达到提醒天数后只发通知并在插件页列出，插件不会自动删除这类种子；"
-                                                     "站点恢复可达则自动移出跟踪。"),
+                                                     "达到提醒天数后只发通知并在插件页列出；"
+                                                     "站点恢复可达则自动移出跟踪。"
+                                                     "如需到设定天数后自动清理该站种子，请开启下方「整站失联超期删除」。"),
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "site_offline_delete",
+                                            "label": "整站失联超期删除（默认关闭）",
+                                            "hint": ("开启后，某站连续失联达到下方设定天数，"
+                                                     "自动删除该站全部种子任务；源文件仍被其它正常种子覆盖则只删任务保留文件，"
+                                                     "无任何正常种子覆盖时连同源文件一起删除。"),
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "site_offline_delete_days",
+                                            "label": "整站失联超期删除天数",
+                                            "type": "number",
+                                            "hint": ("连续失联达到该天数后删除该站全部种子；"
+                                                     "想填 30 就 30、想填 60 就 60；填 0 表示永不删除，只提醒。"),
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VAlert",
+                                        "props": {
+                                            "type": "warning",
+                                            "variant": "tonal",
+                                            "text": ("与红种删除同一口径：只删该站自己的种子任务，别的站正常种子一律不动；"
+                                                     "源文件只要还有任一种子在做种就不删文件。"
+                                                     "删除前自动备份清单到临时目录，日志可回查。"
+                                                     "仍受「允许执行删除/移动处置」总开关控制。"),
                                         },
                                     }
                                 ],
@@ -565,6 +637,8 @@ class SeedSourceGuard(_PluginBase):
             "allow_delete": False,
             "skip_unreachable": True,
             "site_offline_alert_days": 7,
+            "site_offline_delete": False,
+            "site_offline_delete_days": 0,
         }
 
     def get_page(self) -> Optional[List[dict]]:
@@ -877,7 +951,11 @@ class SeedSourceGuard(_PluginBase):
                 ],
             } for item in red_exempt[:max_rows]]
             page.append(_card(
-                "整站失联豁免（该站种子全部连不上且站点不可达，不计红种也不处置）",
+                ("整站失联豁免（该站种子全部连不上且站点不可达，不计红种"
+                 + (f"；满 {self._site_offline_delete_days} 天整站删除"
+                    if self._site_offline_delete and self._site_offline_delete_days > 0
+                    else "，当前不处置")
+                 + "）"),
                 "mdi-lan-disconnect", info_c, f"{len(red_exempt)} 项", "info",
                 [_scroll_table(["下载器", "种子", "失败原因"], exempt_rows, min_width=900)]
                 + [{"component": "div",
@@ -892,29 +970,68 @@ class SeedSourceGuard(_PluginBase):
             ))
 
         if site_offline:
+            try:
+                from app.db.oper.site import SiteOper
+                _sites = SiteOper().list() or []
+            except Exception:
+                _sites = []
+
+            def _site_disp(host: str) -> Tuple[str, str]:
+                """tracker 域名匹配站点，返回（站点名, 站点域名）；匹配不上时两者都显示该域名。"""
+                h = (host or "").lower()
+                best_label, best_site = "", None
+                for _s in _sites:
+                    _d = (getattr(_s, "domain", "") or "").lower()
+                    for _label in _d.split("."):
+                        if len(_label) >= 4 and _label in h and len(_label) > len(best_label):
+                            best_label, best_site = _label, _s
+                if best_site is not None:
+                    return (getattr(best_site, "name", "") or best_label,
+                            getattr(best_site, "domain", "") or h)
+                return h or "-", h or "-"
+
             offline_rows = [{
                 "component": "tr",
                 "content": [
                     {"component": "td", "props": {"class": "text-body-2"},
-                     "text": item.get("host", "") or "-"},
+                     "content": [
+                         {"component": "VChip",
+                          "props": {"size": "x-small", "variant": "tonal",
+                                    "color": "warning", "class": "mr-1"},
+                          "text": _site_disp(item.get("host", ""))[0]},
+                         {"component": "VChip",
+                          "props": {"size": "x-small", "variant": "outlined",
+                                    "color": "grey"},
+                          "text": _site_disp(item.get("host", ""))[1]},
+                     ]},
                     {"component": "td", "props": {"class": "text-caption"},
-                     "text": f"{item.get('days', 0)} 天（{item.get('rounds', 0)} 次扫描）"},
+                     "text": str(item.get("failed", 0))},
                     {"component": "td", "props": {"class": "text-caption"},
-                     "text": f"{item.get('failed', 0)}/{item.get('total', 0)}"},
-                    {"component": "td", "props": {"class": "text-caption"},
-                     "text": item.get("first_seen", "") or "-"},
+                     "text": f"{item.get('days', 0)} 天"},
                 ],
             } for item in site_offline[:max_rows]]
+            _offline_hint = (
+                "判定依据：该站做种任务 ≥90% 连不上，且直接访问站点域名同样不可达"
+                "（两级都成立才计入）。"
+            )
+            if self._site_offline_delete and self._site_offline_delete_days > 0:
+                _offline_hint += (f"已开启超期删除：连续失联满 {self._site_offline_delete_days} 天后，"
+                                  "自动删除该站全部种子任务；源文件仍被其它正常种子覆盖则只删任务保留文件，"
+                                  "无任何正常种子覆盖时连同源文件一起删除。")
+            else:
+                _offline_hint += ("当前仅在此列出并每 7 天提醒一次，不处置；"
+                                  "确认站点已废弃后可自行清理对应种子，或开启「整站失联超期删除」。")
             page.append(_card(
-                f"整站失联跟踪（连续 ≥{self._site_offline_alert_days} 天起每 7 天提醒，不处置）",
+                (f"整站失联跟踪（连续 ≥{self._site_offline_alert_days} 天起每 7 天提醒"
+                 + (f"，满 {self._site_offline_delete_days} 天自动删除"
+                    if self._site_offline_delete and self._site_offline_delete_days > 0 else "，不处置")
+                 + "）"),
                 "mdi-alert-decagram-outline", warn, f"{len(site_offline)} 个站", "warning",
-                [_scroll_table(["站点", "连续失联", "连不上/总任务", "起始日期"],
-                               offline_rows, min_width=900)]
+                [_scroll_table(["站点", "失联种子数", "连续失联"],
+                               offline_rows, min_width=640)]
                 + [{"component": "div",
                     "props": {"class": "text-caption text-medium-emphasis mt-2"},
-                    "text": ("判定依据：该站做种任务 ≥90% 连不上，且直接访问站点域名同样不可达"
-                             "（两级都成立才计入）。这类站点对本地文件不做任何处置，"
-                             "仅在此列出并每 7 天提醒一次；确认站点已废弃后可自行清理对应种子。")}],
+                    "text": _offline_hint}],
             ))
 
         unavail_rows = [{
@@ -1664,6 +1781,12 @@ class SeedSourceGuard(_PluginBase):
                 if handled.get("disposed"):
                     days_data.pop(key, None)
 
+        # 整站失联超期删除：独立开关；连续失联达到设定天数后删除该站全部种子任务。
+        # 与红种同口径：只删该站自己的种子任务，别的站正常种子一律不动；
+        # 源文件仍被任一正常做种任务覆盖则只删任务保留文件，无任何正常覆盖时连同源文件删除。
+        handled_list.extend(self._handle_site_offline_expiry(
+            site_tracking, exempt_red, handle, healthy_roots))
+
         # 清理已恢复的旧记录（保留当前仍异常项的天数历史）
         for prefix in ("no_seed:", "invalid:", "red:"):
             for old_key in [k for k in days_data if k.startswith(prefix)]:
@@ -1842,11 +1965,14 @@ class SeedSourceGuard(_PluginBase):
         for host in [h for h in stored if h not in offline_now]:
             stored.pop(host, None)
         if alerts:
+            _mode = (f"超期 {self._site_offline_delete_days} 天将自动删除"
+                     if self._site_offline_delete and self._site_offline_delete_days > 0
+                     else "仅提醒不处置")
             logger.warning(
                 f"站点长期失联提醒：{len(alerts)} 个站点连续失联已达 "
                 f"{self._site_offline_alert_days} 天以上（"
                 + "、".join(f"{a['host']}({a['days']}天)" for a in alerts[:5])
-                + "），仅提醒不处置"
+                + f"），{_mode}"
             )
         self.save_data("site_offline", stored)
         tracking = [
@@ -2021,6 +2147,84 @@ class SeedSourceGuard(_PluginBase):
 
     # ── 落盘与通知 ────────────────────────────────────────────
 
+    def _handle_site_offline_expiry(self, site_tracking: List[Dict[str, Any]],
+                                    exempt_red: Dict[str, Any],
+                                    handle: bool,
+                                    healthy_roots: Optional[List[str]] = None,
+                                    ) -> List[Dict[str, Any]]:
+        """整站失联超期删除：连续失联达到设定天数后删除该站全部种子任务。
+
+        与红种处置同一口径：只删除该站（host 匹配）自己的种子任务，其它站正常种子不受影响；
+        源文件仍被任一正常做种任务覆盖（root 命中 healthy_roots）则只删任务保留文件，
+        无任何正常种子覆盖时删除任务并连同源文件一起删除。
+        删除前把本批清单备份到临时目录，日志记录便于回查。返回本轮处置记录列表。
+        """
+        results: List[Dict[str, Any]] = []
+        if not (self._site_offline_delete and self._site_offline_delete_days > 0):
+            return results
+        if not handle or not self._allow_delete or not site_tracking or not exempt_red:
+            return results
+        due_hosts = {
+            e.get("host", "") for e in site_tracking
+            if str(e.get("host", "")) and float(e.get("days") or 0) >= self._site_offline_delete_days
+        }
+        if not due_hosts:
+            return results
+        # 收集每个超期站点名下（host 精确匹配）的红种豁免任务
+        targets: List[Tuple[str, Dict[str, Any]]] = [
+            (host, item) for host in due_hosts
+            for item in exempt_red.values() if item.get("host") == host
+        ]
+        if not targets:
+            return results
+        # 删除前备份清单到临时目录（含每项的删除文件判定）
+        try:
+            backup_items = []
+            for host, item in targets:
+                root = str(item.get("root") or "").rstrip("/")
+                delete_file = not (healthy_roots and root and root in healthy_roots)
+                backup_items.append({
+                    "host": host, "downloader": item.get("dl", ""),
+                    "hash": item.get("hash", ""), "name": item.get("name", ""),
+                    "root": item.get("root", ""), "delete_file": delete_file,
+                })
+            backup_path = Path(settings.TEMP_PATH) / (
+                f"seedsourceguard_offline_delete_{datetime.now():%Y%m%d_%H%M%S}.json")
+            backup_path.write_text(
+                json.dumps(backup_items, ensure_ascii=False, indent=2), encoding="utf-8")
+            logger.info(f"整站失联超期删除：已备份清单 {backup_path}（{len(backup_items)} 项）")
+        except Exception as err:
+            logger.warning(f"整站失联超期删除清单备份失败（不阻断处置）：{err}")
+        for host, item in targets:
+            dl = item.get("dl", "")
+            name = item.get("name", "")
+            hash_value = item.get("hash", "")
+            root = str(item.get("root") or "").rstrip("/")
+            text = f"整站失联超期 {dl}：{name}（站点 {host} 连续失联 ≥{self._site_offline_delete_days} 天）"
+            if not hash_value:
+                continue
+            # 与红种同口径：源文件仍被任一正常任务覆盖则只删任务保留文件
+            delete_file = not (healthy_roots and root and root in healthy_roots)
+            try:
+                services = self._downloader_helper.get_services(name_filters=[dl])
+                instance = getattr(services.get(dl), "instance", None) if services else None
+                if instance is None:
+                    logger.warning(f"下载器 {dl} 不可用，无法删除整站失联任务")
+                    results.append({"time": datetime.now().strftime("%m-%d %H:%M"),
+                                    "text": f"删除失败 {text}（下载器不可用）", "disposed": False})
+                    continue
+                instance.delete_torrents(delete_file, [hash_value])
+                logger.info(f"已删除整站失联超期任务：{dl} / {name}（delete_file={delete_file}）")
+                results.append({"time": datetime.now().strftime("%m-%d %H:%M"),
+                                "text": (f"已删除 {'任务及源文件 ' if delete_file else '任务 '}{text}"),
+                                "disposed": True})
+            except Exception as err:
+                logger.error(f"删除整站失联超期任务失败 {dl} / {name}：{err}")
+                results.append({"time": datetime.now().strftime("%m-%d %H:%M"),
+                                "text": f"删除失败 {text}：{err}", "disposed": False})
+        return results
+
+
     def _save_report(self, report: Dict[str, Any], last_run: str = None,
                      handled_list: List[Dict[str, Any]] = None) -> None:
         """保存本轮检测结果到数据页状态。"""
@@ -2074,9 +2278,14 @@ class SeedSourceGuard(_PluginBase):
                 lines.append("  - 数量较多，不逐条推送，请到插件页查看明细")
         exempt_red = report.get("red_exempt") or []
         if exempt_red:
+            if self._site_offline_delete and self._site_offline_delete_days > 0:
+                _exempt_mode = (f"不计入红种；连续失联满 {self._site_offline_delete_days} 天后"
+                                "整站删除该批种子任务（文件按正常种子覆盖判定）")
+            else:
+                _exempt_mode = "不计入红种也不处置，站点恢复后继续累计"
             lines.append(
                 f"整站失联豁免 {len(exempt_red)} 个（所属站点种子全部连不上且站点域名不可达，"
-                "不计入红种也不处置，站点恢复后继续累计）"
+                f"{_exempt_mode}）"
             )
             for item in exempt_red[:5]:
                 reason = item.get("reason", "") or item.get("kind", "")
@@ -2085,10 +2294,14 @@ class SeedSourceGuard(_PluginBase):
                 lines.append("  - 其余请到插件页「整站失联豁免」表查看")
         site_offline = report.get("site_offline") or []
         if site_offline:
+            if self._site_offline_delete and self._site_offline_delete_days > 0:
+                offline_mode = (f"已开启超期删除：连续失联满 {self._site_offline_delete_days} 天后"
+                                "自动删除该站种子任务（源文件仍被其它正常种子覆盖则只删任务保留文件）")
+            else:
+                offline_mode = "仅提醒不处置；若站点已放弃可自行清理对应种子，或开启「整站失联超期删除」"
             lines.append(
                 f"【站点长期失联提醒】{len(site_offline)} 个站点已连续失联 "
-                f"{self._site_offline_alert_days} 天以上（每 7 天提醒一次，仅提醒不处置；"
-                "若站点已放弃可自行清理对应种子，插件不会自动删除）"
+                f"{self._site_offline_alert_days} 天以上（每 7 天提醒一次；{offline_mode}）"
             )
             for item in site_offline[:5]:
                 lines.append(
