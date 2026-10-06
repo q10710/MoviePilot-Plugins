@@ -329,6 +329,15 @@ class PluginConfig:
         return value if value and value > 0 else 0
 
     @property
+    def relocate_orphan_delete(self) -> bool:
+        """反查残留自动删除：收容目录反查发现「无收容记录且各下载器均无对应任务」的目录时自动删除。
+
+        默认关闭（只通知不删除）；开启后仍受枚举完整性、目录变动时间、硬链接与路径校验
+        四道守卫约束，任一不通过即退回人工确认，避免误删在管数据或牵连媒体库。
+        """
+        return self.get_bool("relocate_orphan_delete", False)
+
+    @property
     def default_hr_hours(self) -> float:
         """默认 H&R 时长（小时）：站点未单独配置时用于计算收容到期时间，默认 168 小时。"""
         value = self.get_float("default_hr_hours", 168)
