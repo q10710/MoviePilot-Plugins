@@ -8,6 +8,7 @@ import json
 import os
 import random
 import re
+import shutil
 import threading
 import time
 from types import SimpleNamespace
@@ -102,6 +103,11 @@ RELOCATE_MISSING_GRACE_DAYS = 7
 # 收容目录反查的节流间隔（秒）：目录与记录对不齐时每天兜底核对一次。
 RELOCATE_AUDIT_INTERVAL = 24 * 3600
 
+# 残留自动删除的“新鲜度”守卫（秒）：目录内最新文件变动（含 ctime/mtime，rename 会刷新
+# ctime）不足该时长时暂缓删除。既挡住「收容移动与记录写入之间的毫秒级竞态」，
+# 也给补搜重下、记录补登记留出下一轮反查的纠正窗口。
+RELOCATE_ORPHAN_FRESH_SECONDS = 24 * 3600
+
 
 class SummaryPayload(BaseModel):
     """订阅助手概览接口的业务数据模型。"""
@@ -152,7 +158,7 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/subscribeassistantenhancedq.png"
     # 插件版本
-    plugin_version = "0.10.37"
+    plugin_version = "0.10.38"
     _site_cache_candidate_helper_warned = False
     # 插件作者
     plugin_author = "Q"
@@ -3248,14 +3254,15 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
                 torrent_hash, {key: record[key] for key in dirty}, drop_record)
 
     def _relocate_dir_audit(self) -> None:
-        """收容目录反查：目录里有、但收容记录里没有的种子补登记；反查不到的只上报。
+        """收容目录反查：目录里有、但收容记录里没有的种子补登记；反查不到的按配置处置。
 
         到期清理只遍历收容记录、不会扫目录，所以记录一旦丢失（搬回后误移出、
         下载器短暂不可见被移出），目录里的数据会永远无人清理。这里每天兜底一次：
         1) 目录名能对上现有记录（相等 / 双向包含 / 同前 20 字符）→ 在管，不误报；
         2) 对不上的先按「各下载器里保存在收容目录的实际任务」反查，再用插件
            下载/删除索引兜底；唯一命中且任务确实在收容目录 → 补登记纳入正常到期清理；
-        3) 反查不到任务 → 列入残留上报（只通知不删除，删除交人工确认）。
+        3) 反查不到任务 → 开启「残留自动删除」时在守卫全部通过后直接删除目录文件；
+           未开启、守卫不通过或快照/枚举不可信时退回「只通知、人工确认」。
         """
         cfg = self._config
         relocate_dir = str(getattr(cfg, "relocate_dir", "") or "").strip() if cfg else ""
@@ -3267,7 +3274,18 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
             last = 0.0
         if time.time() - last < RELOCATE_AUDIT_INTERVAL:
             return
-        records = self._relocate_records_snapshot() or {}
+        records = self._relocate_records_snapshot()
+        if records is None:
+            # 锁超时拿不到快照：记录集合不可信——在管目录会被误判成残留，
+            # 补登记更会以「空记录重建」覆盖既有记录（丢失完成时间、轮次、缺失观察
+            # 等字段，进而扰乱到期计算与收容往返）。本轮直接跳过且不推进节流时间，
+            # 下一次通用巡检（30 分钟）自动重试。
+            logger.warning("订阅收容反查：收容记录锁被占用，本轮跳过")
+            return
+        # 残留自动删除：需显式开启，且与「到期删除源文件」联动——
+        # 用户选择到期保留文件时，残留文件同样不自动删。
+        delete_enabled = bool(cfg) and bool(getattr(cfg, "relocate_orphan_delete", False)) \
+            and bool(getattr(cfg, "relocate_delete_files", True))
 
         def _norm(text) -> str:
             # 归一化后去掉前导中文：种子名可能是「永恒族Eternals...」而记录/历史标题是
@@ -3328,23 +3346,52 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
         # （例如雷神2 的任务在 tr 的外语电影目录，hr 里那份是无任务残留）。
         hr_norm = os.path.normpath(relocate_dir)
         hr_tasks: Dict[str, List[Tuple[str, str]]] = {}
+        # 任务实际数据路径（content/root）→ (hash, 下载器)：用于「目录属于某任务但
+        # 目录名与任务名对不上」的场景——这种目录绝不能当残留删除。
+        hr_data_index: Dict[str, Tuple[str, str]] = {}
+        hr_data_paths: List[str] = []
+        # 枚举完整性：任一下载器不可见/报错时，「反查不到任务」的结论不成立，
+        # 残留自动删除必须整体停用（否则下载器瞬断会把在管数据判成残留删掉）。
+        enumerate_ok = bool(self._downloader_helper)
         if self._downloader_helper:
             try:
                 services = self._downloader_helper.get_services() or {}
             except Exception as err:
                 logger.debug(f"订阅收容反查：获取下载器列表失败：{err}")
                 services = {}
+                enumerate_ok = False
+            if not services:
+                enumerate_ok = False
+            # 配置层对照：get_services 只返回「运行中实例」，被禁用或启动失败的下载器
+            # 整体不可见，其中的收容任务会被误判成残留删掉。凡有「已配置但不在运行」
+            # 的下载器，本轮一律不执行自动删除（只上报）。
+            try:
+                configured = set(self._downloader_helper.get_configs(include_disabled=True) or {})
+            except Exception as err:
+                logger.debug(f"订阅收容反查：读取下载器配置失败：{err}")
+                configured = set()
+                enumerate_ok = False
+            not_running = configured - set(services.keys())
+            if not_running:
+                if delete_enabled:
+                    logger.info(f"订阅收容反查：存在未运行的下载器"
+                                f"（{ '、'.join(sorted(not_running)) }），"
+                                f"本轮停用残留自动删除")
+                enumerate_ok = False
             for dl_name in services.keys():
                 try:
                     service = self._downloader_helper.get_service(name=dl_name)
                     instance = getattr(service, "instance", None) if service else None
                     if not instance:
+                        enumerate_ok = False
                         continue
                     torrents, error = instance.get_torrents()
                 except Exception as err:
                     logger.debug(f"订阅收容反查：枚举下载器 {dl_name} 任务失败：{err}")
+                    enumerate_ok = False
                     continue
                 if error:
+                    enumerate_ok = False
                     continue
                 for raw in torrents or []:
                     task_name = _raw_value(raw, "name")
@@ -3356,7 +3403,12 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
                     if task_path != hr_norm and not task_path.startswith(hr_norm + os.sep):
                         continue
                     hr_tasks.setdefault(_norm(task_name), []).append((task_hash, dl_name))
-        registered, orphan, ambiguous = [], [], []
+                    data_path = os.path.normpath(
+                        _raw_value(raw, "content_path", "root_path")
+                        or os.path.join(task_path, task_name))
+                    hr_data_index.setdefault(data_path, (task_hash, dl_name))
+                    hr_data_paths.append(data_path)
+        registered, orphan, ambiguous, deleted = [], [], [], []
         for name in unmatched:
             key = _norm(name)
             # 源二优先：收容目录内的实际任务，按宽松关系匹配
@@ -3383,6 +3435,34 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
                     if actual_norm == hr_norm or actual_norm.startswith(hr_norm + os.sep):
                         hits.setdefault(item_hash, downloader)
             if not hits:
+                # 数据路径反查兜底：目录名与任务名对不上、但目录本身就是某任务的
+                # 数据路径（任务改名/中英文标题差异）→ 归属明确，不删不报残留。
+                dir_path = os.path.normpath(os.path.join(relocate_dir, name))
+                related = None
+                for data_path in hr_data_paths:
+                    if (dir_path == data_path
+                            or data_path.startswith(dir_path + os.sep)
+                            or dir_path.startswith(data_path + os.sep)):
+                        related = hr_data_index.get(data_path)
+                        break
+                if related:
+                    item_hash, downloader = related
+                    if item_hash not in records:
+                        entry = self._register_relocate_record(
+                            downloader, item_hash, None, {"title": name}, 0)
+                        registered.append(name)
+                        logger.info(f"订阅收容反查：{name} 无收容记录，按数据路径归属补登记"
+                                    f"（下载器 {downloader}，到期 {entry.get('deadline')}）")
+                    continue
+                # 真·无主残留：仅当开关开启、记录快照可信且全部下载器枚举完整时才删除；
+                # 任一守卫不通过则连同原因退回「待人工确认」。
+                if delete_enabled and enumerate_ok:
+                    removed, note = self._relocate_orphan_dispose(relocate_dir, name)
+                    if removed:
+                        deleted.append(f"{name}（{note}）")
+                    else:
+                        orphan.append(f"{name}（{note}）")
+                    continue
                 orphan.append(name)
                 continue
             if len(hits) > 1:
@@ -3398,7 +3478,7 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
                         f"（下载器 {downloader}，到期 {entry.get('deadline')}）")
         # 无论是否有发现都推进节流时间，避免空目录时每轮扫描
         self.save_data("relocate_audit_at", time.time())
-        if registered or orphan or ambiguous:
+        if registered or orphan or ambiguous or deleted:
             lines = []
             if registered:
                 lines.append("已补登记：" + "、".join(registered))
@@ -3406,6 +3486,8 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
                 lines.append("匹配到多个收容任务，未自动登记（待人工确认）：" + "、".join(ambiguous))
             if orphan:
                 lines.append("无记录且未找到任务（残留，待人工确认）：" + "、".join(orphan))
+            if deleted:
+                lines.append("已自动删除残留：" + "、".join(deleted))
             if getattr(cfg, "notify", True):
                 try:
                     self.post_message(
@@ -3415,10 +3497,74 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
                 except Exception as err:
                     logger.debug(f"订阅收容反查：通知发送失败：{err}")
 
-    def _relocate_records_snapshot(self) -> dict:
-        """在收容锁内取收容记录快照；取锁超时返回空字典（本轮跳过）。"""
+    def _relocate_orphan_dispose(self, relocate_dir: str, name: str) -> Tuple[bool, str]:
+        """删除反查判定的无主残留目录，返回 (是否已删除, 说明)。
+
+        四道守卫按顺序执行，任一不通过即返回 (False, 原因) 交回人工确认：
+        1) 路径守卫：目标必须是收容目录内的真实目录（拒绝符号链接与越界路径）；
+        2) 新鲜度守卫：目录树内最新文件变动（mtime/ctime）距今不足
+           RELOCATE_ORPHAN_FRESH_SECONDS 时暂缓——挡住「刚搬入、记录尚未落盘」
+           以及「补搜刚命中、任务即将重建」的中间态；
+        3) 硬链接守卫：目录内存在 links>=2 的文件即跳过——删除硬链接会把媒体库
+           侧的链接数降到 1，LinkChecker 的「曾硬链接、现断开」判定会把它计入
+           孤立计数，3 天后连媒体库那份一起删，形成误删连锁；
+        4) 磁盘守卫：单目录超过 500 GB 视为异常（正常残留不会这么大），跳过。
+        全部通过后 rmtree 删除，删除失败返回 (False, 失败原因)。
+        """
+        target = os.path.join(relocate_dir, name)
+        try:
+            # 1) 路径守卫：name 必须是纯目录名（scandir 来源天然满足，这里显式
+            # 拒绝 ../ 与分隔符作为纵深防御），realpath 再兜底防符号链接逃逸
+            if not name or name in (".", "..") or os.sep in name or (os.altsep and os.altsep in name):
+                return False, "路径校验未通过"
+            real_dir = os.path.realpath(relocate_dir)
+            real_target = os.path.realpath(target)
+            if not real_target.startswith(real_dir + os.sep) or os.path.islink(target):
+                return False, "路径校验未通过"
+            if not os.path.isdir(real_target):
+                return False, "不是目录"
+            # 2) 新鲜度 + 3) 硬链接 + 4) 体积，单次遍历完成。
+            # 目录自身 ctime 必须参与：rename 搬入时子文件的 mtime/ctime 全部不变，
+            # 只有被搬目录自身的 ctime 刷新——漏掉它会在「收容刚搬入、任务路径尚
+            # 未在下载器侧可见」的窗口里把刚收容的数据当残留删掉。
+            newest = 0.0
+            total_size = 0
+            try:
+                top = os.lstat(real_target)
+                newest = max(top.st_ctime, top.st_mtime)
+            except OSError:
+                pass
+            for dirpath, _dirnames, filenames in os.walk(real_target):
+                for filename in filenames:
+                    path = os.path.join(dirpath, filename)
+                    try:
+                        info = os.lstat(path)
+                    except OSError:
+                        continue
+                    total_size += info.st_size
+                    if info.st_nlink > 1:
+                        return False, "存在硬链接文件"
+                    newest = max(newest, info.st_mtime, info.st_ctime)
+            if newest and time.time() - newest < RELOCATE_ORPHAN_FRESH_SECONDS:
+                return False, "24小时内有文件变动"
+            if total_size > 500 * 1024 ** 3:
+                return False, "体积超过500GB异常"
+            shutil.rmtree(real_target)
+            freed = f"{total_size / (1024 ** 3):.1f}GB"
+            logger.info(f"订阅收容反查：已自动删除无主残留 {real_target}（释放 {freed}）")
+            return True, freed
+        except Exception as err:
+            logger.error(f"订阅收容反查：删除残留 {target} 失败：{err}")
+            return False, f"删除失败：{err}"
+
+    def _relocate_records_snapshot(self) -> Optional[dict]:
+        """在收容锁内取收容记录快照；取锁超时返回 None，供调用方区分「锁失败」与「真无记录」。
+
+        反查的残留自动删除必须知道快照是否可信：锁超时时记录集合为空会让
+        「在管目录」被误判成残留，因此该场景下只允许上报、不允许删除。
+        """
         if not self._acquire_relocate_lock():
-            return {}
+            return None
         try:
             records = self.get_data("relocate_records") or {}
             return dict(records) if isinstance(records, dict) else {}
