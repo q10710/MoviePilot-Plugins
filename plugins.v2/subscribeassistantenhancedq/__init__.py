@@ -158,7 +158,7 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/subscribeassistantenhancedq.png"
     # 插件版本
-    plugin_version = "0.10.40"
+    plugin_version = "0.10.41"
     _site_cache_candidate_helper_warned = False
     # 插件作者
     plugin_author = "Q"
@@ -2954,7 +2954,6 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
         return all_copies or known
 
     @staticmethod
-    @staticmethod
     def _copy_save_path(raw) -> str:
         """从下载器原始种子对象读取保存目录（qb 为 dict，tr 为对象，逐字段防御式读取）。"""
         for key in ("save_path", "download_dir", "downloadDir"):
@@ -2999,6 +2998,7 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
             return None
         return inside
 
+    @staticmethod
     def _delete_torrent_copies(copies: List[Tuple[str, Any, Any]], torrent_hash: str,
                                delete_files: bool) -> List[str]:
         """删除该 hash 的全部副本，返回成功删除的下载器名列表。
