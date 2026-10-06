@@ -111,11 +111,15 @@ class BestVersionOrchestrator:
         )
         if sid:
             mode_label = "洗版"
+            # add 在订阅已存在时也返回已有 id（err_msg=订阅已存在），必须区分
+            # 「本次新建」与「复用已存在」，否则日志/通知会把已有订阅误报成新建。
+            existed = err_msg == "订阅已存在"
+            action_label = "已存在" if existed else "已创建"
             logger.info(
                 f"洗版编排：{format_subscribe_desc(subscribe)} "
-                f"原因=订阅完成，处理=已创建{mode_label}订阅（id={sid}）"
+                f"原因=订阅完成，处理={action_label}{mode_label}订阅（id={sid}）"
             )
-            if self._notify:
+            if self._notify and not existed:
                 self._notify(
                     f"{format_subscribe_desc(subscribe)} 已添加{mode_label}订阅",
                     score=mediainfo.vote_average,
