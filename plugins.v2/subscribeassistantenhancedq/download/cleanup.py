@@ -100,6 +100,20 @@ class TorrentCleanup:
         elif outcome == RELOCATE_RETAINED:
             retained = True
 
+        if outcome in (RELOCATE_RESTORED, RELOCATE_KEPT_FINAL):
+            # 收容往返把同一份种子搬回影视目录继续下载：种子仍在下载，不能走
+            # 「种子已删除」善后——写删除指纹/清任务/清待定/补搜会让订阅误判缺集
+            # 而重复下载，并使搬回的种子脱离下载监控（往返链路断）。
+            # 与 handle_timeout_limit 对齐：只按本次动作发通知，其余状态原样保留。
+            detail(f"种子删除处理：{torrent_hash} 已搬回影视目录继续下载，跳过删种善后")
+            self._notify_deleted(
+                subscribe, torrent_task, reason,
+                reason_detail=reason_detail,
+                restored=outcome == RELOCATE_RESTORED,
+                kept_final=outcome == RELOCATE_KEPT_FINAL,
+            )
+            return
+
         if retained:
             detail(f"种子删除处理：{torrent_hash} 为 H&R 种子但收容未成功，"
                    f"本轮保留种子并等待下一轮重试")
