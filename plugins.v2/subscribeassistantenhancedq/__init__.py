@@ -158,7 +158,7 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/subscribeassistantenhancedq.png"
     # 插件版本
-    plugin_version = "0.10.38"
+    plugin_version = "0.10.40"
     _site_cache_candidate_helper_warned = False
     # 插件作者
     plugin_author = "Q"
@@ -2379,12 +2379,13 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
         record = torrent_task or {}
         record_title = record.get("title") or torrent_hash
         if in_hr:
-            # 补搜命中：开启新一轮，把种子从收容目录搬回影视目录继续下载
-            round_no = self._hr_round_bump(torrent_hash, subscribe, torrent_task)
+            # 补搜命中：把种子从收容目录搬回影视目录继续下载。
+            # 轮次在「搬动确认生效」之后才累加——搬运失败/读不到路径的重试不消耗
+            # 往返名额（与影视目录分支「失败不计数」口径一致），避免下载器瞬断把
+            # 配置的往返次数白白吃光后直接进「保留停手」。
             if not media_dir:
                 logger.warning(f"订阅收容：{record_title} 在收容目录但未解析到影视下载目录，保持现状继续保种")
                 return RELOCATE_RELOCATED
-            last_round = round_no >= round_limit
             if not self._move_torrent_location(instance, torrent_hash, media_dir):
                 logger.warning(f"订阅收容：{record_title} 搬回影视目录 {media_dir} 未成功，本轮保留种子")
                 return RELOCATE_RETAINED
@@ -2401,6 +2402,9 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
                 logger.warning(f"订阅收容：{record_title} 搬回影视目录 {media_dir} 未生效"
                                f"（保存目录仍在收容目录），保留收容记录待下一轮重试")
                 return RELOCATE_RETAINED
+            # 搬动已确认生效：本轮正式计数
+            round_no = self._hr_round_bump(torrent_hash, subscribe, torrent_task)
+            last_round = round_no >= round_limit
             if last_round:
                 # 先进观察期再清收容记录：观察期记录要续用原收容时间与到期点，
                 # 否则期满搬回收容目录时会把「未完成清理」14 天计时重置。
@@ -2950,6 +2954,51 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
         return all_copies or known
 
     @staticmethod
+    @staticmethod
+    def _copy_save_path(raw) -> str:
+        """从下载器原始种子对象读取保存目录（qb 为 dict，tr 为对象，逐字段防御式读取）。"""
+        for key in ("save_path", "download_dir", "downloadDir"):
+            if isinstance(raw, dict):
+                value = raw.get(key)
+            else:
+                try:
+                    value = getattr(raw, key, None)
+                except Exception:
+                    value = None
+            if value:
+                return str(value).strip()
+        return ""
+
+    def _relocate_copy_guard(self, copies, torrent_hash: str, record: dict) -> Optional[list]:
+        """到期/未完成清理只允许删除「实际保存在收容目录内」的副本；全部不在则返回 None。
+
+        收容记录断言「种子在收容目录」，但搬运竞态、下载器瞬断可能让记录失真
+        （例如搬回影视目录后读不到路径而保留了错误断言）。删错位置会直接丢失
+        影视目录数据——未入库即净损失，已入库则 links 降 1 后被 LinkChecker
+        「曾硬链接现断开」判定在 3 天后连媒体库一起删。与反查链路的 hr_norm
+        归属校验同一口径；返回 None 时调用方跳过删除并保留记录，交由反查或
+        后续轮次再判定。
+        """
+        relocate_dir = str(getattr(self._config, "relocate_dir", "") or "").strip()
+        hr_norm = os.path.normpath(relocate_dir) if relocate_dir else ""
+        if not hr_norm:
+            return None
+        inside, outside = [], []
+        for name, raw, instance in copies:
+            path = os.path.normpath(self._copy_save_path(raw)) if self._copy_save_path(raw) else ""
+            if path and (path == hr_norm or path.startswith(hr_norm + os.sep)):
+                inside.append((name, raw, instance))
+            else:
+                outside.append(f"{name}({path or '路径未知'})")
+        if outside:
+            logger.warning(f"订阅收容：{record.get('title') or torrent_hash} 部分副本已不在收容目录"
+                           f"（{'、'.join(outside)}），只删除收容目录内的副本")
+        if not inside:
+            logger.warning(f"订阅收容：{record.get('title') or torrent_hash} 全部副本已不在收容目录，"
+                           f"跳过删除并保留记录（避免误删影视目录等非收容数据）")
+            return None
+        return inside
+
     def _delete_torrent_copies(copies: List[Tuple[str, Any, Any]], torrent_hash: str,
                                delete_files: bool) -> List[str]:
         """删除该 hash 的全部副本，返回成功删除的下载器名列表。
@@ -3191,9 +3240,13 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
                     return
                 # 是否保留文件沿用「到期删除源文件」配置，避免同一插件内两处口径不一致
                 delete_files = bool(record.get("delete_files", True))
-                removed_downloaders = self._delete_torrent_copies(
+                guarded_copies = self._relocate_copy_guard(
                     self._all_copies_for_delete(torrent_hash, preferred, copies),
-                    torrent_hash, delete_files)
+                    torrent_hash, record)
+                if guarded_copies is None:
+                    return
+                removed_downloaders = self._delete_torrent_copies(
+                    guarded_copies, torrent_hash, delete_files)
                 if not removed_downloaders:
                     return
                 logger.info(f"订阅收容未完成清理：已在 {'/'.join(removed_downloaders)} 删除 "
@@ -3227,9 +3280,14 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
                 dirty.add("deadline")
             if now < deadline:
                 return
-            removed_downloaders = self._delete_torrent_copies(
+            guarded_copies = self._relocate_copy_guard(
                 self._all_copies_for_delete(torrent_hash, preferred, copies),
-                torrent_hash, bool(record.get("delete_files", True)))
+                torrent_hash, record)
+            if guarded_copies is None:
+                # 副本已不在收容目录：不删非收容数据，保留记录等反查/下一轮判定
+                return
+            removed_downloaders = self._delete_torrent_copies(
+                guarded_copies, torrent_hash, bool(record.get("delete_files", True)))
             if not removed_downloaders:
                 return
             logger.info(f"订阅收容到期：已在 {'/'.join(removed_downloaders)} 删除 "
