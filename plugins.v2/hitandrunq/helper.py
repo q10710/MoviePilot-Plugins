@@ -76,7 +76,18 @@ class TorrentHelper:
 
             site_info = siteshelper.get_indexer(domain)
             if site_info:
-                return site_info.get("id"), site_info.get("name")
+                site_id = site_info.get("id")
+                # get_indexer 对「未登记到本机站点表的内置索引器」返回的是字符串标识（如 "gtkpw"），
+                # 而 TorrentTask.site 是站点表整数 ID；直接传入会在 parse_obj 抛 ValidationError，
+                # 使整轮检查服务执行失败（H&R 状态、标签补写与任务统计全部中断）。
+                # 此处按返回类型收敛为整数 ID：可转换则用转换值，不可转换即视为该站点未登记，返回 0，
+                # 与「找不到站点」分支一致，站点名仍原样返回供补标名单（按名称）比对。
+                if not isinstance(site_id, int) or isinstance(site_id, bool):
+                    try:
+                        site_id = int(site_id)
+                    except (TypeError, ValueError):
+                        site_id = 0
+                return site_id, site_info.get("name")
 
         # 当找不到对应的站点信息时，返回一个默认值
         return 0, domain
