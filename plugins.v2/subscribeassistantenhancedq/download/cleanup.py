@@ -7,7 +7,7 @@ from app.schemas.types import MediaType
 
 from ..engine.types import PriorityManagerProtocol
 from ..shared.log import detail
-from ..shared.subscribe import format_subscribe, resolve_subscribe_media_type
+from ..shared.subscribe import format_subscribe, load_chain_subscription, resolve_subscribe_media_type
 from ..shared.update import update_subscribe
 
 # 收容回调的返回值：relocated=已收容；restored=已从收容目录搬回影视目录；
@@ -298,7 +298,10 @@ class TorrentCleanup:
             for key, value in payload.items():
                 setattr(subscribe, key, value)
             if media_type == MediaType.TV:
-                SubscribeChain().refresh_subscribe_progress(subscribe, scene="plugin_delete_rollback")
+                chain = SubscribeChain()
+                snapshot = load_chain_subscription(chain, subscribe)
+                if snapshot is not None:
+                    chain.refresh_subscribe_progress(snapshot, scene="plugin_delete_rollback")
 
     def _clean_torrent_task(self, torrent_hash: str):
         """清理种子任务数据。"""
