@@ -78,7 +78,7 @@ class BestVersionGuard(_PluginBase):
                    "定时巡检维护已是洗版的订阅（未播完取消洗版、已播完维持整季洗版并在库缺集时重置进度）；"
                    "普通订阅库缺集自动对账回退补齐（删掉的文件被订阅重新补回）。")
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/bestversionguard.png"
-    plugin_version = "2.9.0"
+    plugin_version = "2.9.1"
     plugin_label = "订阅"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -712,6 +712,11 @@ class BestVersionGuard(_PluginBase):
         risks: List[Dict[str, Any]] = []
         if not self._reconcile_enabled or not self._subscribe_oper:
             return actions, risks
+        # 通用性护栏：没有可用媒体服务器（未配置/全部禁用/主程序版本不支持枚举）时
+        # 查库永远为空，绝不能据此回退下载事实——整轮跳过。
+        if not self._library_server_names():
+            logger.info("未配置可用的媒体服务器，本轮跳过对账回退")
+            return actions, risks
         # 同一轮内的 TMDB 查询按 (tmdbid, season) 去重，几十部订阅不会打爆 TMDB
         air_cache: Dict[Tuple[int, int], Any] = {}
         total_cache: Dict[Tuple[int, int], int] = {}
@@ -1045,10 +1050,16 @@ class BestVersionGuard(_PluginBase):
 
     @staticmethod
     def _library_server_names() -> List[str]:
-        """返回已启用的媒体服务器名称（与主程序 API 同源），取不到时返回空列表。"""
+        """返回已启用的影视媒体服务器名称（与主程序 API 同源），取不到时返回空列表。
+
+        通用性：不硬编码任何播放器类型，Emby/Jellyfin/Plex/飞牛/绿联/TrimeMedia/ZSpace
+        等凡是主程序能列出的实例都会逐台查询；纯音乐服务器（如 Navidrome）没有剧集
+        概念，直接排除，避免无意义查询。
+        """
         try:
             from app.application.mediaserver import get_mediaserver_configs
-            return [c.name for c in get_mediaserver_configs() if c.name and c.enabled]
+            return [c.name for c in get_mediaserver_configs()
+                    if c.name and c.enabled and c.type != "navidrome"]
         except Exception as e:
             logger.debug(f"获取媒体服务器列表失败: {e}")
             return []
