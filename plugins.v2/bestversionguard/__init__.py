@@ -1,6 +1,6 @@
 """洗版订阅守护插件。
 
-职责分两块，**只看订阅指向的那一季**，不看整剧状态：
+职责分三块，**只看订阅指向的那一季**，不看整剧状态：
 
 1) **订阅新增的那一刻**（监听 SubscribeAdded，本插件唯一的「普通订阅 → 洗版」入口）：
    判断这一季是否已播完——已播完就直接开整季洗版（best_version / best_version_full = 1），
@@ -11,6 +11,18 @@
    该季未播完 → 取消洗版、恢复普通订阅继续追更；该季已播完 → 维持整季洗版并在库缺集时重置洗版进度。
    **已存在订阅的洗版不由本插件开启**：它们逐集正常下载，等这一季下完，由订阅助手Q 的洗版编排
    在「订阅完成」时自动新建整季洗版订阅（用户口径 2026-09-16）。**普通订阅在巡检里一律不处理**。
+3) **定时巡检 · 普通订阅库缺集对账回退**（`reconcile_enabled`，可开关）：
+   媒体库缺集、但订阅的下载事实 note 仍把这些集标成已完成时（典型链路：红种源被清理 → 硬链接断开 →
+   媒体库副本按规则删除 → 主程序按「缺失集数 = 库缺集 − note」把这些集当成已下载而永不重下），
+   把这部分集从 note 摘除并同步缺集数，让下一轮订阅搜索重新补下。三态处置：
+   - 该季未播完 → 只回退缺集，普通订阅逐集正常追补；
+   - 该季已播完 → 回退缺集的同一次写入里转整季洗版（best_version/full=1），只认整季包一次补齐并完成洗版；
+     转洗版后限时（reconcile_grace_days，默认 7 天）仍缺集说明站上没有整季包 → 兜底把 best_version 置回 0，
+     恢复普通订阅逐集补；
+   - 已是洗版的订阅由 2) 的既有逻辑维护，本模块只负责上面的兜底回退，不重复处理。
+   护栏：媒体库整季查空需连续 3 轮、部分缺失需连续 2 轮确认同一批缺集才动手；S/P 状态与手动冻结总集数
+   （manual_total_episode）的订阅不参与；同一订阅限频；同一集累计回退达止损次数（reconcile_stop_count）
+   即拉黑该订阅、停止自动回退并推送高危清单；每轮最多处理 reconcile_max_per_run 部。
 
 判断逻辑：
 1. 该季是否播完：取该季全部分集的 air_date，全部已过才算播完（只考虑单季）；
@@ -22,7 +34,8 @@
 4. 库缺集且订阅却认为已下完（lack_episode<=0）→ 重置订阅触发重新下载（原有能力）
 5. 取不到该季分集信息 → 保守跳过本轮，不做任何改动
 
-媒体库检查用「媒体身份 + 本地索引条目 ID」定位，条目名与 TMDB 中文名不一致时也能命中。
+媒体库检查用「媒体身份 + 本地索引条目 ID」定位，条目名与 TMDB 中文名不一致时也能命中；
+已配置多台媒体服务器（如 Emby + 飞牛影视）时按并集合并，任一服务器上存在该集即视为存在（可播放）。
 """
 
 import threading
@@ -62,9 +75,10 @@ class BestVersionGuard(_PluginBase):
 
     plugin_name = "洗版守护Q自用版"
     plugin_desc = ("只看订阅那一季：订阅新增时判定——该季已播完就直接开整季洗版，未播完保持普通订阅；"
-                   "定时巡检只维护已是洗版的订阅（未播完取消洗版、已播完维持整季洗版并在库缺集时重置进度）。")
+                   "定时巡检维护已是洗版的订阅（未播完取消洗版、已播完维持整季洗版并在库缺集时重置进度）；"
+                   "普通订阅库缺集自动对账回退补齐（删掉的文件被订阅重新补回）。")
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/bestversionguard.png"
-    plugin_version = "2.8.3"
+    plugin_version = "2.9.0"
     plugin_label = "订阅"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -79,6 +93,16 @@ class BestVersionGuard(_PluginBase):
     _reset_missing_enabled: bool = True
     # 同一订阅重置限频天数（0 = 不限频），避免媒体库查询异常导致反复重下
     _reset_cooldown_days: int = 1
+    # 普通订阅库缺集对账回退（删完自动补，见模块说明 3）
+    _reconcile_enabled: bool = True
+    # 同一订阅对账回退限频天数（0 = 不限频）
+    _reconcile_cooldown_days: int = 7
+    # 每轮巡检最多处理的订阅数，避免一轮补集打满带宽磁盘
+    _reconcile_max_per_run: int = 5
+    # 同一集累计回退次数上限：达到即拉黑该订阅、停止自动回退并推送高危清单
+    _reconcile_stop_count: int = 3
+    # 完结季转整季洗版后仍缺集的兜底天数：超过则回退普通订阅逐集补
+    _reconcile_grace_days: int = 7
 
     _subscribe_oper = None
     _fixed_count: int = 0
@@ -92,6 +116,20 @@ class BestVersionGuard(_PluginBase):
     _fixed_ids: Set[str] = set()
     # 持久化：已重置订阅 ID -> 上次重置时间戳（用于限频）
     _reset_records: Dict[str, float] = {}
+    # 对账回退：订阅 ID -> 上次回退动作时间戳（限频用）
+    _reconcile_records: Dict[str, float] = {}
+    # 对账回退：订阅 ID -> 待确认缺集 {"rolled": [集号], "count": 轮次}（连续确认护栏）
+    _reconcile_pending: Dict[str, Dict[str, Any]] = {}
+    # 对账回退：订阅 ID -> {集号: 已回退次数}（集级止损计数）
+    _reconcile_strikes: Dict[str, Dict[str, int]] = {}
+    # 对账回退：止损拉黑的订阅 ID（停止自动回退，进高危清单）
+    _reconcile_blocked: Set[str] = set()
+    # 完结转洗版兜底：订阅 ID -> 转整季洗版时间戳（超过宽限仍缺集则回退普通订阅）
+    _convert_records: Dict[str, float] = {}
+    # 累计对账回退次数与最近一次明细（数据页/通知展示）
+    _reconcile_count: int = 0
+    _last_reconcile: List[Dict[str, Any]] = []
+    _last_high_risk: List[Dict[str, Any]] = []
     # 即时判定（订阅新增事件）串行化：事件可能在短时间内大量触发（如榜单插件批量建订阅），
     # 若并发执行会同时改插件数据、并按条数放大 TMDB 与媒体库查询压力。
     _single_check_lock = threading.Lock()
@@ -111,6 +149,17 @@ class BestVersionGuard(_PluginBase):
         self._last_fixed = saved.get("last_fixed") or []
         self._last_reset = saved.get("last_reset") or []
         self._last_enabled = saved.get("last_enabled") or []
+        self._reconcile_records = {str(k): float(v) for k, v in (saved.get("reconcile_records") or {}).items()}
+        self._reconcile_pending = {str(k): dict(v or {}) for k, v in (saved.get("reconcile_pending") or {}).items()}
+        self._reconcile_strikes = {
+            str(k): {str(ek): int(ev) for ek, ev in (v or {}).items()}
+            for k, v in (saved.get("reconcile_strikes") or {}).items()
+        }
+        self._reconcile_blocked = set(str(x) for x in (saved.get("reconcile_blocked") or []))
+        self._convert_records = {str(k): float(v) for k, v in (saved.get("convert_records") or {}).items()}
+        self._reconcile_count = saved.get("reconcile_count", 0)
+        self._last_reconcile = saved.get("last_reconcile") or []
+        self._last_high_risk = saved.get("last_high_risk") or []
         if not config:
             self._enabled = False
             return
@@ -124,8 +173,17 @@ class BestVersionGuard(_PluginBase):
             self._reset_cooldown_days = int(raw_cooldown) if raw_cooldown not in (None, "") else 1
         except (TypeError, ValueError):
             self._reset_cooldown_days = 1
+        # 对账回退配置（同上：显式解析缺省值，避免空串/非法值）
+        self._reconcile_enabled = bool(config.get("reconcile_enabled", True))
+        self._reconcile_cooldown_days = self._int_cfg(config.get("reconcile_cooldown_days"), 7)
+        self._reconcile_max_per_run = max(1, self._int_cfg(config.get("reconcile_max_per_run"), 5))
+        self._reconcile_stop_count = max(1, self._int_cfg(config.get("reconcile_stop_count"), 3))
+        self._reconcile_grace_days = max(0, self._int_cfg(config.get("reconcile_grace_days"), 7))
         logger.info(f"初始化完成, enabled={self._enabled}, cron={self._cron}, "
                     f"库缺集重置={self._reset_missing_enabled}（限频 {self._reset_cooldown_days} 天），"
+                    f"对账回退={self._reconcile_enabled}（限频 {self._reconcile_cooldown_days} 天，"
+                    f"每轮上限 {self._reconcile_max_per_run} 部，止损 {self._reconcile_stop_count} 次，"
+                    f"转洗版兜底 {self._reconcile_grace_days} 天，已拉黑 {len(self._reconcile_blocked)} 条），"
                     f"已取消 {len(self._fixed_ids)} 条")
         if self._enabled:
             # 定时任务交由 MoviePilot 主调度器统一注册（见 get_service）
@@ -175,6 +233,13 @@ class BestVersionGuard(_PluginBase):
                 "auth": "bear",
                 "summary": "手动触发洗版检查",
             },
+            {
+                "path": "/reconcile_unblock",
+                "endpoint": self._api_reconcile_unblock,
+                "methods": ["GET"],
+                "auth": "bear",
+                "summary": "解除对账回退止损拉黑（可带 subscribe_id 只解除单条）",
+            },
         ]
 
     def get_form(self) -> Tuple[Optional[List[dict]], Dict[str, Any]]:
@@ -218,6 +283,57 @@ class BestVersionGuard(_PluginBase):
                             "persistent-hint": True,
                         },
                     },
+                    {
+                        "component": "VSwitch",
+                        "props": {
+                            "model": "reconcile_enabled",
+                            "label": "普通订阅库缺集对账回退（删完自动补）",
+                            "hint": ("媒体库缺集但订阅的下载事实仍标记为已完成时（文件被删后主程序不会重下），"
+                                     "把这些集从下载事实中摘除并同步缺集数：未播完的季逐集补，"
+                                     "已播完的季转整季洗版一次补齐（限时找不到整季包则回退逐集补）。"),
+                            "persistent-hint": True,
+                        },
+                    },
+                    {
+                        "component": "VTextField",
+                        "props": {
+                            "model": "reconcile_cooldown_days",
+                            "label": "对账回退限频（天，0=不限频）",
+                            "type": "number",
+                            "hint": "同一订阅在该天数内最多回退一次，防止补了又删、删了又补的循环打满带宽",
+                            "persistent-hint": True,
+                        },
+                    },
+                    {
+                        "component": "VTextField",
+                        "props": {
+                            "model": "reconcile_max_per_run",
+                            "label": "每轮最多处理部数",
+                            "type": "number",
+                            "hint": "每次巡检最多对账回退多少部订阅，剩余下一轮继续，避免一轮补集打满带宽磁盘",
+                            "persistent-hint": True,
+                        },
+                    },
+                    {
+                        "component": "VTextField",
+                        "props": {
+                            "model": "reconcile_stop_count",
+                            "label": "同集止损次数",
+                            "type": "number",
+                            "hint": "同一集累计回退达到该次数仍被删除，停止该订阅的自动回退并推送高危清单",
+                            "persistent-hint": True,
+                        },
+                    },
+                    {
+                        "component": "VTextField",
+                        "props": {
+                            "model": "reconcile_grace_days",
+                            "label": "转洗版兜底天数",
+                            "type": "number",
+                            "hint": "已完结季转整季洗版后仍缺集超过该天数（站上没有整季包），回退为普通订阅逐集补",
+                            "persistent-hint": True,
+                        },
+                    },
                 ],
             }
         ], {
@@ -226,6 +342,11 @@ class BestVersionGuard(_PluginBase):
             "notify": True,
             "reset_missing_enabled": True,
             "reset_cooldown_days": 1,
+            "reconcile_enabled": True,
+            "reconcile_cooldown_days": 7,
+            "reconcile_max_per_run": 5,
+            "reconcile_stop_count": 3,
+            "reconcile_grace_days": 7,
         }
 
     def get_page(self) -> Optional[List[dict]]:
@@ -412,7 +533,7 @@ class BestVersionGuard(_PluginBase):
                                 "text": "洗版守护"},
                                {"component": "div",
                                 "props": {"class": "text-caption text-medium-emphasis"},
-                                "text": "订阅新增时判定该季是否已播完；定时巡检只维护已是洗版的订阅"},
+                                "text": "订阅新增时判定该季是否已播完；巡检维护洗版订阅、对账回退补齐库缺集"},
                            ]},
                           {"component": "VBtn",
                            "props": {"color": "primary", "variant": "flat", "size": "small",
@@ -435,6 +556,11 @@ class BestVersionGuard(_PluginBase):
                                icon="mdi-restore"),
                           chip(f"限频 {self._reset_cooldown_days} 天", "info",
                                icon="mdi-timer-sand"),
+                          chip("对账回退 开启" if self._reconcile_enabled else "对账回退 关闭",
+                               "success" if self._reconcile_enabled else "warning",
+                               icon="mdi-restore-alert"),
+                          chip(f"对账限频 {self._reconcile_cooldown_days} 天 / 每轮 {self._reconcile_max_per_run} 部",
+                               "secondary", icon="mdi-timer-outline"),
                       ]},
                  ]},
             ],
@@ -453,6 +579,10 @@ class BestVersionGuard(_PluginBase):
                           info_color, "库缺集，重置洗版重新补集"),
                 stat_card("mdi-format-list-bulleted", "在管取消记录", len(self._fixed_ids),
                           alt_color, "已取消洗版的订阅条数"),
+                stat_card("mdi-restore-alert", "累计对账回退", self._reconcile_count,
+                          ok_color, "库缺集但订阅标记已完成，摘除后重新补下"),
+                stat_card("mdi-alert-octagon-outline", "高危止损拉黑", len(self._reconcile_blocked),
+                          warn_color, "同集反复被删已停止自动回退，需人工处理"),
             ],
         }
 
@@ -474,6 +604,16 @@ class BestVersionGuard(_PluginBase):
                 "最近一次重置洗版进度", "mdi-restore", info_color,
                 self._last_reset, "reset_time", "最近一次检查没有重置进度的订阅",
                 chip(f"{len(self._last_reset)} 条", "info"),
+            ),
+            detail_section(
+                "最近一次对账回退（库缺集重新补下）", "mdi-restore-alert", ok_color,
+                self._last_reconcile, "time", "最近一次检查没有对账回退的订阅",
+                chip(f"{len(self._last_reconcile)} 条", "success"),
+            ),
+            detail_section(
+                "高危止损清单（已停止自动回退）", "mdi-alert-octagon-outline", warn_color,
+                self._last_high_risk, "time", "没有被止损拉黑的订阅",
+                chip(f"{len(self._last_high_risk)} 条", "warning"),
             ),
         ]
 
@@ -519,6 +659,14 @@ class BestVersionGuard(_PluginBase):
                 "fixed_count": self._fixed_count,
                 "enabled_count": self._enabled_count,
                 "reset_records": dict(self._reset_records),
+                "reconcile_records": dict(self._reconcile_records),
+                "reconcile_pending": {k: dict(v or {}) for k, v in self._reconcile_pending.items()},
+                "reconcile_strikes": {k: dict(v or {}) for k, v in self._reconcile_strikes.items()},
+                "reconcile_blocked": list(self._reconcile_blocked),
+                "convert_records": dict(self._convert_records),
+                "reconcile_count": self._reconcile_count,
+                "last_reconcile": (self._last_reconcile or [])[:50],
+                "last_high_risk": (self._last_high_risk or [])[:50],
                 "last_run": self._last_run,
                 "last_fixed": (self._last_fixed or [])[:50],
                 "last_reset": (self._last_reset or [])[:50],
@@ -533,6 +681,202 @@ class BestVersionGuard(_PluginBase):
         if not last:
             return True
         return (time.time() - float(last)) >= self._reset_cooldown_days * 86400
+
+    @staticmethod
+    def _int_cfg(value: Any, default: int) -> int:
+        """把表单里的数字配置安全转成 int；空串/非法值回落到默认值。"""
+        try:
+            if value in (None, ""):
+                return default
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _can_reconcile(self, subscribe_id: Any) -> bool:
+        """对账回退限频：同一订阅在限频期内不再处理（0 天 = 不限频）。"""
+        if self._reconcile_cooldown_days <= 0:
+            return True
+        last = self._reconcile_records.get(str(subscribe_id))
+        if not last:
+            return True
+        return (time.time() - float(last)) >= self._reconcile_cooldown_days * 86400
+
+    def _reconcile_normal_subs(self, subscribes: List[Any], now_str: str
+                               ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """普通订阅库缺集对账回退（见模块说明 3）。
+
+        返回 (回退明细, 本轮新增高危明细)。每轮最多处理 reconcile_max_per_run 部；
+        单条异常只记日志，不影响其余订阅与主巡检。
+        """
+        actions: List[Dict[str, Any]] = []
+        risks: List[Dict[str, Any]] = []
+        if not self._reconcile_enabled or not self._subscribe_oper:
+            return actions, risks
+        # 同一轮内的 TMDB 查询按 (tmdbid, season) 去重，几十部订阅不会打爆 TMDB
+        air_cache: Dict[Tuple[int, int], Any] = {}
+        total_cache: Dict[Tuple[int, int], int] = {}
+        acted = 0
+        for sub in subscribes:
+            if acted >= self._reconcile_max_per_run:
+                logger.info(f"对账回退已达本轮上限 {self._reconcile_max_per_run} 部，其余下一轮继续")
+                break
+            try:
+                item = self._reconcile_one(sub, air_cache, total_cache, now_str)
+            except Exception as e:
+                logger.error(f"对账回退处理异常: {getattr(sub, 'name', '')} - {e}")
+                continue
+            if not item:
+                continue
+            if item.get("risk"):
+                risks.append(item)
+                continue
+            acted += 1
+            actions.append(item)
+        return actions, risks
+
+    def _reconcile_one(self, sub: Any, air_cache: Dict[Tuple[int, int], Any],
+                       total_cache: Dict[Tuple[int, int], int],
+                       now_str: str) -> Optional[Dict[str, Any]]:
+        """处理单条订阅的对账回退；返回动作明细、高危明细或 None（无动作）。"""
+        if sub.type != MediaType.TV.value:
+            return None
+        key = str(sub.id)
+        # S=用户暂停、P=已有下载在进行：都不打扰
+        if sub.state in ("S", "P"):
+            return None
+        if key in self._reconcile_blocked:
+            return None
+        # 用户手动冻结总集数（微短剧手设 99 等）的订阅不参与自动对账
+        if getattr(sub, "manual_total_episode", 0):
+            return None
+        tmdbid = self._resolve_tmdbid(sub)
+        if not tmdbid:
+            return None
+        if not self._can_reconcile(sub.id):
+            return None
+        cache_key = (tmdbid, sub.season)
+        if cache_key not in total_cache:
+            total_cache[cache_key] = self._get_tmdb_season_total(tmdbid, sub.season)
+        season_total = total_cache[cache_key]
+        if cache_key not in air_cache:
+            air_cache[cache_key] = self._get_season_air_status(tmdbid, sub.season)
+        air = air_cache[cache_key]
+        if not air or air[0] is None:
+            # 取不到该季分集信息：保守跳过，与巡检同一口径
+            return None
+        season_finished = bool(air[0])
+        lib_eps = self._get_library_episodes(tmdbid, sub.season, sub.name, sub.year,
+                                             getattr(sub, "media_id", None))
+        missing_eps = [ep for ep in range(1, season_total + 1) if ep not in lib_eps] if season_total > 0 else []
+        lib_complete = season_total > 0 and not missing_eps
+        season_ended = season_finished or lib_complete
+        if sub.best_version:
+            # 洗版订阅由主巡检逻辑维护；本函数只负责「完结转洗版后限时兜底回退」
+            return self._reconcile_grace_revert(sub, key, lib_eps, lib_complete, season_ended, now_str)
+        note_set = {int(x) for x in (sub.note or []) if str(x).isdigit()}
+        if not note_set:
+            return None
+        rolled = sorted(note_set - set(lib_eps))
+        if not rolled:
+            # 没有「note 标完成但库里没有」的集：只清理待确认记录
+            self._reconcile_pending.pop(key, None)
+            return None
+        # 连续确认护栏：整季查空（媒体服务器可能重启/瞬断）需 3 轮、部分缺失需 2 轮，且每轮缺集一致
+        pending = self._reconcile_pending.get(key)
+        if pending and pending.get("rolled") == rolled:
+            count = int(pending.get("count") or 0) + 1
+        else:
+            count = 1
+        required_rounds = 3 if not lib_eps else 2
+        if count < required_rounds:
+            self._reconcile_pending[key] = {"rolled": rolled, "count": count}
+            logger.info(f"对账回退待确认({count}/{required_rounds}): {sub.name} S{sub.season} "
+                        f"缺 {self._format_missing_episodes(rolled)}")
+            return None
+        self._reconcile_pending.pop(key, None)
+        # 集级止损预检：任一集回退次数将达上限 → 拉黑该订阅并进高危清单
+        strikes = self._reconcile_strikes.setdefault(key, {})
+        for ep in rolled:
+            if int(strikes.get(str(ep), 0)) + 1 >= self._reconcile_stop_count:
+                self._reconcile_blocked.add(key)
+                reason = f"E{ep:02d} 已回退 {strikes.get(str(ep))} 次仍被删除，停止自动回退"
+                logger.warning(f"对账回退止损拉黑: {sub.name} S{sub.season} ({reason})")
+                self._save_state()
+                return {
+                    "risk": True,
+                    "name": sub.name, "year": sub.year, "season": sub.season,
+                    "episodes": rolled, "reason": reason, "time": now_str,
+                }
+        # 外科回退：只摘掉「note 标完成但库里没有」的集，其余字段（总集数/每集优先级/状态）不动。
+        # 缺集数按主程序同一口径递增：缺失集数 = 库缺集 − note，note 摘除后差集恰好增加 len(rolled)。
+        new_note = sorted(note_set - set(rolled))
+        payload: Dict[str, Any] = {
+            "note": new_note,
+            "lack_episode": (sub.lack_episode or 0) + len(rolled),
+        }
+        converting = False
+        if season_ended and season_total > 0 and not lib_complete:
+            # 已完结的季：同一次写入转整季洗版，只认整季包一次补齐并完成洗版（用户口径）
+            payload["best_version"] = 1
+            payload["best_version_full"] = 1
+            converting = True
+        try:
+            self._subscribe_oper.update(sid=sub.id, payload=payload)
+        except Exception as e:
+            logger.info(f"对账回退写入失败: {sub.name} S{sub.season} - {e}")
+            return None
+        for ep in rolled:
+            strikes[str(ep)] = int(strikes.get(str(ep), 0)) + 1
+        self._reconcile_records[key] = time.time()
+        if converting:
+            self._convert_records[key] = time.time()
+        self._reconcile_count += 1
+        self._save_state()
+        action = "回退缺集并转整季洗版" if converting else "回退缺集，等待重新下载"
+        logger.info(f"对账回退: {sub.name} S{sub.season} {action} "
+                    f"({self._format_missing_episodes(rolled)})")
+        return {
+            "name": sub.name, "year": sub.year, "season": sub.season,
+            "episodes": rolled, "action": action,
+            "reason": "媒体库缺集但订阅标记为已完成",
+            "time": now_str,
+        }
+
+    def _reconcile_grace_revert(self, sub: Any, key: str, lib_eps: Set[int],
+                                lib_complete: bool, season_ended: bool,
+                                now_str: str) -> Optional[Dict[str, Any]]:
+        """完结季转整季洗版后的兜底：限时仍缺集（站上没有整季包）→ 回退普通订阅逐集补。"""
+        converted_at = self._convert_records.get(key)
+        if not converted_at:
+            return None
+        if lib_complete:
+            # 已补齐：只清理兜底计时
+            self._convert_records.pop(key, None)
+            self._save_state()
+            return None
+        if not lib_eps:
+            # 媒体库整季查空（可能媒体服务器瞬断）不做兜底回退，防止误关洗版
+            return None
+        if not season_ended:
+            return None
+        if (time.time() - float(converted_at)) < self._reconcile_grace_days * 86400:
+            return None
+        try:
+            self._subscribe_oper.update(sid=sub.id, payload={"best_version": 0})
+        except Exception as e:
+            logger.info(f"转洗版兜底回退失败: {sub.name} S{sub.season} - {e}")
+            return None
+        self._convert_records.pop(key, None)
+        self._reconcile_records[key] = time.time()
+        self._save_state()
+        logger.info(f"转洗版兜底回退: {sub.name} S{sub.season} 已过 "
+                    f"{self._reconcile_grace_days} 天仍缺集，回退普通订阅逐集补")
+        return {
+            "name": sub.name, "year": sub.year, "season": sub.season,
+            "episodes": [], "action": "转洗版兜底回退，逐集补",
+            "reason": f"转整季洗版 {self._reconcile_grace_days} 天仍缺集（站上没有整季包）",
+            "time": now_str,
+        }
 
     def _reset_subscribe(self, sub: Any, extra: Optional[Dict[str, Any]] = None) -> bool:
         """重置订阅，让它重新搜索下载；字段与主程序「订阅重置」保持一致。
@@ -651,8 +995,13 @@ class BestVersionGuard(_PluginBase):
 
     def _query_media_exists(self, season: int, title: str, year: str,
                             media_id: Optional[str] = None,
-                            itemid: Optional[str] = None) -> Set[int]:
-        """查询媒体服务器中该季已入库的集号；media_id 为空表示不按媒体身份查询。"""
+                            itemid: Optional[str] = None,
+                            server: Optional[str] = None) -> Set[int]:
+        """查询媒体服务器中该季已入库的集号；media_id 为空表示不按媒体身份查询。
+
+        server 为空时主程序遍历全部媒体服务器并返回「第一台找到该剧的服务器」的结果；
+        指定 server 时只查该服务器，供多服务器并集合并使用。
+        """
         try:
             mi = MediaInfo()
             mi.type = MediaType.TV
@@ -665,8 +1014,7 @@ class BestVersionGuard(_PluginBase):
                 if str(media_id).isdigit():
                     mi.tmdb_id = int(media_id)
             chain = MediaServerChain()
-            # 不传 server：主程序会遍历全部已配置的媒体服务器（本机 Emby、飞牛影视等）
-            exists = chain.media_exists(mediainfo=mi, itemid=itemid)
+            exists = chain.media_exists(mediainfo=mi, itemid=itemid, server=server)
             if exists and exists.seasons:
                 eps = exists.seasons.get(season) or exists.seasons.get(str(season))
                 if eps:
@@ -677,18 +1025,33 @@ class BestVersionGuard(_PluginBase):
 
     def _get_library_episodes(self, tmdbid: int, season: int, title: str, year: str,
                               media_id: Optional[str] = None) -> Set[int]:
-        """取媒体库中该季已入库的集号。
+        """取媒体库中该季已入库的集号（所有已启用媒体服务器取并集）。
 
         主口径：完整媒体身份 + 本地索引条目 ID（条目名不一致也能命中）；
-        兜底：不带条目 ID 按原方式再查一次，覆盖本地索引中没有身份记录的媒体服务器。
+        再按已启用的每台媒体服务器逐台查询取并集——任一服务器上有该集就算存在（可播放），
+        避免只看第一台服务器而把另一台还有的集误判为缺失；
+        都没命中时按原方式（不带条目 ID）再查一次兜底。
         """
         resolved_id = str(media_id or tmdbid)
         itemid = self._resolve_library_item_id(season, title, year, resolved_id)
         episodes = self._query_media_exists(season, title, year,
                                             media_id=resolved_id, itemid=itemid)
+        for server_name in self._library_server_names():
+            episodes |= self._query_media_exists(season, title, year,
+                                                 media_id=resolved_id, server=server_name)
         if not episodes:
             episodes = self._query_media_exists(season, title, year)
         return episodes
+
+    @staticmethod
+    def _library_server_names() -> List[str]:
+        """返回已启用的媒体服务器名称（与主程序 API 同源），取不到时返回空列表。"""
+        try:
+            from app.application.mediaserver import get_mediaserver_configs
+            return [c.name for c in get_mediaserver_configs() if c.name and c.enabled]
+        except Exception as e:
+            logger.debug(f"获取媒体服务器列表失败: {e}")
+            return []
 
     def _get_tmdb_season_total(self, tmdbid: int, season: int) -> int:
         try:
@@ -980,6 +1343,12 @@ class BestVersionGuard(_PluginBase):
             except Exception as e:
                 logger.info(f"取消洗版失败: {sub.name} - {e}")
 
+        # 普通订阅库缺集对账回退（仅定时巡检；订阅新增事件不触发本逻辑）
+        reconcile_list: List[Dict[str, Any]] = []
+        high_risk_list: List[Dict[str, Any]] = []
+        if not single:
+            reconcile_list, high_risk_list = self._reconcile_normal_subs(subscribes, now_str)
+
         # 「开启洗版」的明细与累计计数两种模式都要记：新增那一刻是本插件唯一的开启入口，
         # 若只在巡检里累计，数据页的「最近开启洗版」与累计数会永远是空的。
         self._enabled_count += len(enable_list)
@@ -994,21 +1363,29 @@ class BestVersionGuard(_PluginBase):
                 self._last_fixed = fixed_list
             if reset_list:
                 self._last_reset = reset_list
+            if reconcile_list:
+                self._last_reconcile = reconcile_list
+            if high_risk_list:
+                self._last_high_risk = high_risk_list
         self._save_state()
 
         logger.info(f"检查完成: 开启洗版 {len(enable_list)} 个，取消洗版 {len(fixed_list)} 个，"
-                    f"重置 {len(reset_list)} 个")
+                    f"重置 {len(reset_list)} 个，对账回退 {len(reconcile_list)} 个"
+                    + (f"，新增高危 {len(high_risk_list)} 个" if high_risk_list else ""))
 
-        if self._notify and (fixed_list or reset_list or enable_list):
-            lines = self._format_lists(fixed_list, reset_list, enable_list)
+        if self._notify and (fixed_list or reset_list or enable_list or reconcile_list or high_risk_list):
+            lines = self._format_lists(fixed_list, reset_list, enable_list,
+                                       reconcile_list=reconcile_list, risk_list=high_risk_list)
             self.post_message(title="洗版守护", text="\n".join(lines))
 
     @staticmethod
     def _format_lists(fixed_list: List[Dict[str, Any]],
                       reset_list: List[Dict[str, Any]],
                       enable_list: Optional[List[Dict[str, Any]]] = None,
-                      limit: int = 10) -> List[str]:
-        """格式化开启洗版/取消洗版/重置订阅清单（前 N 个明细 + 总数后缀），供通知复用。"""
+                      limit: int = 10,
+                      reconcile_list: Optional[List[Dict[str, Any]]] = None,
+                      risk_list: Optional[List[Dict[str, Any]]] = None) -> List[str]:
+        """格式化开启洗版/取消洗版/重置订阅/对账回退/高危清单（前 N 个明细 + 总数后缀），供通知复用。"""
         lines: List[str] = []
         if enable_list:
             names = "、".join(
@@ -1028,6 +1405,18 @@ class BestVersionGuard(_PluginBase):
             )
             suffix = f"等 {len(reset_list)} 个" if len(reset_list) > limit else ""
             lines.append(f"已重置订阅/洗版进度，等待重新下载: {names}{suffix}")
+        if reconcile_list:
+            names = "、".join(
+                f"{r.get('name', '')} S{r.get('season')}({r.get('action', '')})" for r in reconcile_list[:limit]
+            )
+            suffix = f"等 {len(reconcile_list)} 个" if len(reconcile_list) > limit else ""
+            lines.append(f"对账回退缺集，已重新补下: {names}{suffix}")
+        if risk_list:
+            names = "、".join(
+                f"{r.get('name', '')} S{r.get('season')}({r.get('reason', '')})" for r in risk_list[:limit]
+            )
+            suffix = f"等 {len(risk_list)} 个" if len(risk_list) > limit else ""
+            lines.append(f"⚠ 高危止损（已停止自动回退，请人工处理）: {names}{suffix}")
         return lines
 
     # ── API ───────────────────────────────────────────────────
@@ -1041,6 +1430,22 @@ class BestVersionGuard(_PluginBase):
             "last_run": self._last_run,
         }
 
+    async def _api_reconcile_unblock(self, apikey: str = "", subscribe_id: int = 0) -> Dict[str, Any]:
+        """解除对账回退的止损拉黑与计数；带 subscribe_id 只解除单条。"""
+        if subscribe_id:
+            key = str(subscribe_id)
+            self._reconcile_blocked.discard(key)
+            self._reconcile_strikes.pop(key, None)
+            self._reconcile_records.pop(key, None)
+            self._reconcile_pending.pop(key, None)
+        else:
+            self._reconcile_blocked.clear()
+            self._reconcile_strikes.clear()
+        self._save_state()
+        logger.info(f"解除对账回退拉黑: subscribe_id={subscribe_id or '全部'}，"
+                    f"剩余拉黑 {len(self._reconcile_blocked)} 条")
+        return {"success": True, "blocked": len(self._reconcile_blocked)}
+
     # ── 事件处理 ──────────────────────────────────────────────
 
     @eventmanager.register(EventType.PluginAction)
@@ -1051,7 +1456,8 @@ class BestVersionGuard(_PluginBase):
             return
         logger.info("收到手动检查命令")
         self._guard_check()
-        lines = self._format_lists(self._last_fixed, self._last_reset, self._last_enabled)
+        lines = self._format_lists(self._last_fixed, self._last_reset, self._last_enabled,
+                                   reconcile_list=self._last_reconcile, risk_list=self._last_high_risk)
         if lines:
             text = f"检查完成（最近一次 {self._last_run or '未知'}）\n" + "\n".join(lines)
         else:
