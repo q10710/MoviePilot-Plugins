@@ -158,7 +158,7 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/subscribeassistantenhancedq.png"
     # 插件版本
-    plugin_version = "0.10.43"
+    plugin_version = "0.10.44"
     _site_cache_candidate_helper_warned = False
     # 插件作者
     plugin_author = "Q"
@@ -879,11 +879,25 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
 
         数字发行取 TMDB release_dates 中 type=4（数字/网络发行）的最早日期；
         首映时间取 type=1/2/3 的最早日期，缺失时回退 mediainfo.release_date。
+        日期源值是 TMDB 原生 ISO8601（如 2026-10-03T00:00:00.000Z），
+        先按共享解析器尝试，失败再按 ISO 兜底，避免全部落 None。
         """
+
+        def _parse_date(value):
+            parsed = self._parse_datetime(value)
+            if parsed:
+                return parsed
+            if isinstance(value, str) and value:
+                try:
+                    return datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+                except ValueError:
+                    return None
+            return None
+
         digital_ts = None
         premiere_ts = None
         for item in (getattr(mediainfo, "release_dates", None) or []):
-            parsed = self._parse_datetime(getattr(item, "date", None))
+            parsed = _parse_date(getattr(item, "date", None))
             if not parsed:
                 continue
             ts = parsed.timestamp()
@@ -895,7 +909,7 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
                 if premiere_ts is None or ts < premiere_ts:
                     premiere_ts = ts
         if premiere_ts is None:
-            parsed = self._parse_datetime(getattr(mediainfo, "release_date", None))
+            parsed = _parse_date(getattr(mediainfo, "release_date", None))
             if parsed:
                 premiere_ts = parsed.timestamp()
         return digital_ts, premiere_ts
