@@ -158,7 +158,7 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/subscribeassistantenhancedq.png"
     # 插件版本
-    plugin_version = "0.10.42"
+    plugin_version = "0.10.43"
     _site_cache_candidate_helper_warned = False
     # 插件作者
     plugin_author = "Q"
@@ -872,17 +872,71 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
             return False
         return (datetime.datetime.now() - last_update).total_seconds() >= days * 86400
 
-    def _best_version_overdue(self, subscribe, now=None) -> bool:
-        """洗版是否超时限：从最近活动时间起算超过对应媒体类型洗版时限。
+    _MOVIE_OFFLINE_FALLBACK_DAYS: int = 365
 
-        活动时间取该订阅在 torrents 任务数据中的最新记录时间；
-        无下载记录则按首次观察锚点（缺失则置当前时间）。
+    def _movie_release_state(self, mediainfo):
+        """返回电影的（数字发行时间戳, 首映时间戳），无法解析时对应值为 None。
+
+        数字发行取 TMDB release_dates 中 type=4（数字/网络发行）的最早日期；
+        首映时间取 type=1/2/3 的最早日期，缺失时回退 mediainfo.release_date。
+        """
+        digital_ts = None
+        premiere_ts = None
+        for item in (getattr(mediainfo, "release_dates", None) or []):
+            parsed = self._parse_datetime(getattr(item, "date", None))
+            if not parsed:
+                continue
+            ts = parsed.timestamp()
+            item_type = getattr(item, "type", None)
+            if item_type == 4:
+                if digital_ts is None or ts < digital_ts:
+                    digital_ts = ts
+            elif item_type in (1, 2, 3):
+                if premiere_ts is None or ts < premiere_ts:
+                    premiere_ts = ts
+        if premiere_ts is None:
+            parsed = self._parse_datetime(getattr(mediainfo, "release_date", None))
+            if parsed:
+                premiere_ts = parsed.timestamp()
+        return digital_ts, premiere_ts
+
+    def _movie_waiting_offline(self, mediainfo) -> bool:
+        """电影是否尚未下线（无 TMDB 数字发行记录）。"""
+        if not mediainfo:
+            return False
+        digital_ts, _premiere_ts = self._movie_release_state(mediainfo)
+        return digital_ts is None
+
+    def _best_version_overdue(self, subscribe, now=None, mediainfo=None) -> bool:
+        """洗版是否超时限。
+
+        电视剧：从最近活动时间起算（原逻辑不变）——活动时间取该订阅在
+        torrents 任务数据中的最新记录时间；无下载记录则按首次观察锚点。
+        电影：按「下线时间」起算——TMDB 有数字发行（type=4）记录时，距今超过
+        洗版时限才超时；无数字发行记录（未下线）时永不超时，继续等待；
+        兜底：首映已满 365 天仍无下线记录时判超时，防止 TMDB 漏填导致永不收口。
         remaining_days=0 表示不限，永不超时。
         """
         days = self._best_version_timeout_days(subscribe)
         if not days:
             return False
         now = now or time.time()
+        if resolve_subscribe_media_type(subscribe) == MediaType.MOVIE:
+            if not mediainfo:
+                return False
+            digital_ts, premiere_ts = self._movie_release_state(mediainfo)
+            if digital_ts is not None:
+                return (now - digital_ts) > days * 86400
+            if (
+                premiere_ts is not None
+                and (now - premiere_ts) >= self._MOVIE_OFFLINE_FALLBACK_DAYS * 86400
+            ):
+                logger.info(
+                    f"洗版超时兜底：{getattr(mediainfo, 'title_year', '')} 无数字发行记录"
+                    f"且首映已满 {self._MOVIE_OFFLINE_FALLBACK_DAYS} 天，按超时处理"
+                )
+                return True
+            return False
         sid = subscribe.id
         torrents = self._task_manager.read("torrents") or {}
         times = [
@@ -903,6 +957,7 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
         if not priority or not self._subscribe_oper:
             return
         detail("洗版巡检：开始")
+        waiting_offline: list[str] = []
         for subscribe in (self._subscribe_oper.list(state="N,R,P") or []):
             if (
                 resolve_subscribe_media_type(subscribe) not in (MediaType.MOVIE, MediaType.TV)
@@ -934,15 +989,21 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
                             image=self._resolve_notification_image(subscribe, mediainfo),
                         )
                         continue
-                if is_full_best_version_subscribe(subscribe) and self._best_version_overdue(subscribe):
-                    logger.info(f"洗版巡检：{format_subscribe(subscribe)} {mode_label}超过洗版时限，标记洗版完成并停止洗版")
-                    priority.mark_full_best_version_complete(subscribe)
-                    self._notify_subscribe(
-                        f"{format_subscribe(subscribe)} {mode_label}超过时限"
-                        f"（{self._best_version_timeout_days(subscribe)}天），已标记洗版优先级为完成",
-                        image=self._resolve_notification_image(subscribe, mediainfo),
-                    )
-                    continue
+                if is_full_best_version_subscribe(subscribe):
+                    if self._best_version_overdue(subscribe, mediainfo=mediainfo):
+                        logger.info(f"洗版巡检：{format_subscribe(subscribe)} {mode_label}超过洗版时限，标记洗版完成并停止洗版")
+                        priority.mark_full_best_version_complete(subscribe)
+                        self._notify_subscribe(
+                            f"{format_subscribe(subscribe)} {mode_label}超过时限"
+                            f"（{self._best_version_timeout_days(subscribe)}天），已标记洗版优先级为完成",
+                            image=self._resolve_notification_image(subscribe, mediainfo),
+                        )
+                        continue
+                    if (
+                        resolve_subscribe_media_type(subscribe) == MediaType.MOVIE
+                        and self._movie_waiting_offline(mediainfo)
+                    ):
+                        waiting_offline.append(format_subscribe(subscribe))
             else:
                 detail(
                     f"洗版巡检：{format_subscribe(subscribe)} {mode_label}媒体识别失败，本轮跳过；"
@@ -951,6 +1012,12 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
                     f"媒体类型：{subscribe.type or '未设置'}，季号：{subscribe.season if subscribe.season is not None else '未设置'}；"
                     f"建议检查订阅名称、年份、媒体来源和媒体 ID、媒体类型和季号"
                 )
+        if waiting_offline:
+            detail(
+                f"洗版巡检：{len(waiting_offline)} 部电影尚未下线（无 TMDB 数字发行记录），"
+                f"按口径继续等待不超时：{'、'.join(waiting_offline[:20])}"
+                f"{' 等' if len(waiting_offline) > 20 else ''}"
+            )
 
     @staticmethod
     def _best_version_mode_label(subscribe) -> str:
