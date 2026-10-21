@@ -474,18 +474,25 @@ class SubscriptionCleanup:
         history_delete_total = 0
         history_deleted = 0
         protected_hashes: set = set()
+        hr_undetermined = 0
         for history in histories:
             src_fileitem = self._field(history, "src_fileitem")
             source_path = self._fileitem_path(src_fileitem) or self._field(history, "src")
             download_hash = self._field(history, "download_hash")
             # H&R 种子保护：交给插件移入收容目录保种，不删文件、不发删除事件（否则会删掉保种任务）
+            # 返回 True=已保护、False=确认非 H&R、None=无法判定（本轮完全跳过，下一轮重试）
             protected = False
             if download_hash and self._protect_hr:
                 try:
-                    protected = bool(self._protect_hr(download_hash, source_path, subscribe))
+                    hr_result = self._protect_hr(download_hash, source_path, subscribe)
                 except Exception as err:
                     logger.error(f"订阅清理：H&R 种子保护判断失败 {download_hash}：{err}", exc_info=True)
-                    protected = False
+                    # 判定异常按「无法判定」处理（fail-closed）：本轮跳过该记录，绝不误删
+                    hr_result = None
+                if hr_result is None:
+                    hr_undetermined += 1
+                    continue
+                protected = bool(hr_result)
             if protected:
                 protected_hashes.add(str(download_hash))
                 if source_path:
@@ -520,6 +527,7 @@ class SubscriptionCleanup:
             f"源文件 {source_file_deleted}/{len(histories)} 个，"
             f"下载记录通知 {download_notice_sent}/{download_notice_total} 个，"
             f"H&R 保种保护 {len(protected_hashes)} 个"
+            + (f"，无法判定跳过 {hr_undetermined} 个" if hr_undetermined else "")
         )
 
         if self._notify:
