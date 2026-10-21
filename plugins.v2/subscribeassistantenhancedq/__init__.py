@@ -158,7 +158,7 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/subscribeassistantenhancedq.png"
     # 插件版本
-    plugin_version = "0.10.46"
+    plugin_version = "0.10.47"
     _site_cache_candidate_helper_warned = False
     # 插件作者
     plugin_author = "Q"
@@ -2199,6 +2199,12 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
         if not site_name:
             site_name = self._site_name_from_history(torrent_hash)
         archived = record.get("hit_and_run")
+        if archived is None and self._task_manager:
+            # 种子完成后监控记录已被清：回退读 H&R 长期留档（清记录时单独存档）
+            archive_record = (self._task_manager.read("hr_archive") or {}).get(torrent_hash) or {}
+            archived = archive_record.get("hit_and_run")
+            if not site_name:
+                site_name = str(archive_record.get("site_name") or "").strip()
 
         # 1) 下载当时存档的种子级标记：最强的种子级判据
         if archived is True:
@@ -2724,11 +2730,14 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
         except Exception as err:
             logger.debug(f"订阅收容：写观察期保护失败 {torrent_hash}：{err}")
 
-    def _protect_hr_seed_from_cleanup(self, torrent_hash, source_path=None, subscribe=None) -> bool:
+    def _protect_hr_seed_from_cleanup(self, torrent_hash, source_path=None, subscribe=None) -> Optional[bool]:
         """订阅清理命中 H&R 种子时的保护：不删源文件，把种子移入收容目录继续保种。
 
         返回 True 表示已接管（调用方跳过删除源文件与 DownloadFileDeleted），
-        返回 False 表示按原清理逻辑处理。
+        返回 False 表示按原清理逻辑处理；
+        返回 None 表示**无法判定**（下载器不可用/查询失败/已配置但未运行的下载器里可能有该种子），
+        调用方应本轮完全跳过该条记录的删除，等下一轮巡检重试——
+        「查不清」绝不能当成「没有可保护的种子」，否则下载器瞬断的那一轮会误删 H&R 做种。
 
         注意这里**不能**发 DownloadFileDeleted：主程序收到该事件会走
         `app/chain/download/tasks.py::_download_file_deleted` → `remove_torrents(delete_file=False)`，
@@ -2755,8 +2764,13 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
         # 这里只需「找到任一副本」判断是否 H&R，不做已完成选优，避免把正在保种的已完成副本搬走
         downloader, conclusive, raw = self._locate_torrent_downloader(torrent_hash, prefer_finished=False)
         if not downloader:
-            # 找不到种子时按原逻辑处理：没有可保护的做种任务
-            return False
+            if conclusive:
+                # 已遍历全部下载器且无任何报错：确定没有可保护的做种任务，按原逻辑处理
+                return False
+            # 结论不确定（下载器不可用/查询失败）：本轮跳过删除，等下一轮能查清时再处理
+            logger.warning(f"订阅清理：无法确定种子 {torrent_hash[:12]} 是否存在于下载器"
+                           f"（下载器不可用或查询失败），本轮保留源文件不删除（下轮重试）")
+            return None
         record = (self._task_manager.read("torrents") or {}).get(torrent_hash) or {}
         if not self._is_hr_release(downloader, torrent_hash, record, subscribe):
             return False
@@ -2986,6 +3000,17 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
             return [], False
         # 只查记录里的下载器时，结论本身不足以断定种子不存在，因此不置为确定
         conclusive = bool(services) and not only_preferred
+        if conclusive:
+            # 已配置但未运行/未启用的下载器也算「无法判定」：种子可能在停用的下载器里
+            try:
+                configured = set(self._downloader_helper.get_configs(include_disabled=True) or {})
+                not_running = configured - set(services.keys())
+                if not_running:
+                    logger.debug(f"订阅收容：已配置但未运行的下载器 {sorted(not_running)}，"
+                                 f"种子 {torrent_hash[:12]} 的存在性按无法判定处理")
+                    conclusive = False
+            except Exception:
+                conclusive = False
         copies: List[Tuple[str, Any, Any]] = []
         for name in candidates:
             try:
@@ -3747,6 +3772,9 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
                             changed = True
             if changed:
                 self.save_data("relocate_records", records)
+            if drop and self._task_manager:
+                # 收容记录销账时同步清掉 H&R 长期留档（种子已到期删除，判据不再需要）
+                self._task_manager.update("hr_archive", lambda data: (data.pop(torrent_hash, None), data)[1])
         finally:
             self._relocate_lock.release()
 
@@ -3817,6 +3845,14 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
             if name not in candidates:
                 candidates.append(name)
         conclusive = bool(services)
+        if conclusive:
+            # 已配置但未运行/未启用的下载器也算「无法判定」：种子可能在停用的下载器里
+            try:
+                configured = set(self._downloader_helper.get_configs(include_disabled=True) or {})
+                if configured - set(services.keys()):
+                    conclusive = False
+            except Exception:
+                conclusive = False
         for name in candidates:
             try:
                 service = self._downloader_helper.get_service(name=name)
