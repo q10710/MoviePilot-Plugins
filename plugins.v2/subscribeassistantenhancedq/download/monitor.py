@@ -430,12 +430,41 @@ class DownloadMonitor:
             self._remove_subscribe_torrent_task(subscribe_id, torrent_hash)
 
     def _remove_torrent_task(self, torrent_hash: str):
-        """从下载任务表移除指定 hash。"""
+        """从下载任务表移除指定 hash；H&R 判据字段单独留档，供收容保护继续判定。"""
+        archived: dict = {}
+
         def updater(data: dict) -> dict:
-            data.pop(torrent_hash, None)
+            record = data.pop(torrent_hash, None)
+            if isinstance(record, dict) and (
+                record.get("hit_and_run") is not None or str(record.get("site_name") or "").strip()
+            ):
+                archived.update({
+                    "hit_and_run": record.get("hit_and_run"),
+                    "site_name": str(record.get("site_name") or "").strip(),
+                    "downloader": str(record.get("downloader") or "").strip(),
+                    "archived_at": time.time(),
+                })
             return data
 
         self._update("torrents", updater)
+        if archived:
+            self._archive_hr_fields(torrent_hash, archived)
+
+    def _archive_hr_fields(self, torrent_hash: str, fields: dict):
+        """把完成种子的 H&R 判据写入长期留档（收容保护判定回退读取），并清理 365 天前旧档。"""
+
+        def updater(data: dict) -> dict:
+            entry = data.get(torrent_hash) or {}
+            entry.update(fields)
+            data[torrent_hash] = entry
+            cutoff = time.time() - 365 * 86400
+            for key in list(data.keys()):
+                stored_time = (data.get(key) or {}).get("archived_at") or 0
+                if stored_time and stored_time < cutoff:
+                    data.pop(key, None)
+            return data
+
+        self._update("hr_archive", updater)
 
     def _remove_subscribe_torrent_task(self, subscribe_id: int, torrent_hash: str):
         """移除订阅内 subscribes.torrent_tasks 的同名种子任务。"""
