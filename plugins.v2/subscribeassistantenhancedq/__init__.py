@@ -158,7 +158,7 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/subscribeassistantenhancedq.png"
     # 插件版本
-    plugin_version = "0.10.44"
+    plugin_version = "0.10.45"
     _site_cache_candidate_helper_warned = False
     # 插件作者
     plugin_author = "Q"
@@ -926,9 +926,12 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
 
         电视剧：从最近活动时间起算（原逻辑不变）——活动时间取该订阅在
         torrents 任务数据中的最新记录时间；无下载记录则按首次观察锚点。
-        电影：按「下线时间」起算——TMDB 有数字发行（type=4）记录时，距今超过
-        洗版时限才超时；无数字发行记录（未下线）时永不超时，继续等待；
-        兜底：首映已满 365 天仍无下线记录时判超时，防止 TMDB 漏填导致永不收口。
+        电影：下线时间与最后一次下载时间双条件收口（天数同取配置的洗版时限，
+        不写死）——TMDB 有数字发行（type=4）记录时，需「距数字发行超过 N 天」
+        且「最后一次下载也超过 N 天（或从未下载）」才判超时；任一条件未满足
+        则继续等待（仍在活跃下载的片不会被收口）。无数字发行记录（未下线）时
+        永不超时，继续等待；兜底：首映已满 365 天仍无下线记录时判超时，
+        防止 TMDB 漏填导致永不收口。
         remaining_days=0 表示不限，永不超时。
         """
         days = self._best_version_timeout_days(subscribe)
@@ -940,7 +943,15 @@ class SubscribeAssistantEnhancedQ(_PluginBase):
                 return False
             digital_ts, premiere_ts = self._movie_release_state(mediainfo)
             if digital_ts is not None:
-                return (now - digital_ts) > days * 86400
+                if (now - digital_ts) <= days * 86400:
+                    return False
+                # 下线已超 N 天；再看最后一次下载是否也超 N 天（从未下载视为满足）
+                last_download = self._last_download_date(subscribe)
+                if last_download is not None:
+                    today = datetime.datetime.fromtimestamp(now).date()
+                    if (today - last_download).days <= days:
+                        return False
+                return True
             if (
                 premiere_ts is not None
                 and (now - premiere_ts) >= self._MOVIE_OFFLINE_FALLBACK_DAYS * 86400
