@@ -44,7 +44,7 @@ class RainbowReviveButler(_PluginBase):
     plugin_name = "彩虹岛复活区管家Q自用版"
     plugin_desc = "基于六个橙子「憨憨保种区管家」(HHClubButler) 架构复刻，致谢原作者 SixOrg。\n复活区全景 / 免费到期处置 / 捡漏推送 / 做种到期提醒"
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/rainbowrevivebutler.png"
-    plugin_version = "1.2.1"
+    plugin_version = "1.2.2"
     plugin_label = "资源站点"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -1024,6 +1024,47 @@ class RainbowReviveButler(_PluginBase):
 
         return f'<div style="background:transparent;">{acc_cells}{revive_title}{revive_bar}{revive_legend}{seg}</div>'
 
+    def _overview_form_cards(self) -> dict:
+        """配置表单顶部数据面板（照原作者 _overview_form_cards：VCard + 响应式统计格）。"""
+        ov = self._last_overview or {}
+        stats = ov.get("stats", {}) or {}
+        ps = ov.get("portfolio_stats", {}) or {}
+        if not ov or not ov.get("total"):
+            return {"component": "VCard", "props": {"flat": True},
+                    "content": [{"component": "VCardText", "props": {},
+                                 "text": "尚未运行或未获取到数据（启用插件或刷新概况后此处显示最近概况）"}]}
+        ON60 = "rgba(var(--v-theme-on-surface),.6)"
+
+        def stat_col(label, num, sub=""):
+            return {"component": "VCol", "props": {"cols": 6, "md": 3},
+                    "content": [
+                        {"component": "div",
+                         "props": {"style": f"text-align:center;font-size:11px;color:{ON60};white-space:nowrap;"},
+                         "text": label},
+                        {"component": "div",
+                         "props": {"style": "text-align:center;font-size:17px;font-weight:700;white-space:nowrap;"},
+                         "text": f"{num} {sub}".strip()},
+                    ]}
+
+        credit = stats.get("credit", 0) or 0
+        rate = stats.get("credit_rate")
+        credit_sub = f"+{rate:.0f}/h" if rate else ""
+        stats_row = {"component": "VRow", "props": {"dense": True}, "content": [
+            stat_col("🌟 做种积分", f"{credit:,.0f}", credit_sub),
+            stat_col("📊 分享率", f"{stats.get('ratio', 0):.3f}"),
+            stat_col("⬆️ 上传量", f"{stats.get('uploaded_tb', 0):.2f} TB"),
+            stat_col("🌿 当前做种", stats.get("seeding_now", 0), "个"),
+        ]}
+        revive_row = {"component": "VRow", "props": {"dense": True}, "content": [
+            stat_col("🌱 复活区", ov.get("total", 0), "种"),
+            stat_col("🎁 免费中", ov.get("free_active", 0), "种"),
+            stat_col("🔖 我在做种", ov.get("my_seeding", 0), "个"),
+            stat_col("💎 做种组合", ps.get("count", 0), f"颗/{ps.get('total_gb', 0):.0f}G" if ps else ""),
+        ]}
+        return {"component": "VCard", "props": {"flat": True},
+                "content": [{"component": "VCardText", "props": {"class": "py-2"},
+                             "content": [stats_row, revive_row]}]}
+
     def _get_overview_cached_or_refresh(self) -> dict:
         """取缓存概况，超过 2h 或缺失时同步刷新。"""
         if self._last_overview and time.time() - self._last_overview_ts < 2 * 3600:
@@ -1155,93 +1196,83 @@ class RainbowReviveButler(_PluginBase):
     # 页面（Vuetify JSON）
     # ------------------------------------------------------------------ #
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
-        """配置表单 + 顶部数据面板。"""
+        """配置表单（照原作者结构：顶部数据面板 + 响应式栅格 + VCronField）。"""
         downloaders = []
         try:
             for config in DownloaderHelper().get_configs().values():
                 downloaders.append({"title": config.name, "value": config.name})
         except Exception as e:
             logger.warning(f"彩虹岛复活区管家：获取下载器列表失败：{e}")
-        ov = self._last_overview or {}
-        if ov:
-            stat_line = (f"复活区 {ov.get('total', 0)} 种（免费中 {ov.get('free_active', 0)}）"
-                         f" · 我在做种 {ov.get('my_seeding', 0)} 个"
-                         f" · 到期删 {ov.get('deleted', 0)} 提前删 {ov.get('early', 0)}"
-                         f" · {datetime.fromtimestamp(ov.get('ts', time.time())).strftime('%H:%M')} 刷新")
-        else:
-            stat_line = "尚未拉取数据（启用后守护线程自动刷新，或点详情页工作台）"
-        panel = {"component": "VAlert",
-                 "props": {"type": "info", "variant": "tonal", "density": "compact",
-                           "text": stat_line, "class": "mb-2"}}
-        form = [
-            {"component": "VRow", "props": {"dense": True},
-             "content": [{"component": "VCol", "props": {"cols": 12}, "content": [panel]}]},
-            {"component": "VForm", "content": [
-                {"component": "VRow", "props": {"dense": True}, "content": [
-                    {"component": "VCol", "props": {"cols": 4}, "content": [
-                        {"component": "VSwitch", "props": {"model": "enabled", "label": "启用插件", "color": "primary"}}]},
-                    {"component": "VCol", "props": {"cols": 4}, "content": [
-                        {"component": "VSwitch", "props": {"model": "notify", "label": "发送通知"}}]},
-                    {"component": "VCol", "props": {"cols": 4}, "content": [
-                        {"component": "VSwitch", "props": {"model": "onlyonce", "label": "立即运行一次"}}]},
+        form = [{
+            "component": "VForm",
+            "content": [
+                {**self._overview_form_cards()},
+                {"component": "VRow", "content": [
+                    {"component": "VCol", "props": {"cols": 12, "md": 3},
+                     "content": [{"component": "VSwitch", "props": {"model": "enabled", "label": "启用插件"}}]},
+                    {"component": "VCol", "props": {"cols": 12, "md": 3},
+                     "content": [{"component": "VSwitch", "props": {"model": "notify", "label": "发送通知"}}]},
+                    {"component": "VCol", "props": {"cols": 12, "md": 3},
+                     "content": [{"component": "VSwitch", "props": {"model": "onlyonce", "label": "立即运行一次"}}]},
+                    {"component": "VCol", "props": {"cols": 12, "md": 3},
+                     "content": [{"component": "VSwitch", "props": {"model": "delete_files", "label": "删除时含数据文件"}}]},
                 ]},
-                {"component": "VRow", "props": {"dense": True}, "content": [
-                    {"component": "VCol", "props": {"cols": 4}, "content": [
-                        {"component": "VTextField", "props": {
-                            "model": "cron", "label": "巡检周期（全景/捡漏/自动下载）",
-                            "placeholder": "0 */2 * * *（每2小时）",
-                            "hint": "到期处置由守护线程单独高频执行，与此无关", "persistent-hint": True}}]},
-                    {"component": "VCol", "props": {"cols": 4}, "content": [
-                        {"component": "VTextField", "props": {
-                            "model": "dispose_minutes", "label": "到期处置间隔（分钟）",
-                            "type": "number",
-                            "hint": "守护线程频率，越小越接近「到期即删」", "persistent-hint": True}}]},
-                    {"component": "VCol", "props": {"cols": 4}, "content": [
-                        {"component": "VTextField", "props": {
-                            "model": "site_name", "label": "站点名",
-                            "placeholder": "彩虹岛", "hint": "自动匹配站点管理中的彩虹岛（ptchdbits）",
-                            "persistent-hint": True}}]},
+                {"component": "VRow", "content": [
+                    {"component": "VCol", "props": {"cols": 12, "md": 4},
+                     "content": [{"component": "VCronField", "props": {
+                         "model": "cron", "label": "执行周期（全景/捡漏/自动下载）",
+                         "placeholder": "0 */2 * * *（每2小时）"}}]},
+                    {"component": "VCol", "props": {"cols": 12, "md": 4},
+                     "content": [{"component": "VTextField", "props": {
+                         "model": "dispose_minutes", "label": "到期处置间隔（分钟）", "type": "number",
+                         "hint": "守护线程频率，越小越接近「到期即删」", "persistent-hint": True}}]},
+                    {"component": "VCol", "props": {"cols": 12, "md": 4},
+                     "content": [{"component": "VTextField", "props": {
+                         "model": "warn_hours", "label": "到期前预警（小时）", "type": "number"}}]},
                 ]},
-                {"component": "VRow", "props": {"dense": True}, "content": [
-                    {"component": "VCol", "props": {"cols": 6}, "content": [
-                        {"component": "VSelect", "props": {
-                            "model": "downloaders", "label": "受管控下载器（到期处置）",
-                            "items": downloaders, "multiple": True, "chips": True,
-                            "hint": "巡检这些下载器中的未完成任务，到期自动删", "persistent-hint": True}}]},
-                    {"component": "VCol", "props": {"cols": 3}, "content": [
-                        {"component": "VTextField", "props": {"model": "warn_hours", "label": "到期前预警(小时)", "type": "number"}}]},
-                    {"component": "VCol", "props": {"cols": 3}, "content": [
-                        {"component": "VTextField", "props": {"model": "low_seeder_max", "label": "捡漏做种阈值(人)",
-                                                              "type": "number", "hint": "0=关闭捡漏", "persistent-hint": True}}]},
+                {"component": "VRow", "content": [
+                    {"component": "VCol", "props": {"cols": 12, "md": 4},
+                     "content": [{"component": "VTextField", "props": {
+                         "model": "site_name", "label": "站点名", "placeholder": "彩虹岛",
+                         "hint": "自动匹配站点管理中的彩虹岛（ptchdbits）", "persistent-hint": True}}]},
+                    {"component": "VCol", "props": {"cols": 12, "md": 4},
+                     "content": [{"component": "VTextField", "props": {
+                         "model": "low_seeder_max", "label": "捡漏做种阈值（人）", "type": "number",
+                         "hint": "免费且做种≤N 推送；0=关闭捡漏", "persistent-hint": True}}]},
+                    {"component": "VCol", "props": {"cols": 12, "md": 4},
+                     "content": [{"component": "VSelect", "props": {
+                         "model": "downloaders", "label": "受管控下载器（到期处置）",
+                         "items": downloaders, "multiple": True, "chips": True}}]},
                 ]},
-                {"component": "VRow", "props": {"dense": True}, "content": [
-                    {"component": "VCol", "props": {"cols": 3}, "content": [
-                        {"component": "VSwitch", "props": {"model": "delete_files", "label": "删除时含数据文件",
-                                                           "hint": "关闭=仅删任务", "persistent-hint": True}}]},
-                    {"component": "VCol", "props": {"cols": 3}, "content": [
-                        {"component": "VSwitch", "props": {"model": "early_delete", "label": "预计完不成提前删",
-                                                           "hint": "按当前速率 ETA 超过剩余免费时长即提前删", "persistent-hint": True}}]},
-                    {"component": "VCol", "props": {"cols": 3}, "content": [
-                        {"component": "VSwitch", "props": {"model": "auto_download", "label": "捡漏自动下载",
-                                                           "hint": "低做种免费种子自动推送下载器", "persistent-hint": True}}]},
-                    {"component": "VCol", "props": {"cols": 3}, "content": [
-                        {"component": "VTextField", "props": {"model": "target_volume", "label": "自动下载体积上限(GB)",
-                                                              "type": "number", "hint": "0=不限", "persistent-hint": True}}]},
+                {"component": "VRow", "content": [
+                    {"component": "VCol", "props": {"cols": 12, "md": 4},
+                     "content": [{"component": "VSwitch", "props": {
+                         "model": "early_delete", "label": "预计完不成提前删",
+                         "hint": "按当前速率 ETA 超过剩余免费时长即提前删", "persistent-hint": True}}]},
+                    {"component": "VCol", "props": {"cols": 12, "md": 4},
+                     "content": [{"component": "VSwitch", "props": {
+                         "model": "auto_download", "label": "捡漏自动下载",
+                         "hint": "低做种免费种子自动推送下载器", "persistent-hint": True}}]},
+                    {"component": "VCol", "props": {"cols": 12, "md": 4},
+                     "content": [{"component": "VTextField", "props": {
+                         "model": "target_volume", "label": "自动下载体积上限（GB）", "type": "number",
+                         "hint": "0=不限", "persistent-hint": True}}]},
                 ]},
-                {"component": "VRow", "props": {"dense": True}, "content": [
-                    {"component": "VCol", "props": {"cols": 4}, "content": [
-                        {"component": "VSelect", "props": {"model": "push_downloader", "label": "推送下载器（自动下载）",
-                                                           "items": downloaders,
-                                                           "hint": "捡漏种子加到哪个下载器", "persistent-hint": True}}]},
-                    {"component": "VCol", "props": {"cols": 4}, "content": [
-                        {"component": "VTextField", "props": {"model": "save_path", "label": "保存路径（可选）",
-                                                              "placeholder": "留空用下载器默认目录"}}]},
-                    {"component": "VCol", "props": {"cols": 4}, "content": [
-                        {"component": "VTextField", "props": {"model": "tag", "label": "任务标签（可选）",
-                                                              "placeholder": "留空不打标签"}}]},
+                {"component": "VRow", "content": [
+                    {"component": "VCol", "props": {"cols": 12, "md": 4},
+                     "content": [{"component": "VSelect", "props": {
+                         "model": "push_downloader", "label": "推送下载器（自动下载）",
+                         "items": downloaders, "hint": "捡漏种子加到哪个下载器", "persistent-hint": True}}]},
+                    {"component": "VCol", "props": {"cols": 12, "md": 4},
+                     "content": [{"component": "VTextField", "props": {
+                         "model": "save_path", "label": "保存路径（可选）",
+                         "placeholder": "留空用下载器默认目录"}}]},
+                    {"component": "VCol", "props": {"cols": 12, "md": 4},
+                     "content": [{"component": "VTextField", "props": {
+                         "model": "tag", "label": "任务标签（可选）", "placeholder": "留空不打标签"}}]},
                 ]},
-            ]},
-        ]
+            ],
+        }]
         defaults = {
             "enabled": False, "onlyonce": False, "notify": True,
             "cron": "0 */2 * * *", "site_name": "彩虹岛", "downloaders": [],
