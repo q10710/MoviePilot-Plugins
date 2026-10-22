@@ -44,7 +44,7 @@ class RainbowReviveButler(_PluginBase):
     plugin_name = "彩虹岛复活区管家Q自用版"
     plugin_desc = "基于六个橙子「憨憨保种区管家」(HHClubButler) 架构复刻，致谢原作者 SixOrg。\n复活区全景 / 免费到期处置 / 捡漏推送 / 做种到期提醒"
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/rainbowrevivebutler.png"
-    plugin_version = "1.2.0"
+    plugin_version = "1.2.1"
     plugin_label = "资源站点"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -936,6 +936,94 @@ class RainbowReviveButler(_PluginBase):
             "valuable": valuable, "crowded": crowded,
         }
 
+    @staticmethod
+    def _refresh_note(last_ts: float = 0.0, hours: float = 2.0) -> str:
+        """刷新状态说明文案。"""
+        if not last_ts:
+            return "尚未拉取数据"
+        mins = (time.time() - last_ts) / 60
+        if mins >= 60:
+            h, m = divmod(int(mins), 60)
+            ago = f"{h} 小时 {m} 分钟前" if m else f"{h} 小时前"
+        else:
+            ago = f"{int(mins)} 分钟前"
+        if hours > 0:
+            return f"每 {hours:g} 小时自动刷新 · 上次更新 {ago}"
+        return f"上次更新 {ago}"
+
+    @staticmethod
+    def _overview_html(ov: dict) -> str:
+        """照原作者版式：主题自适应 table 布局，账户统计 4 格 + 复活区档位色条 + 做种组合色条。"""
+        if not ov:
+            return ('<div style="padding:12px 14px;border-radius:10px;'
+                    'border:1px solid rgba(var(--v-theme-on-surface),.08);'
+                    'background:rgba(var(--v-theme-surface),.55);'
+                    'color:rgba(var(--v-theme-on-surface),.72);font-size:12px;">'
+                    '彩虹岛复活区管家：未获取到数据（请确认插件已启用、下载器已选择、站点可访问）</div>')
+        stats = ov.get("stats", {}) or {}
+        ps = ov.get("portfolio_stats", {}) or {}
+        seeds = ov.get("seeds", []) or []
+        ON = "rgb(var(--v-theme-on-surface))"
+        ON60 = "rgba(var(--v-theme-on-surface),.6)"
+        ON40 = "rgba(var(--v-theme-on-surface),.4)"
+
+        def td(label, num, sub):
+            return (f'<td style="text-align:center;padding:4px 2px;width:25%;vertical-align:top;">'
+                    f'<div style="font-size:10.5px;color:{ON60};white-space:nowrap;">{label}</div>'
+                    f'<div style="font-size:17px;font-weight:700;color:{ON};line-height:1.4;white-space:nowrap;">{num}'
+                    f'<span style="font-size:10px;font-weight:400;color:{ON40};"> {sub}</span></div></td>')
+
+        # 账户统计 4 格（做种积分/分享率/上传量/当前做种）
+        credit = stats.get("credit", 0) or 0
+        rate = stats.get("credit_rate")
+        credit_sub = f"+{rate:.0f}/h" if rate else ""
+        acc_cells = ('<table style="width:100%;border-collapse:collapse;table-layout:fixed;margin:2px 0 6px;"><tr>'
+                     + td("🌟 做种积分", f"{credit:,.0f}", credit_sub)
+                     + td("📊 分享率", f"{stats.get('ratio', 0):.3f}", "")
+                     + td("⬆️ 上传量", f"{stats.get('uploaded_tb', 0):.2f}", "TB")
+                     + td("🌿 当前做种", f"{stats.get('seeding_now', 0)}", "个")
+                     + '</tr></table>')
+
+        # 复活区档位色条 + 图例（0-1/2-3/4+）
+        C = {"low": "#22c55e", "mid": "#3b82f6", "high": "#ef4444"}
+        tiers = {"low": 0, "mid": 0, "high": 0}
+        for s in seeds:
+            n = s.get("seeders", 0)
+            tiers["low" if n <= 1 else ("mid" if n <= 3 else "high")] += 1
+        t_total = max(1, len(seeds))
+        revive_bar = ('<table style="width:100%;border-collapse:collapse;table-layout:fixed;margin:4px 0 2px;"><tr>'
+                      f'<td style="height:10px;width:{tiers["low"]/t_total*100:.2f}%;background:{C["low"]};border-radius:5px 0 0 5px;"></td>'
+                      f'<td style="height:10px;width:{tiers["mid"]/t_total*100:.2f}%;background:{C["mid"]};"></td>'
+                      f'<td style="height:10px;width:{tiers["high"]/t_total*100:.2f}%;background:{C["high"]};border-radius:0 5px 5px 0;"></td>'
+                      '</tr></table>')
+        revive_legend = (f'<table style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:10.5px;color:{ON60};"><tr>'
+                         f'<td style="text-align:left;white-space:nowrap;"><span style="display:inline-block;width:7px;height:7px;border-radius:2px;background:{C["low"]};margin-right:3px;"></span>复活区 0-1人 {tiers["low"]}</td>'
+                         f'<td style="text-align:center;white-space:nowrap;"><span style="display:inline-block;width:7px;height:7px;border-radius:2px;background:{C["mid"]};margin-right:3px;"></span>2-3人 {tiers["mid"]}</td>'
+                         f'<td style="text-align:right;white-space:nowrap;"><span style="display:inline-block;width:7px;height:7px;border-radius:2px;background:{C["high"]};margin-right:3px;"></span>4+人 {tiers["high"]}</td>'
+                         '</tr></table>')
+        revive_title = ('<table style="width:100%;border-collapse:collapse;table-layout:fixed;"><tr>'
+                        f'<td style="text-align:left;font-size:10.5px;color:{ON60};">复活区 '
+                        f'{ov.get("total", 0)} 种 · 免费中 {ov.get("free_active", 0)} · 我做种 {ov.get("my_seeding", 0)}</td>'
+                        '</tr></table>')
+
+        # 做种组合色条 + 图例（高价值/中/摊薄）
+        seg = ""
+        if ps:
+            p_low = ps.get("tier_low", 0); p_mid = ps.get("tier_mid", 0); p_high = ps.get("tier_high", 0)
+            p_total = max(1, ps.get("count", 1))
+            seg = ('<table style="width:100%;border-collapse:collapse;table-layout:fixed;margin:8px 0 2px;"><tr>'
+                   f'<td style="height:10px;width:{p_low/p_total*100:.2f}%;background:{C["low"]};border-radius:5px 0 0 5px;"></td>'
+                   f'<td style="height:10px;width:{p_mid/p_total*100:.2f}%;background:{C["mid"]};"></td>'
+                   f'<td style="height:10px;width:{p_high/p_total*100:.2f}%;background:{C["high"]};border-radius:0 5px 5px 0;"></td>'
+                   '</tr></table>'
+                   f'<table style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:10.5px;color:{ON60};"><tr>'
+                   f'<td style="text-align:left;white-space:nowrap;"><span style="display:inline-block;width:7px;height:7px;border-radius:2px;background:{C["low"]};margin-right:3px;"></span>做种组合 {ps.get("count", 0)}颗 {ps.get("total_gb", 0):.0f}G</td>'
+                   f'<td style="text-align:center;white-space:nowrap;"><span style="display:inline-block;width:7px;height:7px;border-radius:2px;background:{C["mid"]};margin-right:3px;"></span>中 {p_mid}</td>'
+                   f'<td style="text-align:right;white-space:nowrap;"><span style="display:inline-block;width:7px;height:7px;border-radius:2px;background:{C["high"]};margin-right:3px;"></span>摊薄 {p_high}</td>'
+                   '</tr></table>')
+
+        return f'<div style="background:transparent;">{acc_cells}{revive_title}{revive_bar}{revive_legend}{seg}</div>'
+
     def _get_overview_cached_or_refresh(self) -> dict:
         """取缓存概况，超过 2h 或缺失时同步刷新。"""
         if self._last_overview and time.time() - self._last_overview_ts < 2 * 3600:
@@ -1173,43 +1261,7 @@ class RainbowReviveButler(_PluginBase):
         stats = ov.get("stats", {}) or {}
         ps = ov.get("portfolio_stats", {}) or {}
 
-        def _card(label, val, color):
-            return (f'<div style="flex:1;min-width:120px;background:rgba(var(--v-theme-on-surface),.04);'
-                    f'border:1px solid rgba(var(--v-theme-on-surface),.08);border-radius:6px;padding:10px 14px;">'
-                    f'<div style="font-size:11px;color:rgba(var(--v-theme-on-surface),.5);">{label}</div>'
-                    f'<div style="font-size:20px;font-weight:600;color:{color};margin-top:2px;">{val}</div></div>')
-
-        credit = stats.get("credit", 0)
-        rate = stats.get("credit_rate")
-        rate_txt = f" +{rate:.0f}/h" if rate else ""
-        cards = (f'<div style="display:flex;gap:10px;flex-wrap:wrap;margin:4px 0 6px;">'
-                 + _card("做种积分", f"{credit:,.0f}<span style='font-size:12px;color:#10b981;'>{rate_txt}</span>", "#f59e0b")
-                 + _card("分享率", stats.get("ratio", 0), "#6366f1")
-                 + _card("上传量", f"{stats.get('uploaded_tb', 0):.2f} TB", "#10b981")
-                 + _card("下载量", f"{stats.get('downloaded_tb', 0):.2f} TB", "#3b82f6")
-                 + _card("当前做种", stats.get("seeding_now", 0), "#22c55e")
-                 + _card("H&R", stats.get("hr", 0), "#ef4444")
-                 + '</div>'
-                 + f'<div style="display:flex;gap:10px;flex-wrap:wrap;margin:4px 0 10px;">'
-                 + _card("复活区总数", ov.get("total", 0), "inherit")
-                 + _card("免费中", ov.get("free_active", 0), "#10b981")
-                 + _card("我在做种", ov.get("my_seeding", 0), "#6366f1")
-                 + _card("到期删除", ov.get("deleted", 0), "#ef4444")
-                 + _card("自动下载", ov.get("auto_downloaded", 0), "#f59e0b")
-                 + '</div>')
         seeds = ov.get("seeds", []) or []
-        tiers = {"0-1人": 0, "2-3人": 0, "4人以上": 0}
-        for s in seeds:
-            n = s.get("seeders", 0)
-            tiers["0-1人" if n <= 1 else ("2-3人" if n <= 3 else "4人以上")] += 1
-        total = max(1, len(seeds))
-        bar = ('<div style="display:flex;height:8px;border-radius:4px;overflow:hidden;margin:2px 0 6px;">'
-               f'<div style="width:{tiers["0-1人"]/total*100:.1f}%;background:#22c55e"></div>'
-               f'<div style="width:{tiers["2-3人"]/total*100:.1f}%;background:#4da3ff"></div>'
-               f'<div style="width:{tiers["4人以上"]/total*100:.1f}%;background:#ff6b6b"></div></div>'
-               '<div style="font-size:11px;color:rgba(var(--v-theme-on-surface),.5);display:flex;gap:14px;">'
-               f'<span>🟢 0-1人 {tiers["0-1人"]}</span><span>🔵 2-3人 {tiers["2-3人"]}</span>'
-               f'<span>🔴 4人以上 {tiers["4人以上"]}</span></div>')
         my_ids = set(ov.get("my_ids", []))
         now = time.time()
         my_seeds = [s for s in seeds if s["tid"] in my_ids]
@@ -1298,22 +1350,38 @@ class RainbowReviveButler(_PluginBase):
                 + _seed_rows(crowded, "#ff6b6b") +
                 '</div>')
 
-        return [
-            {"component": "div", "props": {"html": cards + bar + portfolio_html}},
-            {"component": "div", "props": {"html": links}},
-            {"component": "div", "props": {"class": "text-caption", "style": "margin:2px 0;color:rgba(var(--v-theme-on-surface),.6);"},
-             "text": "我在复活区的做种（按做种人数稀少优先）"},
-        ] + list_block + [
-            {"component": "div", "props": {"style": "margin-top:10px;padding:8px;background:rgba(var(--v-theme-on-surface),.04);border-radius:4px;font-size:11px;color:rgba(var(--v-theme-on-surface),.6);"},
-             "text": f"最近运行：{self._last_result}"},
-        ]
+        refresh_api = f"/api/v1/plugin/RainbowReviveButler/refresh?apikey={apikey}"
+        top_bar = (
+            '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">'
+            f'<span style="font-size:10.5px;color:rgba(var(--v-theme-on-surface),.4);">'
+            f'{self._refresh_note(self._last_overview_ts, 2.0)}</span>'
+            f'<a href="{refresh_api}" target="_blank" style="cursor:pointer;color:#42A5F5;text-decoration:none;'
+            'font-size:12px;">🔄 立即刷新</a></div>')
+
+        return [{
+            "component": "VRow", "props": {"density": "compact", "no-gutters": True},
+            "content": [{
+                "component": "VCol", "props": {"cols": 12},
+                "content": [
+                    {"component": "div", "props": {"html": top_bar}},
+                    {"component": "div", "props": {"html": self._overview_html(ov)}},
+                    {"component": "VAlert", "props": {"type": "info", "variant": "tonal",
+                                                      "text": f"最近运行状态：{self._last_result}"}},
+                    {"component": "div", "props": {"html": links}},
+                    {"component": "div", "props": {"html": portfolio_html}},
+                    {"component": "div", "props": {"class": "text-caption",
+                                                   "style": "margin:6px 0 2px;color:rgba(var(--v-theme-on-surface),.6);"},
+                     "text": "我在复活区的做种（按做种人数稀少优先）"},
+                ] + list_block,
+            }],
+        }]
 
     def get_dashboard_meta(self) -> Optional[List[Dict[str, str]]]:
         """仪表盘元数据。"""
         return [{"key": "revive", "name": "彩虹岛复活区管家"}]
 
     def get_dashboard(self, key: str, **kwargs):
-        """首页仪表盘：做种积分/账户数据/复活区/做种组合分析。"""
+        """首页仪表盘（照原作者三元组格式）：账户统计 + 复活区档位 + 做种组合。"""
         if key and key != "revive":
             return None
         try:
@@ -1321,43 +1389,15 @@ class RainbowReviveButler(_PluginBase):
         except Exception as e:
             logger.error(f"彩虹岛复活区管家：仪表盘概况获取失败：{e}")
             ov = {}
-        seeds = ov.get("seeds", []) or []
-        stats = ov.get("stats", {}) or {}
-        ps = ov.get("portfolio_stats", {}) or {}
-        t0 = sum(1 for s in seeds if s.get("seeders", 0) <= 1)
-        t1 = sum(1 for s in seeds if 1 < s.get("seeders", 0) <= 3)
-        t2 = sum(1 for s in seeds if s.get("seeders", 0) > 3)
-        total = max(1, len(seeds))
-        credit = stats.get("credit", 0)
-        rate = stats.get("credit_rate")
-        rate_txt = f"（+{rate:.0f}/h）" if rate else ""
-        # 做种组合档位分布
-        p_low = ps.get("tier_low", 0); p_mid = ps.get("tier_mid", 0); p_high = ps.get("tier_high", 0)
-        p_total = max(1, ps.get("count", 1))
-        return [{
-            "component": "div",
-            "props": {"html": (
-                '<div style="font-size:12px;line-height:1.9;">'
-                f'<div style="font-size:15px;font-weight:600;">做种积分 <b style="color:#f59e0b;">{credit:,.0f}</b>{rate_txt}</div>'
-                f'<span style="color:#888;">分享率 {stats.get("ratio", 0)} · 上传 {stats.get("uploaded_tb", 0):.2f} TB'
-                f' · 下载 {stats.get("downloaded_tb", 0):.2f} TB · 当前做种 {stats.get("seeding_now", 0)}'
-                f' · H&amp;R {stats.get("hr", 0)}</span>'
-                f'<div style="margin-top:6px;">复活区 <b>{ov.get("total", 0)}</b> 种 · 免费中 <b style="color:#10b981">{ov.get("free_active", 0)}</b>'
-                f' · 我做种 <b style="color:#6366f1">{ov.get("my_seeding", 0)}</b></div>'
-                f'<div style="display:flex;height:6px;border-radius:3px;overflow:hidden;margin:4px 0;">'
-                f'<div style="width:{t0/total*100:.0f}%;background:#22c55e"></div>'
-                f'<div style="width:{t1/total*100:.0f}%;background:#4da3ff"></div>'
-                f'<div style="width:{t2/total*100:.0f}%;background:#ff6b6b"></div></div>'
-                f'<span style="color:#888;">复活区档位 0-1人 {t0} · 2-3人 {t1} · 4+ {t2}</span>'
-                + (f'<div style="margin-top:6px;">做种组合 <b>{ps.get("count", 0)}</b> 颗 / {ps.get("total_gb", 0):.0f} GB'
-                   f'<div style="display:flex;height:6px;border-radius:3px;overflow:hidden;margin:4px 0;">'
-                   f'<div style="width:{p_low/p_total*100:.0f}%;background:#22c55e"></div>'
-                   f'<div style="width:{p_mid/p_total*100:.0f}%;background:#4da3ff"></div>'
-                   f'<div style="width:{p_high/p_total*100:.0f}%;background:#ff6b6b"></div></div>'
-                   f'<span style="color:#888;">高价值(0-1人) {p_low} · 中(2-3人) {p_mid} · 摊薄(4+人) {p_high}</span></div>'
-                   if ps else "")
-                + f'<div style="margin-top:4px;color:#888;">{self._last_result}</div></div>')},
-        }]
+        elements = [
+            {"component": "div",
+             "props": {"style": "text-align:left;font-size:10.5px;color:rgba(var(--v-theme-on-surface),.4);margin-bottom:6px;white-space:nowrap;"},
+             "text": self._refresh_note(self._last_overview_ts, 2.0)},
+            {"component": "div", "html": self._overview_html(ov)},
+        ]
+        return ({"cols": 12, "md": 6},
+                {"refresh": 60, "title": "彩虹岛复活区管家", "border": True},
+                elements)
 
     # ------------------------------------------------------------------ #
     # 工作台（单文件 HTML，移植 HHClubButler 全套交互）
