@@ -44,7 +44,7 @@ class RainbowReviveButler(_PluginBase):
     plugin_name = "彩虹岛复活区管家Q自用版"
     plugin_desc = "基于六个橙子「憨憨保种区管家」(HHClubButler) 架构复刻，致谢原作者 SixOrg。\n复活区全景 / 免费到期处置 / 捡漏推送 / 做种到期提醒"
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/rainbowrevivebutler.png"
-    plugin_version = "1.2.3"
+    plugin_version = "1.3.0"
     plugin_label = "资源站点"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -97,7 +97,8 @@ class RainbowReviveButler(_PluginBase):
         dls = config.get("downloaders")
         self._downloaders = [str(x) for x in dls if str(x).strip()] if isinstance(dls, list) else []
         try:
-            self._warn_hours = max(0.0, float(config.get("warn_hours", 2) or 0))
+            _wh = config.get("warn_hours", 2)
+            self._warn_hours = max(0.0, float(_wh if _wh not in ("", None) else 2))
         except (TypeError, ValueError):
             self._warn_hours = 2.0
         self._delete_files = bool(config.get("delete_files", True))
@@ -655,7 +656,10 @@ class RainbowReviveButler(_PluginBase):
         try:
             sv.instance.delete_torrents(delete_file=self._delete_files, ids=[thash])
             ts, err = sv.instance.get_torrents(ids=thash)
-            if ts and not err:
+            if err:
+                logger.warning(f"彩虹岛复活区管家：任务 {thash[:12]} 删除后复核查询失败，按未删除处理（{dl_name}）")
+                return False
+            if ts:
                 logger.warning(f"彩虹岛复活区管家：任务 {thash[:12]} 删除后仍存在（{dl_name}）")
                 return False
             return True
@@ -741,6 +745,7 @@ class RainbowReviveButler(_PluginBase):
                     acct_stats["credit_rate"] = round((cur_credit - prev["credit"]) / dt_h, 1)
             if cur_credit:
                 self.save_data("credit_sample", {"credit": cur_credit, "ts": time.time()})
+                self._append_credit_sample(cur_credit)
         except Exception:
             pass
         portfolio_stats = self._analyze_portfolio(portfolio)
@@ -868,20 +873,21 @@ class RainbowReviveButler(_PluginBase):
     # 守护线程：高频到期处置
     # ------------------------------------------------------------------ #
     def _start_guard_thread(self):
-        """启动到期处置守护线程。"""
+        """启动到期处置守护线程（stop Event 以参数传入，防止配置重载后旧线程读到新 Event 永不退出）。"""
         try:
             self._guard_stop = threading.Event()
             self._guard_thread = threading.Thread(
-                target=self._guard_loop, daemon=True, name="RainbowReviveButler-Dispose")
+                target=self._guard_loop, args=(self._guard_stop,),
+                daemon=True, name="RainbowReviveButler-Dispose")
             self._guard_thread.start()
         except Exception as e:
             logger.error(f"彩虹岛复活区管家：启动守护线程失败：{e}")
 
-    def _guard_loop(self):
+    def _guard_loop(self, stop_event):
         """守护线程主循环：每 dispose_minutes 跑一轮到期处置（到期即删的核心）。"""
         while True:
             try:
-                if self._guard_stop is None or self._guard_stop.is_set():
+                if stop_event.is_set():
                     return
                 if self._enabled:
                     wait = self._dispose_minutes * 60 - (time.time() - self._last_dispose_ts)
@@ -892,13 +898,12 @@ class RainbowReviveButler(_PluginBase):
                             logger.warning(f"彩虹岛复活区管家：守护处置轮次异常：{e}")
                         self._last_dispose_ts = time.time()
                         wait = self._dispose_minutes * 60
-                    self._guard_stop.wait(min(wait, 60.0) if wait > 0 else 60)
+                    stop_event.wait(min(wait, 60.0) if wait > 0 else 60)
                 else:
-                    self._guard_stop.wait(60)
+                    stop_event.wait(60)
             except Exception:
                 try:
-                    if self._guard_stop is not None:
-                        self._guard_stop.wait(60)
+                    stop_event.wait(60)
                 except Exception:
                     return
 
@@ -928,8 +933,8 @@ class RainbowReviveButler(_PluginBase):
                     dt_h = (now - prev["ts"]) / 3600
                     if 0.01 < dt_h < 24 * 7:
                         credit_rate = round((cur_credit - prev["credit"]) / dt_h, 1)
-                if cur_credit:
-                    self.save_data("credit_sample", {"credit": cur_credit, "ts": now})
+                # 注意：此处只读采样不覆写——采样更新仅由巡检 _do_run 负责，
+                # 否则面板/仪表盘每次刷新都重置时间戳，增速永远算不出
             except Exception:
                 pass
             stats["credit_rate"] = credit_rate
@@ -938,7 +943,11 @@ class RainbowReviveButler(_PluginBase):
             self._last_overview = {
                 "ts": now, "total": len(seeds), "pages": pages,
                 "free_active": sum(1 for s in seeds if s["is_free"] and s.get("free_until") and s["free_until"] > now),
-                "my_seeding": len(my_ids), "deleted": 0, "early": 0, "warned": 0, "auto_downloaded": 0,
+                "my_seeding": len(my_ids),
+                "deleted": (self._last_overview or {}).get("deleted", 0),
+                "early": (self._last_overview or {}).get("early", 0),
+                "warned": (self._last_overview or {}).get("warned", 0),
+                "auto_downloaded": (self._last_overview or {}).get("auto_downloaded", 0),
                 "seeds": seeds, "my_ids": sorted(my_ids),
                 "stats": stats, "portfolio": portfolio[:200], "portfolio_stats": portfolio_stats,
             }
@@ -1124,6 +1133,12 @@ class RainbowReviveButler(_PluginBase):
         }, {
             "path": "/panel", "endpoint": self.api_panel, "methods": ["GET"],
             "auth": "apikey", "summary": "复活区工作台",
+        }, {
+            "path": "/stats", "endpoint": self.api_stats_page, "methods": ["GET"],
+            "auth": "apikey", "summary": "做种积分统计表独立页",
+        }, {
+            "path": "/level", "endpoint": self.api_level_page, "methods": ["GET"],
+            "auth": "apikey", "summary": "数据与等级独立页",
         }, {
             "path": "/delete_seed", "endpoint": self.api_delete_seed, "methods": ["POST"],
             "auth": "apikey", "summary": "按种子ID删除下载器任务（工作台批量删）",
@@ -1388,13 +1403,26 @@ class RainbowReviveButler(_PluginBase):
         list_block = [header] + (rows or [{"component": "div",
                      "props": {"style": "padding:20px;text-align:center;color:rgba(var(--v-theme-on-surface),.4);font-size:12px;"},
                      "text": "我在复活区暂无做种种子"}])
-        links = (f'<div style="padding:10px 0;display:flex;gap:10px;">'
-                 f'<a href="{panel_url}" target="_blank" style="display:inline-block;padding:7px 18px;'
-                 'background:rgba(99,102,241,.12);color:#6366f1;text-decoration:none;border-radius:4px;'
-                 'font-size:13px;border:1px solid rgba(99,102,241,.3);">🌈 打开完整工作台（15主题/列配置/批量）</a>'
-                 f'<a href="{export_url}" style="display:inline-block;padding:7px 18px;'
-                 'background:rgba(16,185,129,.12);color:#10b981;text-decoration:none;border-radius:4px;'
-                 'font-size:13px;border:1px solid rgba(16,185,129,.3);">⬇ 导出 CSV</a></div>')
+        links = (
+            '<div style="padding:10px 0;display:flex;align-items:center;gap:10px;flex-wrap:wrap;">'
+            f'<a href="/api/v1/plugin/RainbowReviveButler/stats?apikey={apikey}" target="_blank" '
+            'style="display:inline-flex;align-items:center;gap:6px;padding:7px 18px;background:rgba(66,165,245,.12);'
+            'color:#42A5F5;text-decoration:none;border-radius:4px;font-size:13px;font-weight:500;border:1px solid rgba(66,165,245,.3);">'
+            '📊 做种积分统计</a>'
+            f'<a href="/api/v1/plugin/RainbowReviveButler/level?apikey={apikey}" target="_blank" '
+            'style="display:inline-flex;align-items:center;gap:6px;padding:7px 18px;background:rgba(66,165,245,.12);'
+            'color:#42A5F5;text-decoration:none;border-radius:4px;font-size:13px;font-weight:500;border:1px solid rgba(66,165,245,.3);">'
+            '📈 数据与等级</a>'
+            f'<a href="{panel_url}" target="_blank" '
+            'style="display:inline-flex;align-items:center;gap:6px;padding:7px 18px;background:rgba(66,165,245,.12);'
+            'color:#42A5F5;text-decoration:none;border-radius:4px;font-size:13px;font-weight:500;border:1px solid rgba(66,165,245,.3);">'
+            '🖥️ 复活区管理器</a>'
+            f'<a href="{export_url}" '
+            'style="display:inline-flex;align-items:center;gap:6px;padding:7px 18px;background:rgba(66,165,245,.12);'
+            'color:#42A5F5;text-decoration:none;border-radius:4px;font-size:13px;font-weight:500;border:1px solid rgba(66,165,245,.3);">'
+            '⬇ 导出 CSV</a>'
+            '<span style="font-size:11px;color:rgba(var(--v-theme-on-surface),.45);">独立工作台 · 批量删除 · 搜索 · 档位筛选 · 列自定义 · 多皮肤</span>'
+            '</div>')
         # 做种组合分析：高价值榜（做种人数少+体积大）与摊薄榜（做种人数极多）
         portfolio_html = ""
         if ps:
@@ -1474,6 +1502,221 @@ class RainbowReviveButler(_PluginBase):
     # ------------------------------------------------------------------ #
     # 工作台（单文件 HTML，移植 HHClubButler 全套交互）
     # ------------------------------------------------------------------ #
+    def _append_credit_sample(self, credit: float):
+        """记录做种积分采样（供统计表算日增量），上限 500 条、30 天自清。"""
+        if not credit:
+            return
+        try:
+            hist = self.get_data("credit_history") or []
+            if not isinstance(hist, list):
+                hist = []
+            now = time.time()
+            hist.append({"ts": now, "credit": float(credit)})
+            hist = [h for h in hist if isinstance(h, dict) and h.get("ts", 0) > now - 30 * 86400]
+            self.save_data("credit_history", hist[-500:])
+        except Exception as e:
+            logger.warning(f"彩虹岛复活区管家：记录做种积分采样失败：{e}")
+
+    def _fetch_profile(self, session: requests.Session, base: str) -> dict:
+        """从档案页解析账户资料：加入日期/最近动向/邀请人/HP/BT时间比率/做种时间/下载时间。"""
+        uid = self._get_site_uid(session, base)
+        if not uid:
+            return {}
+        try:
+            r = session.get(base + f"/userdetails.php?id={uid}", timeout=25)
+            t = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", r.text))
+
+            def g(pat, default=""):
+                m = re.search(pat, t)
+                return m.group(1).strip() if m else default
+
+            return {
+                "uid": uid,
+                "reg_date": g(r"加入日期\s*([\d-]+ [\d:]+)"),
+                "last_active": g(r"最近动向\s*([\d-]+ [\d:]+)"),
+                "inviter": g(r"邀请人\s*(\S+)", "-"),
+                "hp": g(r"HP\s+(\d+)\s+BT时间"),
+                "bt_ratio": g(r"做种/下载时间比率\s*[:：]\s*([\d.]+)"),
+                "seed_time": g(r"做种时间\s*[:：]\s*([\d天h:.]+?)(?:\s|下载|&nbsp)"),
+                "dl_time": g(r"下载时间\s*[:：]\s*([\d天h:.]+?)(?:\s|性别|&nbsp|$)"),
+            }
+        except Exception as e:
+            logger.warning(f"彩虹岛复活区管家：解析档案页失败：{e}")
+            return {}
+
+    def _fetch_task_stats(self, session: requests.Session, base: str) -> dict:
+        """从任务页解析彩虹岛原生任务系统全站统计（各档完成/失败/比例）。"""
+        try:
+            r = s = session.get(base + "/selfassess.php", timeout=25)
+            t = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", r.text))
+            tiers = {}
+            for name in ("Master", "Ultimate", "Extreme", "Veteran", "Insane"):
+                m = re.search(name + r"：完成(\d+)、失败(\d+)、完成比例([\d.]+)%", t)
+                if m:
+                    tiers[name] = {"done": int(m.group(1)), "fail": int(m.group(2)),
+                                   "pct": float(m.group(3))}
+            m = re.search(r"任务系统当前人数：(\d+)人", t)
+            return {"tiers": tiers, "busy": int(m.group(1)) if m else 0}
+        except Exception as e:
+            logger.warning(f"彩虹岛复活区管家：解析任务统计失败：{e}")
+            return {}
+
+    def api_stats_page(self):
+        """做种积分统计表独立页（照原作者 monthly_stats 深色版式）。"""
+        hist = self.get_data("credit_history") or []
+        # 按自然日聚合
+        days: Dict[str, dict] = {}
+        for h in hist:
+            if not isinstance(h, dict) or not h.get("credit"):
+                continue
+            day = datetime.fromtimestamp(h["ts"]).strftime("%Y-%m-%d")
+            d = days.setdefault(day, {"first": h["credit"], "last": h["credit"], "n": 0, "max": h["credit"]})
+            d["last"] = h["credit"]
+            d["max"] = max(d["max"], h["credit"])
+            d["n"] += 1
+        ordered = sorted(days.items())[-30:]
+        cur = hist[-1]["credit"] if hist else 0
+        # 日增量
+        deltas = []
+        for i, (day, d) in enumerate(ordered):
+            prev = ordered[i-1][1]["last"] if i > 0 else None
+            d["delta"] = (d["last"] - prev) if prev is not None else None
+            if d["delta"] is not None:
+                deltas.append(d["delta"])
+        today_delta = ordered[-1][1].get("delta") if ordered else None
+        week_delta = sum(deltas[-7:]) if deltas else 0
+        daily_avg = (sum(deltas) / len(deltas)) if deltas else 0
+
+        rows = ""
+        for day, d in reversed(ordered):
+            delta = d.get("delta")
+            delta_html = (f'<span style="color:#2ee6a8">+{delta:,.0f}</span>' if delta and delta > 0
+                          else (f'<span style="color:#f87171">{delta:,.0f}</span>' if delta is not None else "—"))
+            rows += (f'<tr><td>{day}</td><td class="num">{d["first"]:,.1f}</td>'
+                     f'<td class="num">{d["last"]:,.1f}</td><td class="num">{delta_html}</td>'
+                     f'<td class="num">{d["n"]}</td></tr>')
+        if not rows:
+            rows = '<tr><td colspan="5" style="text-align:center;color:#5d6d8f;padding:24px;">暂无采样数据（巡检一次记录一条，次日可见增量）</td></tr>'
+
+        def kpi(label, val, sub="", color="#e8edf7"):
+            return (f'<div class="kpi"><div class="kl">{label}</div>'
+                    f'<div class="kv" style="color:{color}">{val}</div>'
+                    f'<div class="ks">{sub}</div></div>')
+
+        kpis = (kpi("当前做种积分", f"{cur:,.1f}", "实时", "#fbbf24")
+                + kpi("今日增量", f"+{today_delta:,.0f}" if today_delta else "—", "较昨日末次", "#2ee6a8" if today_delta else "#7d8db1")
+                + kpi("近7日增量", f"+{week_delta:,.0f}", "累计", "#38bdf8")
+                + kpi("日均增量", f"{daily_avg:,.0f}", "全部采样日均", "#c084fc"))
+
+        css = ("*{box-sizing:border-box;margin:0;padding:0}"
+               'body{background:#0d1321;color:#e8edf7;font-family:"PingFang SC","Microsoft YaHei",sans-serif;font-size:13px;padding:20px}'
+               ".hd{font-size:16px;font-weight:700;margin-bottom:2px}.sub{color:#7d8db1;font-size:11px;margin-bottom:14px}"
+               ".kpis{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:16px}"
+               ".kpi{flex:1;min-width:140px;background:#111c33;border:1px solid #1e3357;border-radius:10px;padding:10px 14px}"
+               ".kl{font-size:11px;color:#7d8db1}.kv{font-size:19px;font-weight:700;margin-top:2px}.ks{font-size:10px;color:#5d6d8f}"
+               "table{width:100%;border-collapse:collapse;background:#111c33;border:1px solid #1e3357;border-radius:10px;overflow:hidden}"
+               "th{background:#16233f;color:#7d8db1;font-weight:600;font-size:11px;padding:7px 12px;text-align:left}"
+               "td{padding:6px 12px;border-top:1px solid #1e3357;font-size:12px}"
+               ".num{text-align:right;font-variant-numeric:tabular-nums}"
+               'a{color:#38bdf8;text-decoration:none}')
+        html = (f'<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">'
+                f'<meta name="viewport" content="width=device-width,initial-scale=1">'
+                f'<title>做种积分统计</title><style>{css}</style></head><body>'
+                f'<div class="hd">🌈 做种积分统计</div>'
+                f'<div class="sub">数据来自每轮巡检采样 · 采样 {len(hist)} 条 · '
+                f'<a href="javascript:location.reload()">🔄 刷新</a></div>'
+                f'<div class="kpis">{kpis}</div>'
+                f'<table><thead><tr><th>日期</th><th style="text-align:right">首次</th>'
+                f'<th style="text-align:right">末次</th><th style="text-align:right">增量</th>'
+                f'<th style="text-align:right">采样数</th></tr></thead><tbody>{rows}</tbody></table>'
+                f'</body></html>')
+        return HTMLResponse(content=html)
+
+    def api_level_page(self):
+        """数据与等级独立页（照原作者 level 深色版式，数据为彩虹岛账户资料）。"""
+        base = self._get_site_url()
+        cookie = self._get_site_cookie()
+        prof = {}
+        task = {}
+        stats = {}
+        try:
+            session = self._session(cookie)
+            prof = self._fetch_profile(session, base)
+            task = self._fetch_task_stats(session, base)
+            stats = self._fetch_site_stats(session, base)
+        except Exception as e:
+            logger.error(f"彩虹岛复活区管家：数据与等级抓取失败：{e}")
+            return HTMLResponse(content=(
+                '<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8"><title>数据与等级</title>'
+                '<style>body{background:#0d1321;color:#e8edf7;font-family:"PingFang SC",sans-serif;'
+                'padding:40px;text-align:center}.card{max-width:520px;margin:0 auto;background:#111c33;'
+                'border:1px solid #1e3357;border-radius:14px;padding:30px}</style></head><body><div class="card">'
+                f'<div style="font-size:16px;font-weight:700;margin-bottom:10px;">数据与等级 · 获取失败</div>'
+                f'<div style="color:#f87171;line-height:1.8;">{str(e)}</div>'
+                '<div style="margin-top:14px;font-size:12px;color:#7d8db1;">请检查站点 Cookie 是否有效</div>'
+                '</div></body></html>'))
+
+        def kpi(label, val, sub="", color="#e8edf7"):
+            return (f'<div class="kpi"><div class="kl">{label}</div>'
+                    f'<div class="kv" style="color:{color}">{val}</div>'
+                    f'<div class="ks">{sub}</div></div>')
+
+        credit = stats.get("credit", 0) or 0
+        rate = stats.get("credit_rate")
+        kpis = (kpi("上传量", f"{stats.get('uploaded_tb', 0):.3f}", "TB", "#2ee6a8")
+                + kpi("下载量", f"{stats.get('downloaded_tb', 0):.3f}", "TB", "#38bdf8")
+                + kpi("分享率", f"{stats.get('ratio', 0):.3f}", "实际", "#fbbf24")
+                + kpi("做种积分", f"{credit:,.0f}", f"+{rate:.0f}/h" if rate else "实时", "#fbbf24")
+                + kpi("魔力值", f"{stats.get('magic', 0):,.0f}", "余额", "#FF8A3C")
+                + kpi("当前做种", f"{stats.get('seeding_now', 0)}", "个", "#2ee6a8")
+                + kpi("H&R", f"{stats.get('hr', 0)}", "违规扣点", "#f87171" if stats.get("hr") else "#7d8db1")
+                + kpi("HP", prof.get("hp", "—"), "H&R 容量", "#c084fc"))
+
+        meta = (f'UID {prof.get("uid", "—")} · 加入 {prof.get("reg_date", "—")} · '
+                f'最近动向 {prof.get("last_active", "—")} · 邀请人 {prof.get("inviter", "—")}')
+        times = (f'BT时间比率 {prof.get("bt_ratio", "—")} · '
+                 f'做种时间 {prof.get("seed_time", "—")} · 下载时间 {prof.get("dl_time", "—")}')
+
+        # 任务系统全站统计
+        task_html = ""
+        tiers = task.get("tiers") or {}
+        if tiers:
+            trows = "".join(
+                f'<tr><td>{name}</td><td class="num">{t["done"]:,}</td>'
+                f'<td class="num">{t["fail"]:,}</td>'
+                f'<td class="num"><span style="color:#2ee6a8">{t["pct"]}%</span></td></tr>'
+                for name, t in tiers.items())
+            task_html = (
+                f'<div class="sec">任务系统（全站当前 {task.get("busy", 0)} 人）</div>'
+                f'<table><thead><tr><th>等级</th><th style="text-align:right">完成</th>'
+                f'<th style="text-align:right">失败</th><th style="text-align:right">完成率</th>'
+                f'</tr></thead><tbody>{trows}</tbody></table>')
+
+        css = ("*{box-sizing:border-box;margin:0;padding:0}"
+               'body{background:#0d1321;color:#e8edf7;font-family:"PingFang SC","Microsoft YaHei",sans-serif;font-size:13px;padding:20px}'
+               ".hd{font-size:16px;font-weight:700;margin-bottom:2px}.sub{color:#7d8db1;font-size:11px;margin-bottom:14px}"
+               ".kpis{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px}"
+               ".kpi{flex:1;min-width:130px;background:#111c33;border:1px solid #1e3357;border-radius:10px;padding:10px 14px}"
+               ".kl{font-size:11px;color:#7d8db1}.kv{font-size:18px;font-weight:700;margin-top:2px}.ks{font-size:10px;color:#5d6d8f}"
+               ".sec{font-size:12px;font-weight:600;color:#7d8db1;margin:14px 0 6px}"
+               ".meta{background:#111c33;border:1px solid #1e3357;border-radius:10px;padding:10px 14px;"
+               "font-size:12px;color:#a8b8d4;line-height:1.9;margin-bottom:4px}"
+               "table{width:100%;border-collapse:collapse;background:#111c33;border:1px solid #1e3357;border-radius:10px;overflow:hidden}"
+               "th{background:#16233f;color:#7d8db1;font-weight:600;font-size:11px;padding:7px 12px;text-align:left}"
+               "td{padding:6px 12px;border-top:1px solid #1e3357;font-size:12px}"
+               ".num{text-align:right;font-variant-numeric:tabular-nums}"
+               'a{color:#38bdf8;text-decoration:none}')
+        html = (f'<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">'
+                f'<meta name="viewport" content="width=device-width,initial-scale=1">'
+                f'<title>数据与等级</title><style>{css}</style></head><body>'
+                f'<div class="hd">📈 数据与等级</div>'
+                f'<div class="sub">彩虹岛账户资料 · <a href="javascript:location.reload()">🔄 刷新</a></div>'
+                f'<div class="kpis">{kpis}</div>'
+                f'<div class="meta">{meta}<br>{times}</div>'
+                f'{task_html}'
+                f'</body></html>')
+        return HTMLResponse(content=html)
+
     def _build_panel_html(self, apikey: str) -> str:
         """工作台页面：15 主题 / 列显隐 / 列排序 / 列宽拖拽 / 搜索 / 筛选 / 批量删除 / 导出。"""
         return (_PANEL_HTML
@@ -1712,7 +1955,7 @@ await doDel(arr);
 async function doDel(arr){
 var okN=0;
 for(var i=0;i<arr.length;i++){
-try{var r=await fetch("/api/v1/plugin/RainbowReviveButler/delete_seed?apikey="+encodeURIComponent(APIKEY),{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({tid:arr[i].tid})});var j=await r.json();if(j.success){okN++;delete sel[arr[i].tid]}else{alert("删除失败:"+arr[i].title.slice(0,40)+" -> "+(j.message||""))}}
+try{var r=await fetch("/api/v1/plugin/RainbowReviveButler/delete_seed?apikey="+encodeURIComponent(APIKEY)+"&tid="+encodeURIComponent(arr[i].tid),{method:"POST"});var j=await r.json();if(j.success){okN++;delete sel[arr[i].tid]}else{alert("删除失败:"+arr[i].title.slice(0,40)+" -> "+(j.message||""))}}
 catch(e){alert("删除异常:"+e)}}
 if(okN){alert("已删除 "+okN+" 个任务");load()}
 }
