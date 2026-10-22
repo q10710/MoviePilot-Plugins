@@ -44,7 +44,7 @@ class RainbowReviveButler(_PluginBase):
     plugin_name = "彩虹岛复活区管家Q自用版"
     plugin_desc = "基于六个橙子「憨憨保种区管家」(HHClubButler) 架构复刻，致谢原作者 SixOrg。\n复活区全景 / 免费到期处置 / 捡漏推送 / 做种到期提醒"
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/rainbowrevivebutler.png"
-    plugin_version = "1.3.0"
+    plugin_version = "1.4.0"
     plugin_label = "资源站点"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -1530,8 +1530,11 @@ class RainbowReviveButler(_PluginBase):
                 m = re.search(pat, t)
                 return m.group(1).strip() if m else default
 
+            um = re.search(r"class=['\"](\w+)_Name['\"]><b>([^<]+)</b>", r.text)
             return {
                 "uid": uid,
+                "username": um.group(2).strip() if um else "-",
+                "user_class": um.group(1) if um else "Member",
                 "reg_date": g(r"加入日期\s*([\d-]+ [\d:]+)"),
                 "last_active": g(r"最近动向\s*([\d-]+ [\d:]+)"),
                 "inviter": g(r"邀请人\s*(\S+)", "-"),
@@ -1562,84 +1565,39 @@ class RainbowReviveButler(_PluginBase):
             return {}
 
     def api_stats_page(self):
-        """做种积分统计表独立页（照原作者 monthly_stats 深色版式）。"""
+        """做种积分统计独立页（完整移植原作者「结算统计表」模板：渐变底/ECharts柱状图/双仪表/网格表/月表）。"""
         hist = self.get_data("credit_history") or []
-        # 按自然日聚合
+        # 按自然日聚合采样
         days: Dict[str, dict] = {}
         for h in hist:
             if not isinstance(h, dict) or not h.get("credit"):
                 continue
-            day = datetime.fromtimestamp(h["ts"]).strftime("%Y-%m-%d")
-            d = days.setdefault(day, {"first": h["credit"], "last": h["credit"], "n": 0, "max": h["credit"]})
+            day = datetime.fromtimestamp(h["ts"]).strftime("%m-%d")
+            d = days.setdefault(day, {"first": h["credit"], "last": h["credit"], "n": 0})
             d["last"] = h["credit"]
-            d["max"] = max(d["max"], h["credit"])
             d["n"] += 1
-        ordered = sorted(days.items())[-30:]
-        cur = hist[-1]["credit"] if hist else 0
-        # 日增量
-        deltas = []
-        for i, (day, d) in enumerate(ordered):
-            prev = ordered[i-1][1]["last"] if i > 0 else None
-            d["delta"] = (d["last"] - prev) if prev is not None else None
-            if d["delta"] is not None:
-                deltas.append(d["delta"])
-        today_delta = ordered[-1][1].get("delta") if ordered else None
-        week_delta = sum(deltas[-7:]) if deltas else 0
-        daily_avg = (sum(deltas) / len(deltas)) if deltas else 0
-
-        rows = ""
-        for day, d in reversed(ordered):
-            delta = d.get("delta")
-            delta_html = (f'<span style="color:#2ee6a8">+{delta:,.0f}</span>' if delta and delta > 0
-                          else (f'<span style="color:#f87171">{delta:,.0f}</span>' if delta is not None else "—"))
-            rows += (f'<tr><td>{day}</td><td class="num">{d["first"]:,.1f}</td>'
-                     f'<td class="num">{d["last"]:,.1f}</td><td class="num">{delta_html}</td>'
-                     f'<td class="num">{d["n"]}</td></tr>')
-        if not rows:
-            rows = '<tr><td colspan="5" style="text-align:center;color:#5d6d8f;padding:24px;">暂无采样数据（巡检一次记录一条，次日可见增量）</td></tr>'
-
-        def kpi(label, val, sub="", color="#e8edf7"):
-            return (f'<div class="kpi"><div class="kl">{label}</div>'
-                    f'<div class="kv" style="color:{color}">{val}</div>'
-                    f'<div class="ks">{sub}</div></div>')
-
-        kpis = (kpi("当前做种积分", f"{cur:,.1f}", "实时", "#fbbf24")
-                + kpi("今日增量", f"+{today_delta:,.0f}" if today_delta else "—", "较昨日末次", "#2ee6a8" if today_delta else "#7d8db1")
-                + kpi("近7日增量", f"+{week_delta:,.0f}", "累计", "#38bdf8")
-                + kpi("日均增量", f"{daily_avg:,.0f}", "全部采样日均", "#c084fc"))
-
-        css = ("*{box-sizing:border-box;margin:0;padding:0}"
-               'body{background:#0d1321;color:#e8edf7;font-family:"PingFang SC","Microsoft YaHei",sans-serif;font-size:13px;padding:20px}'
-               ".hd{font-size:16px;font-weight:700;margin-bottom:2px}.sub{color:#7d8db1;font-size:11px;margin-bottom:14px}"
-               ".kpis{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:16px}"
-               ".kpi{flex:1;min-width:140px;background:#111c33;border:1px solid #1e3357;border-radius:10px;padding:10px 14px}"
-               ".kl{font-size:11px;color:#7d8db1}.kv{font-size:19px;font-weight:700;margin-top:2px}.ks{font-size:10px;color:#5d6d8f}"
-               "table{width:100%;border-collapse:collapse;background:#111c33;border:1px solid #1e3357;border-radius:10px;overflow:hidden}"
-               "th{background:#16233f;color:#7d8db1;font-weight:600;font-size:11px;padding:7px 12px;text-align:left}"
-               "td{padding:6px 12px;border-top:1px solid #1e3357;font-size:12px}"
-               ".num{text-align:right;font-variant-numeric:tabular-nums}"
-               'a{color:#38bdf8;text-decoration:none}')
-        html = (f'<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">'
-                f'<meta name="viewport" content="width=device-width,initial-scale=1">'
-                f'<title>做种积分统计</title><style>{css}</style></head><body>'
-                f'<div class="hd">🌈 做种积分统计</div>'
-                f'<div class="sub">数据来自每轮巡检采样 · 采样 {len(hist)} 条 · '
-                f'<a href="javascript:location.reload()">🔄 刷新</a></div>'
-                f'<div class="kpis">{kpis}</div>'
-                f'<table><thead><tr><th>日期</th><th style="text-align:right">首次</th>'
-                f'<th style="text-align:right">末次</th><th style="text-align:right">增量</th>'
-                f'<th style="text-align:right">采样数</th></tr></thead><tbody>{rows}</tbody></table>'
-                f'</body></html>')
+        ordered = sorted(days.items())
+        cum = 0.0
+        records = []
+        for day, d in ordered:
+            prev_last = records[-1]["last"] if records else None
+            delta = (d["last"] - prev_last) if prev_last is not None else None
+            cum += delta or 0
+            records.append({"date": day, "first": d["first"], "last": d["last"],
+                            "delta": delta, "n": d["n"], "cum": round(cum, 1)})
+        cur = records[-1]["last"] if records else 0
+        cum30 = round(sum((r["delta"] or 0) for r in records[-30:]), 1)
+        payload = json.dumps({"records": records, "current": cur, "cum30": cum30,
+                              "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")},
+                             ensure_ascii=False)
+        html = _STATS_HTML.replace("__DATA__", payload)
         return HTMLResponse(content=html)
 
     def api_level_page(self):
-        """数据与等级独立页（照原作者 level 深色版式，数据为彩虹岛账户资料）。"""
-        base = self._get_site_url()
-        cookie = self._get_site_cookie()
-        prof = {}
-        task = {}
-        stats = {}
+        """数据与等级独立页（完整移植原作者「数据与等级」模板：头像卡/KPI带/进度条/雷达/阶梯）。"""
         try:
+            base = self._get_site_url()
+            cookie = self._get_site_cookie()
             session = self._session(cookie)
             prof = self._fetch_profile(session, base)
             task = self._fetch_task_stats(session, base)
@@ -1656,65 +1614,92 @@ class RainbowReviveButler(_PluginBase):
                 '<div style="margin-top:14px;font-size:12px;color:#7d8db1;">请检查站点 Cookie 是否有效</div>'
                 '</div></body></html>'))
 
-        def kpi(label, val, sub="", color="#e8edf7"):
-            return (f'<div class="kpi"><div class="kl">{label}</div>'
-                    f'<div class="kv" style="color:{color}">{val}</div>'
-                    f'<div class="ks">{sub}</div></div>')
+        username = prof.get("username", "-")
+        uid = prof.get("uid", "-")
+        cls = prof.get("user_class", "Member")
+        meta = (f"UID {uid} · 加入 {prof.get('reg_date', '—')} · 最近动向 {prof.get('last_active', '—')}"
+                f" · 邀请人 {prof.get('inviter', '—')}")
+        lvline = (f"HP {prof.get('hp', '—')} · 分享率 {stats.get('ratio', 0):.3f}"
+                  f" · BT比率 {prof.get('bt_ratio', '—')} · 做种时间 {prof.get('seed_time', '—')}")
 
+        # KPI 带（原模板 8 卡结构 + 原作者 SVG 图标）
         credit = stats.get("credit", 0) or 0
         rate = stats.get("credit_rate")
-        kpis = (kpi("上传量", f"{stats.get('uploaded_tb', 0):.3f}", "TB", "#2ee6a8")
-                + kpi("下载量", f"{stats.get('downloaded_tb', 0):.3f}", "TB", "#38bdf8")
-                + kpi("分享率", f"{stats.get('ratio', 0):.3f}", "实际", "#fbbf24")
-                + kpi("做种积分", f"{credit:,.0f}", f"+{rate:.0f}/h" if rate else "实时", "#fbbf24")
-                + kpi("魔力值", f"{stats.get('magic', 0):,.0f}", "余额", "#FF8A3C")
-                + kpi("当前做种", f"{stats.get('seeding_now', 0)}", "个", "#2ee6a8")
-                + kpi("H&R", f"{stats.get('hr', 0)}", "违规扣点", "#f87171" if stats.get("hr") else "#7d8db1")
-                + kpi("HP", prof.get("hp", "—"), "H&R 容量", "#c084fc"))
+        def _kpi(ic, k, v, s, cls=""):
+            return (f'<div class="kpi"><div class="ic">{ic}</div>'
+                    f'<div class="k">{k}</div><div class="v {cls}">{v}</div>'
+                    f'<div class="s">{s}</div></div>')
+        kpis = (
+            _kpi(_IC_UP, "上传量", f"{stats.get('uploaded_tb', 0):.3f} TB", "累计上传", "green")
+            + _kpi(_IC_DOWN, "下载量", f"{stats.get('downloaded_tb', 0):.3f} TB", "累计下载", "blue")
+            + _kpi(_IC_RATIO, "分享率", f"{stats.get('ratio', 0):.3f}", "上传 ÷ 下载", "green")
+            + _kpi(_IC_PTS, "做种积分", f"{credit:,.0f}", f"+{rate:.0f}/h" if rate else "巡检采样增速", "blue")
+            + _kpi(_IC_BEAN, "魔力值", _fmt_wan(stats.get("magic", 0)), f"余额 {stats.get('magic', 0):,.0f}", "bean")
+            + _kpi(_IC_ZAP_G, "当前做种", f"{stats.get('seeding_now', 0)}", "个任务在做种")
+            + _kpi(_IC_ZAP_B, "HP", prof.get("hp", "—"), "H&R 容量点数")
+            + _kpi(_IC_TREND, "H&R", f"{stats.get('hr', 0)}", "违规扣点")
+        )
 
-        meta = (f'UID {prof.get("uid", "—")} · 加入 {prof.get("reg_date", "—")} · '
-                f'最近动向 {prof.get("last_active", "—")} · 邀请人 {prof.get("inviter", "—")}')
-        times = (f'BT时间比率 {prof.get("bt_ratio", "—")} · '
-                 f'做种时间 {prof.get("seed_time", "—")} · 下载时间 {prof.get("dl_time", "—")}')
-
-        # 任务系统全站统计
-        task_html = ""
+        # 进度条卡：任务系统五档完成率（替代原「下一级达标进度」）
         tiers = task.get("tiers") or {}
-        if tiers:
-            trows = "".join(
-                f'<tr><td>{name}</td><td class="num">{t["done"]:,}</td>'
-                f'<td class="num">{t["fail"]:,}</td>'
-                f'<td class="num"><span style="color:#2ee6a8">{t["pct"]}%</span></td></tr>'
-                for name, t in tiers.items())
-            task_html = (
-                f'<div class="sec">任务系统（全站当前 {task.get("busy", 0)} 人）</div>'
-                f'<table><thead><tr><th>等级</th><th style="text-align:right">完成</th>'
-                f'<th style="text-align:right">失败</th><th style="text-align:right">完成率</th>'
-                f'</tr></thead><tbody>{trows}</tbody></table>')
+        tier_order = [("Insane", "疯狂"), ("Veteran", "资深"), ("Extreme", "极限"), ("Ultimate", "终极"), ("Master", "骨灰")]
+        bars = ""
+        for en, cn in tier_order:
+            t = tiers.get(en)
+            if not t:
+                continue
+            pct = t["pct"]
+            color = "#2ee6a8" if pct >= 90 else ("#fbbf24" if pct >= 80 else "#f87171")
+            bars += (f'<div class="bar"><div class="r">'
+                     f'<span class="need">{en} {cn} · 完成 {t["done"]:,} / 失败 {t["fail"]:,}</span>'
+                     f'<span class="val" style="color:{color}">{pct:.2f}%</span></div>'
+                     f'<div class="track"><div class="fill" style="width:{pct:.1f}%;background:{color}"></div></div></div>')
 
-        css = ("*{box-sizing:border-box;margin:0;padding:0}"
-               'body{background:#0d1321;color:#e8edf7;font-family:"PingFang SC","Microsoft YaHei",sans-serif;font-size:13px;padding:20px}'
-               ".hd{font-size:16px;font-weight:700;margin-bottom:2px}.sub{color:#7d8db1;font-size:11px;margin-bottom:14px}"
-               ".kpis{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px}"
-               ".kpi{flex:1;min-width:130px;background:#111c33;border:1px solid #1e3357;border-radius:10px;padding:10px 14px}"
-               ".kl{font-size:11px;color:#7d8db1}.kv{font-size:18px;font-weight:700;margin-top:2px}.ks{font-size:10px;color:#5d6d8f}"
-               ".sec{font-size:12px;font-weight:600;color:#7d8db1;margin:14px 0 6px}"
-               ".meta{background:#111c33;border:1px solid #1e3357;border-radius:10px;padding:10px 14px;"
-               "font-size:12px;color:#a8b8d4;line-height:1.9;margin-bottom:4px}"
-               "table{width:100%;border-collapse:collapse;background:#111c33;border:1px solid #1e3357;border-radius:10px;overflow:hidden}"
-               "th{background:#16233f;color:#7d8db1;font-weight:600;font-size:11px;padding:7px 12px;text-align:left}"
-               "td{padding:6px 12px;border-top:1px solid #1e3357;font-size:12px}"
-               ".num{text-align:right;font-variant-numeric:tabular-nums}"
-               'a{color:#38bdf8;text-decoration:none}')
-        html = (f'<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">'
-                f'<meta name="viewport" content="width=device-width,initial-scale=1">'
-                f'<title>数据与等级</title><style>{css}</style></head><body>'
-                f'<div class="hd">📈 数据与等级</div>'
-                f'<div class="sub">彩虹岛账户资料 · <a href="javascript:location.reload()">🔄 刷新</a></div>'
-                f'<div class="kpis">{kpis}</div>'
-                f'<div class="meta">{meta}<br>{times}</div>'
-                f'{task_html}'
-                f'</body></html>')
+        # 雷达：四维（上传/下载/分享率/做种积分）归一化
+        axes = [("上传", min(100.0, stats.get("uploaded_tb", 0) / 10 * 100)),
+                ("下载", min(100.0, stats.get("downloaded_tb", 0) / 10 * 100)),
+                ("分享率", min(100.0, stats.get("ratio", 0) / 5 * 100)),
+                ("做种积分", min(100.0, credit / 500000 * 100))]
+        radar_svg = _radar_svg(axes)
+        avg_pct = (sum(t["pct"] for t in tiers.values()) / len(tiers)) if tiers else 0
+
+        # 阶梯卡：任务五档
+        steps = ""
+        max_done = max((tiers.get(en, {}).get("pct", 0) for en, _ in tier_order), default=0)
+        for en, cn in tier_order:
+            t = tiers.get(en)
+            if not t:
+                continue
+            cls = "done" if t["pct"] >= 90 else ("cur" if t["pct"] == max_done else "")
+            tag = f'<span class="tagcur">当前最高</span>' if t["pct"] == max_done and max_done > 0 else ""
+            steps += (f'<div class="step {cls}">{tag}<div class="en">{en}</div>'
+                      f'<div class="cn">{cn} {t["pct"]:.1f}%</div></div>')
+
+        # 下方双卡：做种组合 + 账户附加
+        ps = self._get_overview_cached_or_refresh().get("portfolio_stats", {}) or {}
+        next_cards = (
+            f'<div class="ncard"><div class="tt"><div class="t1">💎 做种组合</div>'
+            f'<div class="t2">高价值(0-1人) {ps.get("tier_low", 0)} · 中(2-3人) {ps.get("tier_mid", 0)} · 摊薄(4+人) {ps.get("tier_high", 0)}</div></div>'
+            f'<div class="dd"><b>{ps.get("count", 0)}</b> 颗<br>{ps.get("total_gb", 0):.0f} GB</div></div>'
+            f'<div class="ncard"><div class="tt"><div class="t1">📋 任务系统</div>'
+            f'<div class="t2">全站当前 {task.get("busy", 0)} 人 · 五档平均完成率</div></div>'
+            f'<div class="dd"><b>{avg_pct:.1f}%</b></div></div>')
+
+        foot = ("数据来源：ptchdbits.co 档案页/任务页/页头实时解析 · "
+                "任务系统完成率为全站统计（Master/Ultimate/Extreme/Veteran/Insane）· "
+                "做种积分增速由巡检跨次采样计算")
+        html = (_LEVEL_HTML
+                .replace("__USERNAME__", _esc(username))
+                .replace("__META__", _esc(meta))
+                .replace("__BADGE__", _esc(cls))
+                .replace("__LVLINE__", _esc(lvline))
+                .replace("__KPIS__", kpis)
+                .replace("__BARS__", bars)
+                .replace("__RADAR__", radar_svg)
+                .replace("__UP_PCT__", f"{avg_pct:.0f}")
+                .replace("__STEPS__", steps)
+                .replace("__NEXT__", next_cards)
+                .replace("__FOOT__", foot))
         return HTMLResponse(content=html)
 
     def _build_panel_html(self, apikey: str) -> str:
@@ -1744,6 +1729,72 @@ body[data-theme="charcoal"]{--bg:#23201e;--fg:#e0dcd6;--topbar:#1a1715;--border:
 body[data-theme="forest"]{--bg:#0f1f17;--fg:#c8e0d0;--topbar:#162a1f;--border:#0a1510;--chip:#1f3a2a;--chip-active:#66bb6a;--chip-hover:#2a4a35;--input-bg:#162a1f;--input-border:#2a4a35;--btn:#66bb6a;--btn-danger:#ef5350;--btn-ghost:#1f3a2a;--toolbar:#122519;--picker-bg:#0f1f17;--picker-border:#2a4a35;--th:#122519;--th-hover:#1a3525;--td-border:#1a3020;--tr-hover:#1a2e20;--tr-sel:#2e7d32;--footer:#0a1510;--footer-border:#000;--muted:#5a8a6a;--muted2:#8ab89a}
 body[data-theme="hc"]{--bg:#000000;--fg:#ffffff;--topbar:#1a1a1a;--border:#404040;--chip:#2a2a2a;--chip-active:#00ffff;--chip-hover:#3a3a3a;--input-bg:#000;--input-border:#888;--btn:#00ffff;--btn-danger:#ff0000;--btn-ghost:#2a2a2a;--toolbar:#1a1a1a;--picker-bg:#000;--picker-border:#888;--th:#1a1a1a;--th-hover:#2a2a2a;--td-border:#333;--tr-hover:#1a1a1a;--tr-sel:#006666;--footer:#000;--footer-border:#404040;--muted:#aaaaaa;--muted2:#cccccc}
 '''
+
+
+def _esc(s):
+    """HTML 转义（等级页占位符注入用）。"""
+    return (str(s if s is not None else "")
+            .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;"))
+
+
+def _fmt_wan(n):
+    """大数字万化显示（照原作者格式）。"""
+    try:
+        v = float(n or 0)
+    except (TypeError, ValueError):
+        return "—"
+    if v >= 10000:
+        return f"{v/10000:.2f}".rstrip("0").rstrip(".") + "万"
+    return f"{v:,.0f}"
+
+
+# 原作者「数据与等级」页同款 SVG 图标
+_IC_UP = '<svg viewBox="0 0 24 24" fill="none" stroke="#2ee6a8" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M5 12l7-7 7 7"/></svg>'
+_IC_DOWN = '<svg viewBox="0 0 24 24" fill="none" stroke="#38bdf8" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12l7 7 7-7"/></svg>'
+_IC_RATIO = '<svg viewBox="0 0 24 24" fill="none" stroke="#fbbf24" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 17L17 7M9 7h8v8"/></svg>'
+_IC_PTS = '<svg viewBox="0 0 24 24" fill="none" stroke="#38bdf8" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l2.4 7.4H22l-6 4.4 2.3 7.2L12 16.7 5.7 21l2.3-7.2-6-4.4h7.6z"/></svg>'
+_IC_BEAN = '<svg viewBox="0 0 24 24" fill="none" stroke="#FF8A3C" stroke-width="2"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="3.5"/></svg>'
+_IC_ZAP_G = '<svg viewBox="0 0 24 24" fill="none" stroke="#2ee6a8" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2L4 14h6l-1 8 9-12h-6z"/></svg>'
+_IC_ZAP_B = '<svg viewBox="0 0 24 24" fill="none" stroke="#38bdf8" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2L4 14h6l-1 8 9-12h-6z"/></svg>'
+_IC_TREND = '<svg viewBox="0 0 24 24" fill="none" stroke="#f87171" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 17l6-6 4 4 8-8M15 7h6v6"/></svg>'
+
+
+def _radar_svg(axes):
+    """账户四维雷达 SVG（照原作者几何：中心 115,112 半径 78，四轴 0-100 归一化，含展开动画）。"""
+    import math as _m
+    cx, cy, r = 115.0, 112.0, 78.0
+    n = len(axes)
+    def _pt(i, frac):
+        ang = -_m.pi / 2 + i * 2 * _m.pi / n
+        return cx + r * frac * _m.cos(ang), cy + r * frac * _m.sin(ang)
+    parts = []
+    # 网格环
+    for ring in (0.25, 0.5, 0.75, 1.0):
+        pts = " ".join(f"{x:.1f},{y:.1f}" for i in range(n) for x, y in [_pt(i, ring)])
+        parts.append(f'<polygon class="grid-in" points="{pts}" fill="none" stroke="rgba(64,200,255,.14)"/>')
+    # 轴线
+    for i in range(n):
+        x, y = _pt(i, 1.0)
+        parts.append(f'<line class="axis-in" x1="{cx}" y1="{cy}" x2="{x:.1f}" y2="{y:.1f}" stroke="rgba(64,200,255,.14)"/>')
+    # 数据多边形
+    vals = [max(0.05, min(1.0, (v or 0) / 100.0)) for _, v in axes]
+    pts = " ".join(f"{x:.1f},{y:.1f}" for i, v in enumerate(vals) for x, y in [_pt(i, v)])
+    parts.append(f'<polygon class="poly-data" points="{pts}" fill="rgba(56,217,255,.18)" stroke="#38D9FF" stroke-width="1.8"/>')
+    # 顶点 + 标签
+    for i, ((lab, v), frac) in enumerate(zip(axes, vals)):
+        x, y = _pt(i, frac)
+        parts.append(f'<circle class="label-in l{i+1}" cx="{x:.1f}" cy="{y:.1f}" r="3" fill="#38D9FF"/>')
+        lx, ly = _pt(i, 1.22)
+        parts.append(f'<text class="label-in l{i+1}" x="{lx:.1f}" y="{ly:.1f}" text-anchor="middle" dominant-baseline="middle" font-size="11" fill="#9A8FC0">{lab}</text>')
+    return "".join(parts)
+
+
+_AVATAR_SVG = ('<svg viewBox="0 0 44 44" width="44" height="44">'
+               '<defs><linearGradient id="rb" x1="0" y1="0" x2="1" y2="1">'
+               '<stop offset="0" stop-color="#FF8A3C"/><stop offset="1" stop-color="#38D9FF"/></linearGradient></defs>'
+               '<rect width="44" height="44" rx="10" fill="url(#rb)"/>'
+               '<path d="M10 30 L22 14 L34 30 Z" fill="rgba(11,7,20,.82)"/>'
+               '<circle cx="22" cy="12" r="3.4" fill="#2ee6a8"/></svg>')
 
 _PANEL_HTML = r'''<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -1987,3 +2038,14 @@ themeSel.value=document.body.getAttribute("data-theme")||"dark";
 themeSel.onchange=function(){applyTheme(this.value)};
 buildHead();load();
 </script></body></html>'''
+
+
+# ---------------------------------------------------------------------- #
+# 独立工作台页模板（照原作者「结算统计表」「数据与等级」版式整体移植，仅换数据）
+# ---------------------------------------------------------------------- #
+# ---------------------------------------------------------------------- #
+# 独立工作台页模板（照原作者「结算统计表」「数据与等级」版式整体移植，仅换数据）
+# ---------------------------------------------------------------------- #
+_STATS_HTML = '<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">\n<meta name="viewport" content="width=device-width,initial-scale=1">\n<title>做种积分统计</title><style>\n\n*{box-sizing:border-box;margin:0;padding:0}\nbody{font-family:"Segoe UI","PingFang SC",Arial,sans-serif;color:#F0ECFF;\nbackground:radial-gradient(800px 420px at 6% -8%,rgba(255,64,160,.13),transparent 55%),\nradial-gradient(900px 460px at 94% -6%,rgba(64,200,255,.15),transparent 55%),#0B0714;\nmin-height:100vh;height:100vh;height:100dvh;display:flex;flex-direction:column;overflow:hidden;font-size:12px}\n.wrap{width:100%;margin:0 auto;flex:1;overflow:auto;padding:20px 28px 16px;display:flex;flex-direction:column}\n.head{display:flex;justify-content:space-between;align-items:center;margin-bottom:18px}\n.head .t{font-size:22px;font-weight:700}\n.head .t b{color:#FF8A3C}\n.head .src{font-size:12px;color:#9A8FC0;margin-top:5px}\n.exit{border:1px solid rgba(255,64,160,.35);background:rgba(255,64,160,.06);color:#D9A0CF;font-size:13px;padding:7px 16px;border-radius:10px;cursor:pointer;font-family:inherit}\n.exit:hover{background:rgba(255,64,160,.16)}\n.topcard{background:rgba(16,10,28,.75);border:1px solid rgba(64,200,255,.25);border-radius:18px;padding:16px 18px 12px;\nbox-shadow:0 0 30px rgba(64,200,255,.07);margin-bottom:18px}\n.ct{display:flex;align-items:baseline;gap:10px;margin-bottom:8px}\n.ct .nm{font-size:16px;font-weight:700}.ct .sb{font-size:11px;color:#9A8FC0}\n.stp{display:inline-flex;align-items:center;gap:4px;margin:0 2px;vertical-align:1px}\n.stp button{width:20px;height:20px;line-height:1;border-radius:6px;border:1px solid rgba(64,200,255,.35);background:rgba(64,200,255,.08);color:#38D9FF;cursor:pointer;font-size:13px;padding:0;font-family:inherit}\n.stp button:hover{background:rgba(64,200,255,.22)}\n.stp b{min-width:22px;text-align:center;font-size:14px;color:#F0ECFF}\n.chart{width:100%;height:300px}\n/* 柱状图下方达标三行对齐表格（列与柱严格对齐；窄屏整体横滑） */\n.qwrap{overflow-x:auto;overflow-y:hidden}\n.qinner{min-width:920px}\n.qtbl{display:grid;grid-template-columns:40px 80px repeat(10,minmax(56px,1fr));\npadding-right:14px;border-top:1px solid rgba(64,200,255,.22);margin-top:2px}\n.qc{display:flex;align-items:center;justify-content:center;text-align:center;white-space:nowrap;overflow:hidden;\npadding:5px 1px;border-right:1px solid rgba(64,200,255,.10);border-bottom:1px solid rgba(64,200,255,.10);font-size:11px}\n.qc.ax{border-right:none}\n.qc.rl{justify-content:flex-end;padding-right:8px;font-size:10px;color:#9A8FC0;font-weight:600;letter-spacing:.3px}\n.qc.q{color:#34D399;font-weight:700;font-size:13px}\n.qc.s{color:#38D9FF;font-weight:600;font-size:12px}\n.qc.d{color:#9A8FC0;font-size:10.5px;border-bottom:1px solid rgba(64,200,255,.30)}\n.qc.mute{color:#5d5478}\n.low{display:grid;grid-template-columns:1fr 1.15fr;gap:18px}\n.card{background:rgba(16,10,28,.72);border:1px solid rgba(255,64,160,.28);border-radius:18px;padding:16px 18px;\nbox-shadow:0 0 24px rgba(255,64,160,.07)}\n.duals{position:relative;width:100%;height:330px;display:flex;gap:14px}\n.duals .dbox{position:relative;flex:1 1 0;min-width:0}\n.duals .g{width:100%;height:330px}\n.duals .dlab{position:absolute;left:0;right:0;top:50%;transform:translateY(-50%);text-align:center;pointer-events:none}\n.duals .dlab .r{font-size:14px;color:#9A8FC0;margin-bottom:8px}\n.duals .dlab .v{font-size:26px;font-weight:700;line-height:1.15}\ntable{width:100%;border-collapse:collapse;font-size:12.5px}\nth{text-align:left;font-weight:600;color:#9A8FC0;font-size:11px;padding:7px 10px;border-bottom:1px solid rgba(255,64,160,.16);position:sticky;top:0;background:#150D24}\ntd{padding:8px 10px;border-bottom:1px solid rgba(120,90,220,.10);color:#DCD3F5;font-variant-numeric:tabular-nums}\ntd.d{color:#9A8FC0}\ntd.bean{color:#FF8A3C;font-weight:600}\ntd.pt{color:#38D9FF;font-weight:600}\n.scroll30{height:330px;overflow-y:auto;border-radius:12px;border:1px solid rgba(120,90,220,.20)}\n.scroll30::-webkit-scrollbar{width:8px}.scroll30::-webkit-scrollbar-thumb{background:#4A3A78;border-radius:4px}\n.status{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;font-size:14px;color:#F0ECFF;text-align:center;max-width:460px;padding:28px 36px;border-radius:14px;border:1px solid rgba(255,64,160,.25);background:rgba(16,10,28,.85);box-shadow:0 0 30px rgba(255,64,160,.12)}\n.status .bar{width:260px;height:4px;background:rgba(120,90,220,.18);border-radius:2px;overflow:hidden;position:relative}\n.status .bar i{position:absolute;top:0;left:0;height:100%;width:38%;background:linear-gradient(90deg,#FF8A3C,#38D9FF);border-radius:2px;animation:hhslide 1s linear infinite;box-shadow:0 0 8px rgba(255,138,60,.6)}\n@keyframes hhslide{0%{left:-38%}100%{left:100%}}\n.status .err{color:#FF6B6B;font-size:13px;max-width:80%;text-align:center;line-height:1.6}\n.status .retrybtn{background:linear-gradient(90deg,#FF8A3C,#38D9FF);color:#0B0714;border:none;padding:8px 26px;border-radius:8px;cursor:pointer;font-size:13px;margin-top:4px;font-weight:600}\n.warnbar{display:none;margin-bottom:14px;padding:10px 16px;border-radius:12px;background:rgba(255,107,107,.10);border:1px solid rgba(255,107,107,.45);color:#FFB3A0;font-size:12.5px;line-height:1.6;align-items:center}\n.warnbar b{font-weight:700;color:#FF8A6B}\n.warnbar .wbtn{margin-left:14px;background:rgba(255,107,107,.18);border:1px solid rgba(255,107,107,.55);color:#FFD0C0;padding:5px 16px;border-radius:8px;cursor:pointer;font-size:12px;font-family:inherit;flex-shrink:0}\n.warnbar .wbtn:hover{background:rgba(255,107,107,.32)}\n.bodywrap{position:relative;flex:1;display:flex;flex-direction:column}\n.footer{margin-top:16px;font-size:11.5px;color:#9A8FC0;line-height:1.7;text-align:center}\n@media (max-width:720px){\n.wrap{padding:14px 12px 12px}\n.head .t{font-size:18px}\n.head .src{font-size:11px}\n.low{grid-template-columns:1fr}\n.scroll30{overflow-x:auto}\n.chart{height:272px}\n.duals{height:280px}\n.duals .g{height:280px}\n.status{max-width:88vw;padding:22px 16px}\n.status .bar{width:200px}\n}\n\n</style></head><body>\n<div class="wrap">\n<div class="head">\n<div><div class="t">做种<b>积分统计</b></div>\n<div class="src">彩虹岛做种积分巡检采样 · 每轮巡检自动记录 · 按自然日聚合</div></div>\n<button class="exit" title="关闭页面" onclick="window.close()">退出</button>\n</div>\n<div class="bodywrap">\n<div id="status" class="status"><span>正在加载统计数据，请稍候…</span><div class="bar"><i></i></div></div>\n<div id="main" style="display:none">\n<div class="topcard"><div class="ct"><span class="nm">近<span id="dvl">15</span>日做种积分增量</span><span class="stp"><button onclick="adjD(-1)">−</button><button onclick="adjD(1)">＋</button></span><span class="sb">橙柱 = 当日做种积分增量 · 悬停查看当日首末次采样 · 下方网格与柱严格对齐</span></div>\n<div class="qwrap"><div class="qinner">\n<div class="chart" id="mb"></div>\n<div class="qtbl" id="qtbl"></div>\n</div></div></div>\n<div class="low">\n<div class="card"><div class="ct"><span class="nm">做种积分累计</span><span class="sb">左环 = 当前积分 · 右环 = 近30日增量</span></div>\n<div class="duals"><div class="dbox"><div class="g" id="dg1"></div><div class="dlab"><div class="r">当前积分</div><div class="v" id="cvb" style="color:#FF8A3C">—</div></div></div>\n<div class="dbox"><div class="g" id="dg2"></div><div class="dlab"><div class="r">30日增量</div><div class="v" id="cvp" style="color:#38D9FF">—</div></div></div></div></div>\n<div class="card"><div class="ct"><span class="nm">采样明细</span><span class="sb">最新日期在最上方 · 首/末 = 当日首末次采样值</span></div>\n<div class="scroll30" id="tbl"></div></div>\n</div>\n</div>\n</div>\n<div class="footer" id="foot">做种积分数据来自插件每轮巡检对页头「做种积分」的采样 · 增量按相邻日末次采样差计算 · 采样积累后方有数据</div>\n</div>\n<script src="https://cdn.jsdelivr.net/npm/echarts@5.4.3/dist/echarts.min.js"></script>\n<script>\nvar data=__DATA__;\nvar chb=null,chd1=null,chd2=null,R={days:15};\nfunction esc(s){return String(s==null?"":s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;")}\nfunction fmtBig(n){if(n===null||n===undefined)return "—";return Number(n).toLocaleString()}\nfunction adjD(d){R.days=Math.min(30,Math.max(1,(R.days||15)+d));renderAll();}\nfunction renderAll(){\nvar rec=(data.records||[]).slice(-R.days);\ndocument.getElementById(\'dvl\').textContent=R.days;\nvar st=document.getElementById(\'status\');st.style.display=\'none\';\ndocument.getElementById(\'main\').style.display=\'block\';\ndocument.getElementById(\'foot\').textContent=\'数据更新于 \'+(data.updated_at||\'—\')+\' · 做种积分数据来自插件每轮巡检采样 · 增量按相邻日末次采样差计算\';\nif(typeof echarts===\'undefined\'){renderTable(rec);return;}\nrenderChart(rec);buildQTable(rec);renderGauges();renderTable((data.records||[]));\n}\nfunction renderChart(rec){\nif(chb){chb.dispose();chb=null;}\nchb=echarts.init(document.getElementById(\'mb\'));\nvar x=[],d=[];\nfor(var i=0;i<rec.length;i++){var r=rec[i];x.push(r.date);d.push(r.delta===null||r.delta===undefined?0:Math.round(r.delta));}\nchb.setOption({backgroundColor:\'transparent\',\ntooltip:{trigger:\'axis\',triggerOn:\'click\',renderMode:\'richText\',confine:true,textStyle:{fontSize:11,color:\'#F0ECFF\',lineHeight:15},backgroundColor:\'rgba(21,13,36,.95)\',borderColor:\'rgba(64,200,255,.3)\',padding:[6,8],\nformatter:function(ps){var r=rec[ps[0].dataIndex];var h=\'<b>\'+esc(r.date)+\'</b><br/>当日增量：\'+fmtBig(r.delta)+\'<br/>首采：\'+fmtBig(r.first)+\'<br/>末采：\'+fmtBig(r.last)+\'<br/>采样数：\'+r.n+\'<br/>累计增量：\'+fmtBig(r.cum);return h;}},\ngrid:{left:80,right:14,top:30,bottom:8},\nxAxis:{type:\'category\',data:x,axisTick:{show:false},axisLine:{show:false},axisLabel:{show:false}},\nyAxis:{type:\'value\',axisLabel:{fontSize:10,color:\'#9A8FC0\',formatter:function(v){return v>=10000?(v/10000).toFixed(1).replace(\'.0\',\'\')+\'万\':v}},splitLine:{lineStyle:{color:\'rgba(64,200,255,.12)\'}}},\nseries:[{name:\'当日增量\',type:\'bar\',data:d,itemStyle:{color:\'#FF8A3C\',borderRadius:[4,4,0,0]},\nlabel:{show:true,position:\'top\',fontSize:9,color:\'#FF8A3C\',distance:2,formatter:function(p){return (p.value===null||p.value===undefined||p.value===0)?\'\':fmtBig(p.value)}},labelLayout:{hideOverlap:true}}]});\nchb.resize();\n}\nfunction buildQTable(rec){\nvar tb=document.getElementById(\'qtbl\');if(!tb)return;\nvar n=rec.length;\ntb.style.gridTemplateColumns=\'40px 80px repeat(\'+n+\',minmax(56px,1fr))\';\nvar inner=document.querySelector(\'.qinner\');if(inner)inner.style.minWidth=Math.max(920,134+n*60)+\'px\';\nfunction row(lab,cls,fn){var h=\'<div class="qc ax"></div><div class="qc rl">\'+lab+\'</div>\';for(var i=0;i<n;i++){h+=\'<div class="qc \'+cls+\'">\'+fn(rec[i])+\'</div>\';}return h;}\ntb.innerHTML=\nrow(\'增量\',\'q\',function(r){return (r.delta===null||r.delta===undefined)?\'<span class="mute">—</span>\':fmtBig(Math.round(r.delta));})+\nrow(\'累计\',\'s\',function(r){return fmtBig(r.cum);})+\nrow(\'日期\',\'d\',function(r){return r.date||\'\';});\n}\nfunction renderGauges(){\nif(chd1){chd1.dispose();chd1=null;}if(chd2){chd2.dispose();chd2=null;}\nchd1=echarts.init(document.getElementById(\'dg1\'));\nchd2=echarts.init(document.getElementById(\'dg2\'));\nvar cur=Number(data.current)||0,c30=Number(data.cum30)||0;\ndocument.getElementById(\'cvb\').textContent=fmtBig(Math.round(cur));\ndocument.getElementById(\'cvp\').textContent=\'+\'+fmtBig(Math.round(c30));\nchd1.setOption({backgroundColor:\'transparent\',series:[\n{type:\'gauge\',startAngle:210,endAngle:-30,min:0,max:Math.max(cur,1),radius:\'78%\',center:[\'50%\',\'52%\'],\nprogress:{show:true,width:22,itemStyle:{color:\'#FF8A3C\',shadowColor:\'#FF8A3C\',shadowBlur:16}},\naxisLine:{lineStyle:{width:22,color:[[1,\'rgba(255,138,60,.10)\']]}},\naxisTick:{show:false},splitLine:{show:false},axisLabel:{show:false},pointer:{show:false},detail:{show:false},data:[{value:cur}]}]});\nchd2.setOption({backgroundColor:\'transparent\',series:[\n{type:\'gauge\',startAngle:210,endAngle:-30,min:0,max:Math.max(c30,1),radius:\'78%\',center:[\'50%\',\'52%\'],\nprogress:{show:true,width:22,itemStyle:{color:\'#38D9FF\',shadowColor:\'#38D9FF\',shadowBlur:16}},\naxisLine:{lineStyle:{width:22,color:[[1,\'rgba(56,217,255,.10)\']]}},\naxisTick:{show:false},splitLine:{show:false},axisLabel:{show:false},pointer:{show:false},detail:{show:false},data:[{value:c30}]}]});\nchd1.resize();chd2.resize();\n}\nfunction renderTable(rec){\nvar rows=\'\';\nfor(var j=rec.length-1;j>=0;j--){var r=rec[j];\nrows+=\'<tr><td class="d">\'+esc(r.date)+\'</td><td class="bean">\'+fmtBig(r.delta===null||r.delta===undefined?null:Math.round(r.delta))+\'</td><td class="pt">\'+fmtBig(r.first)+\'</td><td>\'+fmtBig(r.last)+\'</td><td>\'+r.n+\'</td><td>\'+fmtBig(r.cum)+\'</td></tr>\';}\nif(!rows)rows=\'<tr><td colspan="6" style="text-align:center;color:#5d5478;padding:24px;">暂无采样数据（巡检一次记录一条，运行后自动积累）</td></tr>\';\ndocument.getElementById(\'tbl\').innerHTML=\'<table><thead><tr><th>日期</th><th>当日增量</th><th>首采</th><th>末采</th><th>采样数</th><th>累计增量</th></tr></thead><tbody>\'+rows+\'</tbody></table>\';\n}\nwindow.addEventListener(\'resize\',function(){if(chb)chb.resize();if(chd1)chd1.resize();if(chd2)chd2.resize();});\nrenderAll();\n</script></body></html>'
+
+_LEVEL_HTML = '<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">\n<meta name="viewport" content="width=device-width,initial-scale=1">\n<title>数据与等级</title><style>\n\n  * { margin:0; padding:0; box-sizing:border-box; }\n  body { background:#0d1321; color:#e8edf7; font-family:"PingFang SC","Microsoft YaHei",sans-serif; padding:10px; }\n  .card { background:#111c33; border:1px solid #1e3357; border-radius:12px; }\n  .head { display:flex; align-items:center; gap:14px; height:64px; padding:0 20px; background:linear-gradient(135deg,#12203a,#0f1830); border-radius:12px; margin-bottom:10px; }\n  .avatar { width:44px; height:44px; border-radius:10px; background:#fff; display:flex; align-items:center; justify-content:center; overflow:hidden; flex-shrink:0; }\n  .avatar img { width:100%; height:100%; }\n  .head .nm { font-size:20px; font-weight:700; }\n  .head .meta { font-size:10px; color:#7d8db1; margin-top:2px; }\n  .head .right { margin-left:auto; text-align:right; }\n  .badge { display:inline-block; background:linear-gradient(135deg,#f59e0b,#d97706); color:#1a1205; font-size:12px; font-weight:700; padding:5px 14px; border-radius:14px; margin-bottom:5px; }\n  .lvline { font-size:10px; color:#9fb3d8; }\n  .band { display:flex; gap:10px; margin-bottom:10px; }\n  .kpi { flex:1 1 0; min-width:0; background:#111c33; border:1px solid #1e3357; border-radius:11px; padding:10px 8px; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:3px; text-align:center; min-height:120px; }\n  .kpi .ic { width:34px; height:34px; border-radius:9px; background:#16233f; display:flex; align-items:center; justify-content:center; margin-bottom:2px; }\n  .kpi .ic svg { width:18px; height:18px; }\n  .kpi .k { font-size:10px; color:#7d8db1; line-height:1.25; }\n  .kpi .v { font-size:16px; font-weight:700; white-space:nowrap; line-height:1.15; }\n  .kpi .s { font-size:8.5px; color:#5a6b8c; white-space:nowrap; }\n  .green { color:#2ee6a8; } .blue { color:#38bdf8; } .bean { color:#FF8A3C; }\n  .main { display:flex; gap:10px; margin-bottom:10px; }\n  .progCard { flex:1 1 0; min-width:0; padding:14px 20px; display:flex; flex-direction:column; }\n  .progCard h3 { font-size:13px; color:#9fb3d8; letter-spacing:1px; margin-bottom:12px; }\n  .bar { margin-bottom:16px; flex:1; display:flex; flex-direction:column; justify-content:center; }\n  .bar:last-child { margin-bottom:0; }\n  .bar .r { display:flex; justify-content:space-between; align-items:baseline; gap:10px; font-size:11px; margin-bottom:6px; }\n  .bar .r .need { color:#7d8db1; white-space:nowrap; }\n  .bar .r .val { color:#c6d3ec; font-weight:600; text-align:right; }\n  .miss { color:#f87171; font-weight:700; } .ok { color:#2ee6a8; }\n  .track { height:9px; background:#0a1326; border-radius:5px; overflow:hidden; }\n  .fill { height:100%; border-radius:5px; }\n  .radarCard { width:380px; flex-shrink:0; padding:14px; display:flex; flex-direction:column; }\n  .radarCard h3 { font-size:13px; color:#9fb3d8; letter-spacing:1px; margin-bottom:2px; }\n  .radarWrap { position:relative; flex:1; display:flex; align-items:center; justify-content:center; }\n  .radarWrap svg { width:285px; height:285px; max-width:100%; }\n  .rcenter { position:absolute; left:50%; top:48.5%; transform:translate(-50%,-50%); text-align:center; pointer-events:none; }\n  .rcenter .lv { font-size:26px; font-weight:800; color:#fbbf24; }\n  .rcenter .sub { font-size:10px; color:#7d8db1; }\n  .rextra { text-align:center; font-size:11px; color:#9fb3d8; border-top:1px solid #1e2d4e; padding-top:8px; }\n  .rextra b { color:#f87171; }\n  .ladderCard { padding:12px 20px; margin-bottom:10px; }\n  .ladderCard h3 { font-size:13px; color:#9fb3d8; letter-spacing:1px; margin-bottom:8px; }\n  .ladder { display:flex; align-items:flex-start; }\n  .step { flex:1; text-align:center; position:relative; padding-top:16px; }\n  .step::before { content:\'\'; position:absolute; top:0; left:50%; width:12px; height:12px; border-radius:50%; background:#27334d; z-index:2; transform:translateX(-50%); }\n  .step::after { content:\'\'; position:absolute; top:5px; left:-50%; width:100%; height:2px; background:#1e3357; }\n  .step:first-child::after { display:none; }\n  .step.done::before { background:#2ee6a8; }\n  .step.done::after { background:#2ee6a8; }\n  .step.cur::before { background:#fbbf24; box-shadow:0 0 0 4px rgba(251,191,36,.2); }\n  .step.cur::after { background:linear-gradient(to right,#2ee6a8,#fbbf24); }\n  .step.done .en { color:#2ee6a8; }\n  .step .en { font-size:10.5px; color:#c6d3ec; }\n  .step .cn { font-size:9.5px; color:#5a6b8c; }\n  .step.cur .en { color:#fbbf24; font-weight:700; }\n  .tagcur { position:absolute; top:-16px; left:50%; transform:translateX(-50%); background:#fbbf24; color:#1a1205; font-size:9px; font-weight:700; padding:2px 8px; border-radius:8px; white-space:nowrap; }\n  .next { display:flex; gap:10px; }\n  .ncard { flex:1 1 0; min-width:0; background:#0f1a30; border:1px solid #24355a; border-radius:11px; padding:12px 18px; display:flex; align-items:center; gap:14px; min-height:100px; }\n  .ncard .tt { flex:1; min-width:0; }\n  .ncard .t1 { font-size:13px; font-weight:700; }\n  .ncard .t2 { font-size:10px; color:#7d8db1; margin-top:4px; }\n  .ncard .dd { text-align:right; font-size:11px; color:#c6d3ec; white-space:nowrap; }\n  .ncard .dd b { color:#f87171; }\n  .foot { text-align:center; font-size:9px; color:#44567a; margin-top:10px; line-height:1.6; }\n  @keyframes radarExpand { from { transform:scale(0); opacity:0; } to { transform:scale(1); opacity:1; } }\n  @keyframes fadeIn { from { opacity:0; } to { opacity:1; } }\n  @keyframes fadeUp { from { opacity:0; transform:translateY(5px); } to { opacity:1; transform:none; } }\n  .poly-data { transform-box:view-box; transform-origin:115px 112px; animation:radarExpand .9s cubic-bezier(.22,.61,.36,1) .12s; }\n  .grid-in { animation:fadeIn .5s ease-out; }\n  .axis-in { animation:fadeIn .45s ease-out; }\n  .label-in { animation:fadeUp .5s ease-out; }\n  .l1 { animation-delay:.5s; } .l2 { animation-delay:.6s; } .l3 { animation-delay:.7s; } .l4 { animation-delay:.8s; }\n  @media (max-width:1100px){\n    .band { flex-wrap:wrap; }\n    .kpi { flex:1 1 30%; min-height:100px; }\n    .main { flex-direction:column; }\n    .radarCard { width:auto; }\n    .radarWrap { height:300px; }\n    .ladderCard { overflow-x:auto; } .ladder { min-width:760px; }\n    .next { flex-direction:column; }\n  }\n  @media (max-width:560px){\n    .kpi { flex:1 1 45%; }\n    .head { flex-wrap:wrap; height:auto; padding:10px 14px; }\n    .head .right { margin-left:0; text-align:left; }\n  }\n\n</style></head><body>\n<div class="panel">\n  <div class="head card">\n    <div class="avatar">__AVATAR__</div>\n    <div>\n      <div class="nm">__USERNAME__</div>\n      <div class="meta">__META__</div>\n    </div>\n    <div class="right">\n      <div class="badge">__BADGE__</div>\n      <div class="lvline">__LVLINE__</div>\n    </div>\n  </div>\n  <div class="band">__KPIS__</div>\n  <div class="main">\n    <div class="card progCard">\n      <h3>任务系统五档完成率（全站统计）</h3>\n      __BARS__\n    </div>\n    <div class="card radarCard">\n      <h3>账户四维概览</h3>\n      <div class="radarWrap">\n        <svg viewBox="-30 -16 290 262">__RADAR__</svg>\n        <div class="rcenter"><div class="lv">__UP_PCT__%</div><div class="sub">任务平均完成率</div></div>\n      </div>\n      <div class="rextra">四维 = 上传 / 下载 / 分享率 / 做种积分（各自归一化至 0-100）</div>\n    </div>\n  </div>\n  <div class="card ladderCard">\n    <h3>任务系统等级阶梯</h3>\n    <div class="ladder">__STEPS__</div>\n  </div>\n  <div class="next">__NEXT__</div>\n  <div class="foot">__FOOT__</div>\n<script>\n(function(){var el=document.querySelector(\'.rcenter .lv\');if(!el)return;var end=parseFloat(el.textContent)||0;var dur=1400,st=performance.now();el.textContent=\'0%\';var timer=setInterval(function(){var p=Math.min((performance.now()-st)/dur,1);el.textContent=Math.round(end*(1-Math.pow(1-p,3)))+\'%\';if(p>=1)clearInterval(timer);},16);})();\n</script>\n</div>\n</body>\n</html>'
