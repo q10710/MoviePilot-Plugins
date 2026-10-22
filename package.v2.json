@@ -309,7 +309,7 @@
     "name": "彩虹岛复活区管家Q自用版",
     "description": "基于六个橙子「憨憨保种区管家」(HHClubButler) 架构复刻，致谢原作者 SixOrg。\n复活区全景 / 免费到期处置 / 捡漏推送 / 做种到期提醒",
     "labels": "保种区管理",
-    "version": "1.2.2",
+    "version": "1.2.3",
     "icon": "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/rainbowrevivebutler.png",
     "author": "Q",
     "author_url": "https://github.com/q10710",
@@ -320,7 +320,8 @@
       "v1.1.0": "全面对齐 HHClubButler 体验：工作台移植 15 套主题/列显隐配置(localStorage)/列排序/列宽拖拽/搜索/筛选/批量删除/CSV导出；详情页升级为统计卡+做种档位色条+QB 风格在保列表(可单删)；仪表盘加档位分布条；频率拆分：到期处置由守护线程高频执行(默认5分钟，到期即删)，巡检 cron 默认 2 小时(全景/捡漏/自动下载)；新增设置：处置间隔/捡漏自动下载(默认关)/推送下载器/保存路径/标签/体积上限；新增 /export /delete_seed API。",
       "v1.2.0": "看板数据接入彩虹岛原生做种计量：新增账户统计(做种积分+每小时增速/魔力/分享率/上传下载/当前做种/H&R)、全量做种组合分析(getusertorrentlistajax 取全部做种，221条，按做种人数分档+高价值/摊薄种子榜，识别可送复活区翻红的种子)；详情页与仪表盘升级为「做种收益看板」。",
       "v1.2.1": "看板版式照原作者 HHClubButler 重做：get_dashboard 改回标准三元组格式(cols/meta/elements，此前返回 list 导致首页看板渲染异常)；新建 _overview_html 静态方法，用主题自适应 CSS 变量(--v-theme-on-surface)+table 布局(账户4格统计/复活区档位色条/做种组合色条+图例)，get_page 与 dashboard 统一复用；移除旧的硬编码颜色 flex 卡片死代码。",
-      "v1.2.2": "配置表单照原作者结构重做：顶部嵌 _overview_form_cards VCard 数据面板(做种积分/分享率/上传/当前做种+复活区/做种组合统计格)、栅格改 cols=12+md 响应式、cron 换 VCronField 专用字段。至此表单/详情页/仪表盘/工作台四处版式均严格对齐 HHClubButler，数据为彩虹岛自有。"
+      "v1.2.2": "配置表单照原作者结构重做：顶部嵌 _overview_form_cards VCard 数据面板(做种积分/分享率/上传/当前做种+复活区/做种组合统计格)、栅格改 cols=12+md 响应式、cron 换 VCronField 专用字段。至此表单/详情页/仪表盘/工作台四处版式均严格对齐 HHClubButler，数据为彩虹岛自有。",
+      "v1.2.3": "深挖修复 6 处：① spstate=1 正则误抓 userdetails.php?id= 用户链接(与详情链接同形)导致「我做种」虚高2个(11→9)，加 (?<!user) 负向断言，主列表解析同步加固(防误抓ID占坑挤掉真种子)；② 捡漏通知去重 key 只查不写导致每2小时重复推送同一批，补 dedupe[key]=now；③ 自动下载未检查 add_torrent 返回值(失败当成功)，改为校验 (ok,ids)；④ 工作台批量删除后未复核就报成功，加删后复核；⑤ 守护线程 quick 早退——下载器无未完成任务时跳过站点抓取(原每5分钟空拉3页，曾触发限流)；⑥ leeching 正则字符类笔误[:?:]→[:：]。"
     }
   }
 }
