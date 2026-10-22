@@ -312,28 +312,36 @@ class RainbowReviveButler(_PluginBase):
         return seeds
 
     def _fetch_revive_list(self, session: requests.Session, base: str) -> Tuple[List[dict], int]:
-        """拉取复活区全部分页（上限 10 页防失控）。"""
+        """拉取复活区全部分页（上限 10 页防失控）；首页空时重试一次防瞬时限流。"""
         all_seeds: List[dict] = []
         seen = set()
         page = 0
-        for page in range(10):
-            url = f"{base}/renewtorrents.php?page={page}" if page else f"{base}/renewtorrents.php"
-            try:
-                r = session.get(url, timeout=30)
-                if r.status_code != 200:
+        for attempt in range(2):
+            all_seeds = []
+            seen = set()
+            for page in range(10):
+                url = f"{base}/renewtorrents.php?page={page}" if page else f"{base}/renewtorrents.php"
+                try:
+                    r = session.get(url, timeout=30)
+                    if r.status_code != 200:
+                        break
+                except Exception as e:
+                    if page == 0:
+                        raise
+                    logger.warning(f"彩虹岛复活区管家：第 {page} 页拉取失败：{e}")
                     break
-            except Exception as e:
-                if page == 0:
-                    raise
-                logger.warning(f"彩虹岛复活区管家：第 {page} 页拉取失败：{e}")
+                seeds = self._parse_revive_page(r.text)
+                new = [s for s in seeds if s["tid"] not in seen]
+                for s in new:
+                    seen.add(s["tid"])
+                all_seeds.extend(new)
+                if len(new) == 0:
+                    break
+            if all_seeds or attempt == 1:
                 break
-            seeds = self._parse_revive_page(r.text)
-            new = [s for s in seeds if s["tid"] not in seen]
-            for s in new:
-                seen.add(s["tid"])
-            all_seeds.extend(new)
-            if len(new) == 0:
-                break
+            # 首页拿到 0 个种子：可能是站点瞬时限流/返回登录页，等 5 秒重试一次
+            logger.warning("彩虹岛复活区管家：复活区列表为空，5 秒后重试一次（防瞬时限流）")
+            time.sleep(5)
         return all_seeds, page + 1
 
     def _fetch_my_seeding_ids(self, session: requests.Session, base: str) -> set:
