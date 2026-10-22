@@ -44,7 +44,7 @@ class RainbowReviveButler(_PluginBase):
     plugin_name = "彩虹岛复活区管家Q自用版"
     plugin_desc = "基于六个橙子「憨憨保种区管家」(HHClubButler) 架构复刻，致谢原作者 SixOrg。\n复活区全景 / 免费到期处置 / 捡漏推送 / 做种到期提醒"
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/rainbowrevivebutler.png"
-    plugin_version = "1.2.2"
+    plugin_version = "1.2.3"
     plugin_label = "资源站点"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -272,7 +272,7 @@ class RainbowReviveButler(_PluginBase):
         """解析复活区列表页，提取种子行字段。"""
         seeds: List[dict] = []
         seen = set()
-        for m in re.finditer(r"details\.php\?id=(\d+)", html):
+        for m in re.finditer(r"(?<!user)details\.php\?id=(\d+)", html):
             tid = m.group(1)
             if tid in seen:
                 continue
@@ -348,7 +348,8 @@ class RainbowReviveButler(_PluginBase):
         """spstate=1 视图 = 我在做种的复活区种子。"""
         try:
             r = session.get(base + "/renewtorrents.php?spstate=1", timeout=30)
-            return set(re.findall(r"details\.php\?id=(\d+)", r.text))
+            # (?<!user) 排除 userdetails.php?id= 用户链接（其尾部与 details.php?id= 同形，会误抓页头/上传者 ID）
+            return set(re.findall(r"(?<!user)details\.php\?id=(\d+)", r.text))
         except Exception as e:
             logger.warning(f"彩虹岛复活区管家：拉取我的做种视图失败：{e}")
             return set()
@@ -395,7 +396,7 @@ class RainbowReviveButler(_PluginBase):
                 "uploaded_tb": self._parse_updown(grab(r"上传量[:：][^0-9]*?([\d.]+\s*[TGM]B)")),
                 "downloaded_tb": self._parse_updown(grab(r"下载量[:：][^0-9]*?([\d.]+\s*[TGM]B)")),
                 "seeding_now": int(grab(r"当前活动[:：].*?arrowup[^>]*>\s*(\d+)", 0) or 0),
-                "leeching_now": int(grab(r"当前活动[:?:].*?arrowdown[^>]*>\s*(\d+)", 0) or 0),
+                "leeching_now": int(grab(r"当前活动[:：].*?arrowdown[^>]*>\s*(\d+)", 0) or 0),
                 "hr": int(grab(r"H&R[:：][^0-9]*?(\d+)", 0) or 0),
             }
             return stats
@@ -513,15 +514,40 @@ class RainbowReviveButler(_PluginBase):
     # ------------------------------------------------------------------ #
     # 核心：到期处置（守护线程与巡检共用）
     # ------------------------------------------------------------------ #
-    def _dispose_pass(self, notify: bool = True) -> dict:
+    def _has_incomplete_tasks(self) -> bool:
+        """受管控下载器里是否存在未完成（下载中）任务——决定守护线程是否值得拉站点。"""
+        services = self._get_manage_services()
+        if not services:
+            return False
+        for dl_name, sv in services.items():
+            try:
+                torrents, error = sv.instance.get_torrents()
+                if error or not torrents:
+                    continue
+                for t in torrents:
+                    progress = float(self._tf(t, "progress", "percentDone", default=0) or 0)
+                    if progress < 1.0:
+                        return True
+            except Exception:
+                # 查不清时保守认为有（走完整流程）
+                return True
+        return False
+
+    def _dispose_pass(self, notify: bool = True, quick: bool = False) -> dict:
         """一轮到期处置：拉列表 → 比对下载器未完成任务 → 到期删/预警/提前删。
 
+        quick=True（守护线程专用）：先查下载器有无未完成任务，没有则跳过站点抓取，
+        避免每 5 分钟空拉 3 页给站点造成压力（曾触发过一次站点限流返回空列表）。
+        quick=False（cron 巡检）：始终全量抓取（看板需要数据）。
         返回统计 dict。异常向上抛由调用方处理。
         """
         base = self._get_site_url()
         cookie = self._get_site_cookie()
         if not base or not cookie:
             raise Exception("未找到彩虹岛站点配置或 Cookie（请在站点管理中配置）")
+        if quick and not self._has_incomplete_tasks():
+            return {"seeds": [], "pages": 0, "deleted": [], "hr_skipped": [],
+                    "warned": [], "early_deleted": []}
         session = self._session(cookie)
         seeds, pages = self._fetch_revive_list(session, base)
         if not seeds:
@@ -739,6 +765,7 @@ class RainbowReviveButler(_PluginBase):
                 if s["is_free"] and s["seeders"] <= self._low_seeder_max and s.get("free_until") and s["free_until"] > now:
                     key = f"deal:{s['tid']}:{int(s['free_until'])}"
                     if key not in dedupe:
+                        dedupe[key] = now  # 写入去重，同一免费窗口只推一次（否则每轮巡检重复推送）
                         deal_seeds.append(s)
         self.save_data("notify_dedupe", dedupe)
 
@@ -819,10 +846,15 @@ class RainbowReviveButler(_PluginBase):
                     break
                 url = f"{base}/download.php?id={s['tid']}"
                 try:
-                    sv.instance.add_torrent(
+                    # add_torrent 返回 (成功标志, 任务标识列表)，失败时 (False, [])
+                    result = sv.instance.add_torrent(
                         content=url, cookie=cookie,
                         download_dir=(self._save_path or None),
                         tag=(self._tag or None))
+                    ok = result[0] if isinstance(result, tuple) else bool(result)
+                    if not ok:
+                        logger.warning(f"彩虹岛复活区管家：自动下载被下载器拒绝 {s['title'][:40]}（返回 {result}）")
+                        continue
                     out.append(s)
                     total_gb += s["size_gb"]
                     logger.info(f"彩虹岛复活区管家：自动下载 {s['title'][:50]}（{s['size_gb']:.1f}GB → {self._push_downloader}）")
@@ -855,7 +887,7 @@ class RainbowReviveButler(_PluginBase):
                     wait = self._dispose_minutes * 60 - (time.time() - self._last_dispose_ts)
                     if wait <= 0:
                         try:
-                            self._dispose_pass(notify=self._notify)
+                            self._dispose_pass(notify=self._notify, quick=True)
                         except Exception as e:
                             logger.warning(f"彩虹岛复活区管家：守护处置轮次异常：{e}")
                         self._last_dispose_ts = time.time()
@@ -1179,9 +1211,18 @@ class RainbowReviveButler(_PluginBase):
                 if not del_ids:
                     continue
                 sv.instance.delete_torrents(delete_file=self._delete_files, ids=del_ids)
+                # 删除后复核：全部不存在才算成功（qb/tr 删除内部可能吞异常返回 False）
+                try:
+                    ts2, err2 = sv.instance.get_torrents(ids=del_ids)
+                    leftover = len(ts2 or []) if not err2 else len(del_ids)
+                except Exception:
+                    leftover = len(del_ids)
+                ok = leftover == 0
                 self._append_disposal({"time": int(time.time()), "tid": seed["tid"], "title": seed["title"],
                                        "size_gb": seed["size_gb"], "progress": 0, "downloader": dl_name,
-                                       "action": "manual_delete", "ok": True})
+                                       "action": "manual_delete", "ok": ok})
+                if not ok:
+                    return {"success": False, "message": f"{dl_name} 删除未生效（仍剩 {leftover} 个任务），请重试"}
                 return {"success": True, "message": f"已从 {dl_name} 删除 {len(del_ids)} 个任务"}
             except Exception as e:
                 logger.error(f"彩虹岛复活区管家：手动删除失败 {seed['title'][:40]}（{dl_name}）：{e}")
