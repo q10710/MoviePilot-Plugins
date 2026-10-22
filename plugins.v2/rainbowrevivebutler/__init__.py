@@ -703,6 +703,21 @@ class RainbowReviveButler(_PluginBase):
         base = self._get_site_url()
         session = self._session(self._get_site_cookie())
         my_ids = self._fetch_my_seeding_ids(session, base)
+        acct_stats = self._fetch_site_stats(session, base)
+        portfolio = self._fetch_seeding_portfolio(session, base)
+        # 做种积分增速
+        try:
+            prev = self.get_data("credit_sample") or {}
+            cur_credit = acct_stats.get("credit", 0)
+            if prev.get("credit") and prev.get("ts") and cur_credit:
+                dt_h = (time.time() - prev["ts"]) / 3600
+                if 0.01 < dt_h < 24 * 7:
+                    acct_stats["credit_rate"] = round((cur_credit - prev["credit"]) / dt_h, 1)
+            if cur_credit:
+                self.save_data("credit_sample", {"credit": cur_credit, "ts": time.time()})
+        except Exception:
+            pass
+        portfolio_stats = self._analyze_portfolio(portfolio)
         now = time.time()
         warn_sec = self._warn_hours * 3600
 
@@ -768,6 +783,7 @@ class RainbowReviveButler(_PluginBase):
             "my_seeding": len(my_ids), "deleted": len(stats["deleted"]),
             "early": len(stats["early_deleted"]), "warned": len(stats["warned"]),
             "auto_downloaded": len(downloaded), "seeds": seeds, "my_ids": sorted(my_ids),
+            "stats": acct_stats, "portfolio": portfolio[:200], "portfolio_stats": portfolio_stats,
         }
         self._last_overview_ts = now
         self._last_result = (
