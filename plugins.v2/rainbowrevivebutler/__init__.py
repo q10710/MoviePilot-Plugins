@@ -56,7 +56,7 @@ class RainbowReviveButler(_PluginBase):
     plugin_name = "彩虹岛复活区管家Q自用版"
     plugin_desc = "基于六个橙子「憨憨保种区管家」(HHClubButler) 架构复刻，致谢原作者 SixOrg。\n复活区全景 / 免费到期处置 / 复活推送 / 换种优选 / 做种到期提醒"
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/rainbowrevivebutler.png"
-    plugin_version = "1.5.0"
+    plugin_version = "1.5.1"
     plugin_label = "资源站点"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -136,7 +136,7 @@ class RainbowReviveButler(_PluginBase):
         if self._mode not in ("incremental", "wash"):
             self._mode = "incremental"
 
-        self._dispose_lock = threading.Lock()
+        self._dispose_lock = threading.RLock()
         self._start_guard_thread()
 
         if self._onlyonce:
@@ -573,8 +573,9 @@ class RainbowReviveButler(_PluginBase):
         """
         if not self._dispose_lock.acquire(blocking=False):
             # 另一轮处置进行中：跳过本轮，防 dedupe/日志并发丢写与双通知
+            # skipped 标记让巡检方区分「跳过」与「真空」，不覆盖看板快照
             return {"seeds": [], "pages": 0, "deleted": [], "hr_skipped": [],
-                    "warned": [], "early_deleted": [], "delete_failed": []}
+                    "warned": [], "early_deleted": [], "delete_failed": [], "skipped": True}
         try:
             return self._dispose_pass_locked(notify=notify, quick=quick)
         finally:
@@ -720,13 +721,14 @@ class RainbowReviveButler(_PluginBase):
             return False
 
     def _append_disposal(self, entry: dict):
-        """记录处置日志（上限 200 条）。"""
+        """记录处置日志（上限 200 条）。持锁读改写，防守护线程/巡检并发丢条目。"""
         try:
-            log = self.get_data("disposal_log") or []
-            if not isinstance(log, list):
-                log = []
-            log.append(entry)
-            self.save_data("disposal_log", log[-200:])
+            with self._dispose_lock:
+                log = self.get_data("disposal_log") or []
+                if not isinstance(log, list):
+                    log = []
+                log.append(entry)
+                self.save_data("disposal_log", log[-200:])
         except Exception as e:
             logger.warning(f"彩虹岛复活区管家：写处置日志失败：{e}")
 
@@ -754,7 +756,7 @@ class RainbowReviveButler(_PluginBase):
                         text="下载器拒绝或任务锁定，任务仍在计费下载：\n" + "\n".join(lines))
                 except Exception:
                     pass
-            if warned and not (deleted or early_deleted):
+            if warned:
                 lines = [f"  {s['title'][:50]}（进度 {s.get('progress_pct', '?')}%，剩 {s.get('remain_min', '?')} 分钟）"
                          for s in warned[:10]]
                 self.post_message(
@@ -789,6 +791,10 @@ class RainbowReviveButler(_PluginBase):
         """巡检主逻辑：到期处置 + 全景 + 复活 + 做种到期提醒 + 自动下载。"""
         t0 = time.time()
         stats = self._dispose_pass(notify=self._notify)
+        if stats.get("skipped"):
+            self._last_result = f"{datetime.now().strftime('%m-%d %H:%M')} 上一轮处置进行中，本轮跳过"
+            logger.info(f"彩虹岛复活区管家：{self._last_result}")
+            return
         seeds = stats["seeds"]
         base = self._get_site_url()
         session = self._session(self._get_site_cookie())
@@ -812,27 +818,29 @@ class RainbowReviveButler(_PluginBase):
         now = time.time()
         warn_sec = self._warn_hours * 3600
 
-        dedupe = self.get_data("notify_dedupe") or {}
-        # 做种到期提醒（只提醒不动作）
-        seeding_expiring = []
-        for s in seeds:
-            if s["tid"] in my_ids and s.get("free_until"):
-                remain = s["free_until"] - now
-                if 0 < remain <= warn_sec:
-                    key = f"seedexp:{s['tid']}:{int(s['free_until'])}"
-                    if key not in dedupe:
-                        dedupe[key] = now
-                        seeding_expiring.append({**s, "remain_min": round(remain / 60)})
-        # 复活：免费 + 做种人数低
-        deal_seeds = []
-        if self._low_seeder_max > 0:
+        with self._dispose_lock:
+            # 去重表读改写持锁（与守护线程到期处置共用锁，防并发丢键导致重复推送）
+            dedupe = self.get_data("notify_dedupe") or {}
+            # 做种到期提醒（只提醒不动作）
+            seeding_expiring = []
             for s in seeds:
-                if s["is_free"] and s["seeders"] <= self._low_seeder_max and s.get("free_until") and s["free_until"] > now:
-                    key = f"deal:{s['tid']}:{int(s['free_until'])}"
-                    if key not in dedupe:
-                        dedupe[key] = now  # 写入去重，同一免费窗口只推一次（否则每轮巡检重复推送）
-                        deal_seeds.append(s)
-        self.save_data("notify_dedupe", dedupe)
+                if s["tid"] in my_ids and s.get("free_until"):
+                    remain = s["free_until"] - now
+                    if 0 < remain <= warn_sec:
+                        key = f"seedexp:{s['tid']}:{int(s['free_until'])}"
+                        if key not in dedupe:
+                            dedupe[key] = now
+                            seeding_expiring.append({**s, "remain_min": round(remain / 60)})
+            # 复活：免费 + 做种人数低
+            deal_seeds = []
+            if self._low_seeder_max > 0:
+                for s in seeds:
+                    if s["is_free"] and s["seeders"] <= self._low_seeder_max and s.get("free_until") and s["free_until"] > now:
+                        key = f"deal:{s['tid']}:{int(s['free_until'])}"
+                        if key not in dedupe:
+                            dedupe[key] = now  # 写入去重，同一免费窗口只推一次（否则每轮巡检重复推送）
+                            deal_seeds.append(s)
+            self.save_data("notify_dedupe", dedupe)
 
         # 自动下载复活（默认关）：HH 同款优选（增量/换种循环淘汰）
         downloaded: List[dict] = []
@@ -947,17 +955,18 @@ class RainbowReviveButler(_PluginBase):
                     seed = by_norm.get(norm)
                     if not seed:
                         continue
+                    # 目录范围对在途/已完成统一生效（防在途占预算、下完又不计入的口径漂移）
+                    if want_dir:
+                        tpath = str(self._tf(t, "save_path", "downloadDir", "download_dir", default="") or "")
+                        if not tpath:
+                            continue  # 配置了目录但任务目录读不到 → 不纳入（不删不动、不计体积）
+                        if not (tpath.rstrip("/") + "/").startswith(want_dir + "/"):
+                            continue  # 不在复活区设置的目录 → 不纳入
                     progress = float(self._tf(t, "progress", "percentDone", default=0) or 0)
                     if progress < 1.0:
                         # 在途（下载中）计入已承诺体积（HH 同款：体积基准含在途）
                         in_flight_gb += seed["size_gb"]
                         continue
-                    if want_dir:
-                        tpath = str(self._tf(t, "save_path", "downloadDir", "download_dir", default="") or "")
-                        if not tpath:
-                            continue  # 配置了目录但任务目录读不到 → 不纳入（不删不动）
-                        if not (tpath.rstrip("/") + "/").startswith(want_dir + "/"):
-                            continue  # 不在复活区设置的目录 → 不纳入
                     thash = self._thash(t)
                     current.append({
                         "title": seed["title"], "norm": seed["norm"], "size": seed["size_gb"],
@@ -992,9 +1001,15 @@ class RainbowReviveButler(_PluginBase):
             else:
                 eff_target = None  # 0=不限
 
-            # 3) 候选池：排除已在下载器、已在做种（HH 同款过滤）
-            cands = [dict(s, size=s["size_gb"]) for s in pool
-                     if s["norm"] not in existing and s["tid"] not in my_ids]
+            # 3) 候选池：排除已在下载器、已在做种；按 norm 去重防同名资源重复下载
+            cands: List[dict] = []
+            cand_norms: set = set()
+            for s in pool:
+                if (not s["norm"] or s["norm"] in existing
+                        or s["norm"] in cand_norms or s["tid"] in my_ids):
+                    continue
+                cand_norms.add(s["norm"])
+                cands.append(dict(s, size=s["size_gb"]))
             if self._mode == "wash" and current:
                 res = self._optimize_wash(cands, current, in_flight_gb)
             else:
@@ -1034,6 +1049,7 @@ class RainbowReviveButler(_PluginBase):
                         logger.warning(f"彩虹岛复活区管家：自动下载被下载器拒绝 {s['title'][:40]}（返回 {result}）")
                         continue
                     out.append(s)
+                    existing.add(s["norm"])  # 推送成功即入清单，防同 norm 后续候选重复推送
                     logger.info(f"彩虹岛复活区管家：自动下载 {s['title'][:50]}（{s['size_gb']:.1f}GB → {self._push_downloader}）")
                 except Exception as e:
                     logger.error(f"彩虹岛复活区管家：自动下载失败 {s['title'][:40]}：{e}")
@@ -1046,7 +1062,7 @@ class RainbowReviveButler(_PluginBase):
     # ------------------------------------------------------------------ #
     @staticmethod
     def _tier_sort_key(s: dict):
-        """档位高（摊薄重）优先、同档位小体积优先（HH 同款）。"""
+        """候选排序（HH 同款）：档位高（摊薄重）优先、同档位大体积优先（-size 降序）。"""
         return (tier_of(s.get("seeders", 1)), -s.get("size", 0.0))
 
     def _optimize_incremental(self, seeds: List[dict], eff_target: Optional[float]) -> dict:
@@ -1520,9 +1536,9 @@ class RainbowReviveButler(_PluginBase):
         cur_gb = getattr(self, "_last_current_gb", None)
         infl_gb = getattr(self, "_last_in_flight_gb", 0.0) or 0.0
         if cur_gb is not None:
-            target_hint = f"含已做种 {cur_gb:.1f} GB + 在途 {infl_gb:.1f} GB，0=不限"
+            target_hint = f"含复活区已做种 {cur_gb:.1f} GB + 在途 {infl_gb:.1f} GB，0=不限"
         else:
-            target_hint = "含已做种 + 在途总体积，0=不限（巡检运行后显示实时数值）"
+            target_hint = "含复活区已做种 + 在途总体积，0=不限（巡检运行后显示实时数值）"
         form = [{
             "component": "VForm",
             "content": [
@@ -1863,25 +1879,28 @@ class RainbowReviveButler(_PluginBase):
     def api_stats_page(self):
         """做种积分统计独立页（完整移植原作者「结算统计表」模板：渐变底/ECharts柱状图/双仪表/网格表/月表）。"""
         hist = self.get_data("credit_history") or []
-        # 按自然日聚合采样（日表只看近 40 天，避免 %m-%d 跨年撞键）
+        tz_sh = pytz.timezone("Asia/Shanghai")
+        # 按自然日聚合采样（日表只看近 40 天；聚合键用完整日期保证 12月/1月 跨年排序正确，展示仍用月-日）
         now_ts = time.time()
         daily_hist = [h for h in hist if isinstance(h, dict) and h.get("ts", 0) > now_ts - 40 * 86400]
         days: Dict[str, dict] = {}
         for h in daily_hist:
             if not h.get("credit"):
                 continue
-            day = datetime.fromtimestamp(h["ts"], pytz.timezone("Asia/Shanghai")).strftime("%m-%d")
-            d = days.setdefault(day, {"first": h["credit"], "last": h["credit"], "n": 0})
+            dt = datetime.fromtimestamp(h["ts"], tz_sh)
+            key = dt.strftime("%Y-%m-%d")
+            d = days.setdefault(key, {"label": dt.strftime("%m-%d"),
+                                      "first": h["credit"], "last": h["credit"], "n": 0})
             d["last"] = h["credit"]
             d["n"] += 1
-        ordered = sorted(days.items())
+        ordered = sorted(days.items())  # 完整日期键 → 跨年顺序正确
         cum = 0.0
         records = []
-        for day, d in ordered:
+        for key, d in ordered:
             prev_last = records[-1]["last"] if records else None
             delta = (d["last"] - prev_last) if prev_last is not None else None
             cum += delta or 0
-            records.append({"date": day, "first": d["first"], "last": d["last"],
+            records.append({"date": d["label"], "first": d["first"], "last": d["last"],
                             "delta": delta, "n": d["n"], "cum": round(cum, 1)})
         cur = records[-1]["last"] if records else 0
         cum30 = round(sum((r["delta"] or 0) for r in records[-30:]), 1)
