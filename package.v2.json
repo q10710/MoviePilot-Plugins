@@ -309,14 +309,15 @@
     "name": "彩虹岛复活区管家Q自用版",
     "description": "基于六个橙子「憨憨保种区管家」(HHClubButler) 架构复刻，致谢原作者 SixOrg。\n复活区全景 / 免费到期处置 / 捡漏推送 / 做种到期提醒",
     "labels": "保种区管理",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "icon": "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/rainbowrevivebutler.png",
     "author": "Q",
     "author_url": "https://github.com/q10710",
     "level": 1,
     "category": "管理",
     "history": {
-      "v1.0.0": "首个版本：复活区全景/免费到期即删（HR闸+5分钟缓冲+前置预警+预计完不成提前删）/捡漏推送/做种到期提醒。基于 HHClubButler (SixOrg) 架构复刻。"
+      "v1.0.0": "首个版本：复活区全景/免费到期即删（HR闸+5分钟缓冲+前置预警+预计完不成提前删）/捡漏推送/做种到期提醒。基于 HHClubButler (SixOrg) 架构复刻。",
+      "v1.1.0": "全面对齐 HHClubButler 体验：工作台移植 15 套主题/列显隐配置(localStorage)/列排序/列宽拖拽/搜索/筛选/批量删除/CSV导出；详情页升级为统计卡+做种档位色条+QB 风格在保列表(可单删)；仪表盘加档位分布条；频率拆分：到期处置由守护线程高频执行(默认5分钟，到期即删)，巡检 cron 默认 2 小时(全景/捡漏/自动下载)；新增设置：处置间隔/捡漏自动下载(默认关)/推送下载器/保存路径/标签/体积上限；新增 /export /delete_seed API。"
     }
   }
 }
