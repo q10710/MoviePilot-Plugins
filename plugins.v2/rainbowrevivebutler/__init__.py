@@ -20,12 +20,24 @@ from app.log import logger
 from app.plugins import _PluginBase
 
 
+def tier_of(seeders: Optional[int]) -> int:
+    """档位（HH 同款）：0-1人=0（高价值）· 2-3人=1 · 4-5人=2 · 6+人=99（摊薄）。"""
+    n = seeders or 1
+    if n <= 1:
+        return 0
+    if n <= 3:
+        return 1
+    if n <= 5:
+        return 2
+    return 99
+
+
 class RainbowReviveButler(_PluginBase):
     """
     彩虹岛复活区管家 Q自用版
 
     基于六个橙子「憨憨保种区管家」(HHClubButler) 架构复刻，致谢原作者 SixOrg。
-    彩虹岛（CHDBits）复活区玩法适配：复活区全景 / 免费到期处置 / 捡漏推送 / 做种到期提醒。
+    彩虹岛（CHDBits）复活区玩法适配：复活区全景 / 免费到期处置 / 复活推送 / 做种到期提醒。
 
     彩虹岛复活区机制（2026-10 实测）：
     - 发布超 14 天、做种人数低于 10 的种子，会员花 3W 做种积分可列入复活区；
@@ -38,13 +50,13 @@ class RainbowReviveButler(_PluginBase):
     到期前 warn_hours 小时预警；预计完不成（按当前速率 ETA 超过剩余免费时长）提前删。
 
     频率拆分：到期处置由后台守护线程高频执行（默认 5 分钟一次，到期即删）；
-    全景/捡漏推送/自动下载由 Cron 巡检（默认 2 小时一次）驱动。
+    全景/复活推送/自动下载由 Cron 巡检（默认 2 小时一次）驱动。
     """
 
     plugin_name = "彩虹岛复活区管家Q自用版"
-    plugin_desc = "基于六个橙子「憨憨保种区管家」(HHClubButler) 架构复刻，致谢原作者 SixOrg。\n复活区全景 / 免费到期处置 / 捡漏推送 / 做种到期提醒"
+    plugin_desc = "基于六个橙子「憨憨保种区管家」(HHClubButler) 架构复刻，致谢原作者 SixOrg。\n复活区全景 / 免费到期处置 / 复活推送 / 换种优选 / 做种到期提醒"
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/rainbowrevivebutler.png"
-    plugin_version = "1.4.0"
+    plugin_version = "1.5.0"
     plugin_label = "资源站点"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -63,12 +75,13 @@ class RainbowReviveButler(_PluginBase):
     _early_delete: bool = True
     _low_seeder_max: int = 3
     _dispose_minutes: float = 5.0
-    # 捡漏自动下载
+    # 复活自动下载
     _auto_download: bool = False
     _push_downloader: str = ""
     _save_path: str = ""
     _tag: str = ""
     _target_volume: float = 0.0
+    _mode: str = "incremental"
 
     _running: bool = False
     _scheduler: Optional[BackgroundScheduler] = None
@@ -119,7 +132,11 @@ class RainbowReviveButler(_PluginBase):
             self._target_volume = max(0.0, float(config.get("target_volume", 0) or 0))
         except (TypeError, ValueError):
             self._target_volume = 0.0
+        self._mode = config.get("mode") or "incremental"
+        if self._mode not in ("incremental", "wash"):
+            self._mode = "incremental"
 
+        self._dispose_lock = threading.Lock()
         self._start_guard_thread()
 
         if self._onlyonce:
@@ -135,6 +152,7 @@ class RainbowReviveButler(_PluginBase):
                 "low_seeder_max": self._low_seeder_max, "dispose_minutes": self._dispose_minutes,
                 "auto_download": self._auto_download, "push_downloader": self._push_downloader,
                 "save_path": self._save_path, "tag": self._tag, "target_volume": self._target_volume,
+                "mode": self._mode,
             })
             self.update_config(_cfg)
             try:
@@ -151,9 +169,9 @@ class RainbowReviveButler(_PluginBase):
             f"彩虹岛复活区管家配置生效：启用={self._enabled} 通知={self._notify} "
             f"巡检={self._cron} 处置守护={self._dispose_minutes:g}min 站点={self._site_name} "
             f"下载器={self._downloaders} 预警={self._warn_hours:g}h 删文件={self._delete_files} "
-            f"提前删={self._early_delete} 捡漏阈值={self._low_seeder_max}人 "
+            f"提前删={self._early_delete} 复活阈值={self._low_seeder_max}人 "
             f"自动下载={self._auto_download}(→{self._push_downloader or '-'}, "
-            f"上限={self._target_volume:g}GB)")
+            f"体积上限={self._target_volume:g}GB 模式={self._mode}")
 
     def get_state(self) -> bool:
         """返回插件启用状态。"""
@@ -186,7 +204,7 @@ class RainbowReviveButler(_PluginBase):
             self._guard_thread = None
 
     def get_service(self) -> List[Dict[str, Any]]:
-        """注册全景/捡漏/自动下载巡检（到期处置由守护线程负责）。"""
+        """注册全景/复活/自动下载巡检（到期处置由守护线程负责）。"""
         if not self.get_state():
             return []
         try:
@@ -347,13 +365,21 @@ class RainbowReviveButler(_PluginBase):
 
     def _fetch_my_seeding_ids(self, session: requests.Session, base: str) -> set:
         """spstate=1 视图 = 我在做种的复活区种子。"""
+        ids: set = set()
         try:
-            r = session.get(base + "/renewtorrents.php?spstate=1", timeout=30)
-            # (?<!user) 排除 userdetails.php?id= 用户链接（其尾部与 details.php?id= 同形，会误抓页头/上传者 ID）
-            return set(re.findall(r"(?<!user)details\.php\?id=(\d+)", r.text))
+            for page in range(5):
+                url = base + "/renewtorrents.php?spstate=1" + (f"&page={page}" if page else "")
+                r = session.get(url, timeout=30)
+                # (?<!user) 排除 userdetails.php?id= 用户链接（其尾部与 details.php?id= 同形，会误抓页头/上传者 ID）
+                found = set(re.findall(r"(?<!user)details\.php\?id=(\d+)", r.text))
+                new = found - ids
+                if not new:
+                    break
+                ids |= new
+            return ids
         except Exception as e:
             logger.warning(f"彩虹岛复活区管家：拉取我的做种视图失败：{e}")
-            return set()
+            return ids
 
     def _get_site_uid(self, session: requests.Session, base: str) -> Optional[str]:
         """从首页解析当前登录用户 UID（做种组合接口需要）。"""
@@ -523,7 +549,10 @@ class RainbowReviveButler(_PluginBase):
         for dl_name, sv in services.items():
             try:
                 torrents, error = sv.instance.get_torrents()
-                if error or not torrents:
+                if error:
+                    # 查询失败保守认为有任务（走完整流程），防下载器瞬断时到期处置静默失效
+                    return True
+                if not torrents:
                     continue
                 for t in torrents:
                     progress = float(self._tf(t, "progress", "percentDone", default=0) or 0)
@@ -542,13 +571,23 @@ class RainbowReviveButler(_PluginBase):
         quick=False（cron 巡检）：始终全量抓取（看板需要数据）。
         返回统计 dict。异常向上抛由调用方处理。
         """
+        if not self._dispose_lock.acquire(blocking=False):
+            # 另一轮处置进行中：跳过本轮，防 dedupe/日志并发丢写与双通知
+            return {"seeds": [], "pages": 0, "deleted": [], "hr_skipped": [],
+                    "warned": [], "early_deleted": [], "delete_failed": []}
+        try:
+            return self._dispose_pass_locked(notify=notify, quick=quick)
+        finally:
+            self._dispose_lock.release()
+
+    def _dispose_pass_locked(self, notify: bool = True, quick: bool = False) -> dict:
         base = self._get_site_url()
         cookie = self._get_site_cookie()
         if not base or not cookie:
             raise Exception("未找到彩虹岛站点配置或 Cookie（请在站点管理中配置）")
         if quick and not self._has_incomplete_tasks():
             return {"seeds": [], "pages": 0, "deleted": [], "hr_skipped": [],
-                    "warned": [], "early_deleted": []}
+                    "warned": [], "early_deleted": [], "delete_failed": []}
         session = self._session(cookie)
         seeds, pages = self._fetch_revive_list(session, base)
         if not seeds:
@@ -567,6 +606,7 @@ class RainbowReviveButler(_PluginBase):
         hr_skipped: List[dict] = []
         warned: List[dict] = []
         early_deleted: List[dict] = []
+        delete_failed: List[dict] = []
 
         services = self._get_manage_services()
         for dl_name, sv in services.items():
@@ -606,7 +646,13 @@ class RainbowReviveButler(_PluginBase):
                                  "size_gb": seed["size_gb"], "progress": round(progress * 100, 1),
                                  "downloader": dl_name, "action": "expired_delete", "ok": ok}
                         self._append_disposal(entry)
-                        (deleted if ok else warned).append(seed)
+                        if ok:
+                            deleted.append(seed)
+                        else:
+                            fkey = f"delfail:{seed['tid']}:{int(free_until)}"
+                            if fkey not in dedupe:
+                                dedupe[fkey] = now
+                                delete_failed.append(seed)
                         logger.info(f"彩虹岛复活区管家：到期删除 {seed['title'][:50]}（{dl_name}，进度 {progress*100:.0f}%）成功={ok}")
                         continue
                     if 0 < remain_sec <= warn_sec:
@@ -628,7 +674,13 @@ class RainbowReviveButler(_PluginBase):
                                              "size_gb": seed["size_gb"], "progress": round(progress * 100, 1),
                                              "downloader": dl_name, "action": "early_delete", "ok": ok}
                                     self._append_disposal(entry)
-                                    (early_deleted if ok else warned).append(seed)
+                                    if ok:
+                                        early_deleted.append(seed)
+                                    else:
+                                        fkey = f"delfail:{seed['tid']}:{int(free_until)}"
+                                        if fkey not in dedupe:
+                                            dedupe[fkey] = now
+                                            delete_failed.append(seed)
                                     logger.info(f"彩虹岛复活区管家：预计完不成提前删 {seed['title'][:50]}（ETA {eta/60:.0f}min > 剩余 {remain_sec/60:.0f}min）成功={ok}")
                 except Exception as e:
                     logger.warning(f"彩虹岛复活区管家：处理任务出错：{e}")
@@ -636,9 +688,9 @@ class RainbowReviveButler(_PluginBase):
 
         self.save_data("notify_dedupe", dedupe)
         stats = {"seeds": seeds, "pages": pages, "deleted": deleted, "hr_skipped": hr_skipped,
-                 "warned": warned, "early_deleted": early_deleted}
+                 "warned": warned, "early_deleted": early_deleted, "delete_failed": delete_failed}
         if notify and self._notify:
-            self._notify_disposal(deleted, hr_skipped, warned, early_deleted)
+            self._notify_disposal(deleted, hr_skipped, warned, early_deleted, delete_failed)
         return stats
 
     def _recheck_incomplete(self, sv, thash: str) -> bool:
@@ -678,7 +730,7 @@ class RainbowReviveButler(_PluginBase):
         except Exception as e:
             logger.warning(f"彩虹岛复活区管家：写处置日志失败：{e}")
 
-    def _notify_disposal(self, deleted, hr_skipped, warned, early_deleted):
+    def _notify_disposal(self, deleted, hr_skipped, warned, early_deleted, delete_failed=None):
         """到期处置相关通知（逐类一条，不刷屏）。"""
         try:
             if deleted or early_deleted:
@@ -694,6 +746,14 @@ class RainbowReviveButler(_PluginBase):
                 self.post_message(
                     title=f"【彩虹岛复活区管家】{len(hr_skipped)} 个 HR 种到期未删，转人工",
                     text="HR 种不自动删除，请手动决定：\n" + "\n".join(lines))
+            if delete_failed:
+                try:
+                    lines = [f"  {s['title'][:60]}（{s['size_gb']:.1f}GB）" for s in delete_failed[:10]]
+                    self.post_message(
+                        title=f"【彩虹岛复活区管家】{len(delete_failed)} 个到期删除失败，请人工处理",
+                        text="下载器拒绝或任务锁定，任务仍在计费下载：\n" + "\n".join(lines))
+                except Exception:
+                    pass
             if warned and not (deleted or early_deleted):
                 lines = [f"  {s['title'][:50]}（进度 {s.get('progress_pct', '?')}%，剩 {s.get('remain_min', '?')} 分钟）"
                          for s in warned[:10]]
@@ -704,7 +764,7 @@ class RainbowReviveButler(_PluginBase):
             logger.error(f"彩虹岛复活区管家：发送通知失败：{e}")
 
     # ------------------------------------------------------------------ #
-    # 巡检：全景 + 捡漏推送 + 做种到期提醒 + 自动下载
+    # 巡检：全景 + 复活推送 + 做种到期提醒 + 自动下载
     # ------------------------------------------------------------------ #
     def run(self):
         """巡检入口（Cron 驱动）。"""
@@ -726,7 +786,7 @@ class RainbowReviveButler(_PluginBase):
             self._running = False
 
     def _do_run(self):
-        """巡检主逻辑：到期处置 + 全景 + 捡漏 + 做种到期提醒 + 自动下载。"""
+        """巡检主逻辑：到期处置 + 全景 + 复活 + 做种到期提醒 + 自动下载。"""
         t0 = time.time()
         stats = self._dispose_pass(notify=self._notify)
         seeds = stats["seeds"]
@@ -763,7 +823,7 @@ class RainbowReviveButler(_PluginBase):
                     if key not in dedupe:
                         dedupe[key] = now
                         seeding_expiring.append({**s, "remain_min": round(remain / 60)})
-        # 捡漏：免费 + 做种人数低
+        # 复活：免费 + 做种人数低
         deal_seeds = []
         if self._low_seeder_max > 0:
             for s in seeds:
@@ -774,10 +834,16 @@ class RainbowReviveButler(_PluginBase):
                         deal_seeds.append(s)
         self.save_data("notify_dedupe", dedupe)
 
-        # 自动下载捡漏（默认关）
-        downloaded = []
-        if self._auto_download and deal_seeds:
-            downloaded = self._auto_download_deals(deal_seeds, my_ids, now)
+        # 自动下载复活（默认关）：HH 同款优选（增量/换种循环淘汰）
+        downloaded: List[dict] = []
+        evicted: List[dict] = []
+        if self._auto_download and self._low_seeder_max > 0:
+            # 候选池 = 免费且在窗口内、做种≤阈值的全部复活种子（预算跨轮复算，HH 同款每轮重选）
+            pool = [s for s in seeds
+                    if s["is_free"] and s.get("free_until") and s["free_until"] > now
+                    and s["seeders"] <= self._low_seeder_max]
+            if pool:
+                downloaded, evicted = self._auto_download_deals(seeds, pool, my_ids, now)
 
         if self._notify:
             if seeding_expiring:
@@ -795,7 +861,7 @@ class RainbowReviveButler(_PluginBase):
                     if more > 0:
                         lines.append(f"  …等共 {len(deal_seeds)} 个")
                     self.post_message(
-                        title=f"【彩虹岛复活区管家】捡漏：{len(deal_seeds)} 个低做种免费种子",
+                        title=f"【彩虹岛复活区管家】复活：{len(deal_seeds)} 个低做种免费种子",
                         text="免费中且做种人数 ≤ {}，ratio 黄金窗口：\n{}".format(self._low_seeder_max, "\n".join(lines)))
                 except Exception:
                     pass
@@ -803,8 +869,19 @@ class RainbowReviveButler(_PluginBase):
                 try:
                     lines = [f"  {t['title'][:60]}（{t['size_gb']:.1f}GB）" for t in downloaded[:10]]
                     self.post_message(
-                        title=f"【彩虹岛复活区管家】自动下载 {len(downloaded)} 个捡漏种子",
+                        title=f"【彩虹岛复活区管家】自动下载 {len(downloaded)} 个复活种子",
                         text=f"已推送到 {self._push_downloader}：\n" + "\n".join(lines))
+                except Exception:
+                    pass
+            if evicted:
+                try:
+                    lines = [f"  {v['title'][:60]}（{v.get('size', 0.0):.1f}GB，做种 {v.get('seeders', '?')} 人）" for v in evicted[:10]]
+                    more = len(evicted) - 10
+                    if more > 0:
+                        lines.append(f"  …等共 {len(evicted)} 个")
+                    self.post_message(
+                        title=f"【彩虹岛复活区管家】换种淘汰 {len(evicted)} 个低档位种子",
+                        text=f"为腾出目标体积已删除任务{'（含文件）' if self._delete_files else ''}：\n" + "\n".join(lines))
                 except Exception:
                     pass
 
@@ -821,38 +898,134 @@ class RainbowReviveButler(_PluginBase):
         self._last_result = (
             f"{datetime.now().strftime('%m-%d %H:%M')} 巡检：复活区 {len(seeds)} 种（免费中 {free_active}），"
             f"我的做种 {len(my_ids)}，到期删 {len(stats['deleted'])}，提前删 {len(stats['early_deleted'])}，"
-            f"预警 {len(stats['warned'])}，自动下载 {len(downloaded)}，耗时 {time.time()-t0:.1f}s")
+            f"预警 {len(stats['warned'])}，自动下载 {len(downloaded)}，淘汰 {len(evicted)}，耗时 {time.time()-t0:.1f}s")
         logger.info(f"彩虹岛复活区管家：{self._last_result}")
 
-    def _auto_download_deals(self, deal_seeds: List[dict], my_ids: set, now: float) -> List[dict]:
-        """把捡漏种子自动推送到下载器（尊重目标体积上限，去重）。"""
+    def _auto_download_deals(self, seeds: List[dict], pool: List[dict], my_ids: set, now: float) -> Tuple[List[dict], List[dict]]:
+        """HH 同款优选：总保种上限内选种推送；换种（wash）放不下时踢低档位腾位。
+
+        范围限制（用户口径「只删复活区设置的目录种子」）：淘汰对象仅限受管/推送下载器内
+        与复活区列表标题匹配、且配置了保存路径时必须位于该目录下的已完成任务；
+        HR 种跳过不删；删除走 _delete_task（删后复核）。
+        """
         out: List[dict] = []
+        evicted: List[dict] = []
         try:
-            sv = self._get_push_service()
-            if not sv:
+            sv_push = self._get_push_service()
+            if not sv_push:
                 logger.warning("彩虹岛复活区管家：自动下载未配置有效推送下载器，跳过")
-                return out
-            existing = set()
-            try:
-                ts, err = sv.instance.get_torrents()
-                if not err and ts:
-                    for t in ts:
-                        existing.add(self._norm_title(self._tf(t, "name", default="")))
-            except Exception:
-                pass
+                return out, evicted
+            scan = self._get_manage_services()
+            if self._push_downloader and self._push_downloader not in scan:
+                scan[self._push_downloader] = sv_push
+            if not scan:
+                logger.warning("彩虹岛复活区管家：无可用下载器服务，跳过优选")
+                return out, evicted
+
+            by_norm: Dict[str, dict] = {}
+            for s in seeds:
+                by_norm.setdefault(s["norm"], s)
+
+            # 1) 扫描下载器：已有任务（去重）/ 当前在保（复活区已完成）/ 在途（未完成）
+            existing: set = set()
+            current: List[dict] = []
+            in_flight_gb = 0.0
+            want_dir = (self._save_path or "").rstrip("/")
+            for dl_name, sv in scan.items():
+                try:
+                    torrents, error = sv.instance.get_torrents()
+                except Exception as e:
+                    logger.warning(f"彩虹岛复活区管家：优选读取下载器 {dl_name} 失败：{e}")
+                    continue
+                if error or not torrents:
+                    continue
+                for t in torrents:
+                    norm = self._norm_title(self._tf(t, "name", default=""))
+                    if not norm:
+                        continue
+                    existing.add(norm)
+                    seed = by_norm.get(norm)
+                    if not seed:
+                        continue
+                    progress = float(self._tf(t, "progress", "percentDone", default=0) or 0)
+                    if progress < 1.0:
+                        # 在途（下载中）计入已承诺体积（HH 同款：体积基准含在途）
+                        in_flight_gb += seed["size_gb"]
+                        continue
+                    if want_dir:
+                        tpath = str(self._tf(t, "save_path", "downloadDir", "download_dir", default="") or "")
+                        if not tpath:
+                            continue  # 配置了目录但任务目录读不到 → 不纳入（不删不动）
+                        if not (tpath.rstrip("/") + "/").startswith(want_dir + "/"):
+                            continue  # 不在复活区设置的目录 → 不纳入
+                    thash = self._thash(t)
+                    current.append({
+                        "title": seed["title"], "norm": seed["norm"], "size": seed["size_gb"],
+                        "seeders": seed.get("seeders", 1), "hr": seed.get("hr"),
+                        "tid": seed["tid"], "downloader": dl_name, "hash": thash,
+                        "evictable": bool(thash),
+                    })
+            # 站点侧我在做种但不在受管下载器里的（手动/其它客户端）：计入体积，不可淘汰
+            cur_norms = {c["norm"] for c in current}
+            for s in seeds:
+                if s["tid"] in my_ids and s["norm"] not in cur_norms:
+                    current.append({"title": s["title"], "norm": s["norm"], "size": s["size_gb"],
+                                    "seeders": s.get("seeders", 1), "hr": s.get("hr"),
+                                    "tid": s["tid"], "downloader": "", "hash": "",
+                                    "evictable": False})
+                    cur_norms.add(s["norm"])
+
+            current_gb = sum(c["size"] for c in current)
+            self._last_current_gb = current_gb
+            self._last_in_flight_gb = in_flight_gb
+
+            # 2) 目标体积与剩余额度（HH 同款；0=不限）
+            target = self._target_volume
+            committed_gb = current_gb + in_flight_gb
+            if target and target > 0:
+                if committed_gb >= target - 1e-6 and self._mode != "wash":
+                    logger.info(f"彩虹岛复活区管家：当前保种+在途已达标（{committed_gb:.1f} GB ≥ 目标 {target:g} GB），本次不推不删")
+                    return out, evicted
+                eff_target: Optional[float] = max(0.0, target - committed_gb)
+                logger.info(f"彩虹岛复活区管家：目标体积（总保种上限）{target:g} GB，当前 {current_gb:.1f}，"
+                            f"在途 {in_flight_gb:.1f}，剩余可增 {eff_target:.1f} GB")
+            else:
+                eff_target = None  # 0=不限
+
+            # 3) 候选池：排除已在下载器、已在做种（HH 同款过滤）
+            cands = [dict(s, size=s["size_gb"]) for s in pool
+                     if s["norm"] not in existing and s["tid"] not in my_ids]
+            if self._mode == "wash" and current:
+                res = self._optimize_wash(cands, current, in_flight_gb)
+            else:
+                res = self._optimize_incremental(cands, eff_target)
+
+            # 4) 换种淘汰（HH 同款：先算后删；HR 闸 + 目录范围 + 删后复核）
+            for v in res.get("del_seeds", []):
+                if not v.get("evictable") or not v.get("hash"):
+                    continue
+                sv = scan.get(v.get("downloader") or "")
+                if not sv:
+                    continue
+                ok = self._delete_task(sv, str(v["hash"]), str(v.get("downloader") or ""))
+                self._append_disposal({"time": int(now), "tid": v.get("tid"), "title": v.get("title"),
+                                       "size_gb": v.get("size", 0.0), "progress": 100.0,
+                                       "downloader": v.get("downloader"), "action": "wash_evict", "ok": ok})
+                if ok:
+                    evicted.append(v)
+                logger.info(f"彩虹岛复活区管家：换种淘汰 {str(v.get('title', ''))[:50]}"
+                            f"（{v.get('downloader')}，做种 {v.get('seeders')} 人，{v.get('size', 0.0):.1f}GB）成功={ok}")
+
+            # 5) 推送选中的候选
             base = self._get_site_url()
             cookie = self._get_site_cookie()
-            total_gb = 0.0
-            for s in deal_seeds:
+            for s in res.get("picked", []):
                 if s["norm"] in existing or s["tid"] in my_ids:
                     continue
-                if self._target_volume > 0 and (total_gb + s["size_gb"]) > self._target_volume:
-                    logger.info(f"彩虹岛复活区管家：自动下载已达目标体积上限 {self._target_volume:g}GB，停止")
-                    break
                 url = f"{base}/download.php?id={s['tid']}"
                 try:
                     # add_torrent 返回 (成功标志, 任务标识列表)，失败时 (False, [])
-                    result = sv.instance.add_torrent(
+                    result = sv_push.instance.add_torrent(
                         content=url, cookie=cookie,
                         download_dir=(self._save_path or None),
                         tag=(self._tag or None))
@@ -861,13 +1034,97 @@ class RainbowReviveButler(_PluginBase):
                         logger.warning(f"彩虹岛复活区管家：自动下载被下载器拒绝 {s['title'][:40]}（返回 {result}）")
                         continue
                     out.append(s)
-                    total_gb += s["size_gb"]
                     logger.info(f"彩虹岛复活区管家：自动下载 {s['title'][:50]}（{s['size_gb']:.1f}GB → {self._push_downloader}）")
                 except Exception as e:
                     logger.error(f"彩虹岛复活区管家：自动下载失败 {s['title'][:40]}：{e}")
         except Exception as e:
             logger.error(f"彩虹岛复活区管家：自动下载流程异常：{e}")
-        return out
+        return out, evicted
+
+    # ------------------------------------------------------------------ #
+    # HH 同款优选：增量（不删保种）/ 换种（wash，删低档位补高档位）
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _tier_sort_key(s: dict):
+        """档位高（摊薄重）优先、同档位小体积优先（HH 同款）。"""
+        return (tier_of(s.get("seeders", 1)), -s.get("size", 0.0))
+
+    def _optimize_incremental(self, seeds: List[dict], eff_target: Optional[float]) -> dict:
+        """HH 同款增量优选：不删在保，按档位高→低在剩余额度内补齐；eff_target=None 表示 0=不限。"""
+        if eff_target is not None and eff_target <= 0:
+            logger.info("彩虹岛复活区管家：当前保种体积已达目标，无需新增")
+            return {"picked": [], "del_seeds": []}
+        candidates = sorted(seeds, key=RainbowReviveButler._tier_sort_key)
+        picked: List[dict] = []
+        used = 0.0
+        for s in candidates:
+            if eff_target is None or used + s["size"] <= eff_target + 1e-6:
+                picked.append(s)
+                used += s["size"]
+        cap_txt = "不限" if eff_target is None else f"{eff_target:.1f} GB"
+        logger.info(f"彩虹岛复活区管家：增量优选：剩余额度 {cap_txt}，按档位高→低补 {len(picked)} 个，新增 {used:.1f} GB")
+        return {"picked": picked, "del_seeds": []}
+
+    def _optimize_wash(self, candidates: List[dict], current: List[dict], in_flight_gb: float) -> dict:
+        """HH 同款换种优选：在目标体积（总保种上限，含在途）内，候选放不下时踢比候选
+        档位更低的在保种子腾位（低档优先、小体积优先、放不下回滚）；只踢可淘汰
+        （复活区目录内）且非 HR 的种子。不因单纯超线而删——仅在有候选需要位置时腾位。
+        """
+        cap = self._target_volume
+        if not cap or cap <= 0:
+            # 0=不限：不淘汰、新增不受限（按「0=不限」文案语义）
+            return {"picked": list(candidates), "del_seeds": []}
+        cur_norms = {c["norm"] for c in current}
+        final: List[dict] = list(current)
+        total_gb = sum(s.get("size", 0.0) for s in final) + in_flight_gb
+        new_cands = [s for s in candidates if s.get("norm") not in cur_norms]
+        new_cands.sort(key=RainbowReviveButler._tier_sort_key)
+        del_map: Dict[str, dict] = {}
+        for cand in new_cands:
+            csize = cand.get("size", 0.0)
+            if csize > cap:
+                continue
+            # 放得下直接加
+            if total_gb + csize <= cap + 1e-6:
+                final.append(cand)
+                total_gb += csize
+                continue
+            # 放不下：只踢比候选档位更低的种子（HR/不可淘汰跳过）
+            cand_tier = tier_of(cand.get("seeders", 1))
+            victims = [s for s in final
+                       if tier_of(s.get("seeders", 1)) > cand_tier
+                       and (s.get("norm") or s.get("title", "")) not in del_map
+                       and s.get("evictable") and not s.get("hr")]
+            victims.sort(key=lambda s: (-tier_of(s.get("seeders", 1)), s.get("size", 0.0)))
+            evicted_round: List[dict] = []
+            added = False
+            for victim in victims:
+                final.remove(victim)
+                evicted_round.append(victim)
+                total_gb -= victim.get("size", 0.0)
+                if total_gb + csize <= cap + 1e-6:
+                    final.append(cand)
+                    total_gb += csize
+                    for v in evicted_round:
+                        del_map[v.get("norm") or v.get("title", "")] = v
+                    added = True
+                    break
+            if not added:
+                # 回滚本次尝试踢掉的种子
+                for v in evicted_round:
+                    final.append(v)
+                    total_gb += v.get("size", 0.0)
+        del_seeds = list(del_map.values())
+        add_seeds = [s for s in final if s.get("norm") not in cur_norms]
+        keep_count = len(final) - len(add_seeds)
+        logger.info(f"彩虹岛复活区管家：换种优选（体积上限 {cap:g} GB，含在途 {in_flight_gb:.1f} GB）："
+                    f"构建 {len(final)} 个（保留当前 {keep_count} + 新增 {len(add_seeds)}），"
+                    f"删除低档位 {len(del_seeds)} 个，最终占用 {total_gb:.1f} GB")
+        for s in add_seeds[:8]:
+            logger.info(f"彩虹岛复活区管家：  + 换种新增 {s.get('title', '')[:50]} | {s.get('size', 0.0):.1f} GB | 当前做种 {s.get('seeders', '?')} 人")
+        for s in del_seeds[:8]:
+            logger.info(f"彩虹岛复活区管家：  - 换种淘汰 {s.get('title', '')[:50]} | {s.get('size', 0.0):.1f} GB | 当前做种 {s.get('seeders', '?')} 人")
+        return {"picked": add_seeds, "del_seeds": del_seeds, "keep_count": keep_count}
 
     # ------------------------------------------------------------------ #
     # 守护线程：高频到期处置
@@ -1120,7 +1377,7 @@ class RainbowReviveButler(_PluginBase):
         """插件 API。"""
         return [{
             "path": "/run", "endpoint": self.api_run, "methods": ["POST"],
-            "auth": "apikey", "summary": "立即巡检（含到期处置+捡漏+自动下载）",
+            "auth": "apikey", "summary": "立即巡检（含到期处置+复活+自动下载）",
         }, {
             "path": "/refresh", "endpoint": self.api_refresh, "methods": ["GET"],
             "auth": "apikey", "summary": "只刷概况（无处置动作）",
@@ -1259,6 +1516,13 @@ class RainbowReviveButler(_PluginBase):
                 downloaders.append({"title": config.name, "value": config.name})
         except Exception as e:
             logger.warning(f"彩虹岛复活区管家：获取下载器列表失败：{e}")
+        # 目标体积 hint 实时数值（HH 同款）：已做种/在途来自最近一次优选巡检
+        cur_gb = getattr(self, "_last_current_gb", None)
+        infl_gb = getattr(self, "_last_in_flight_gb", 0.0) or 0.0
+        if cur_gb is not None:
+            target_hint = f"含已做种 {cur_gb:.1f} GB + 在途 {infl_gb:.1f} GB，0=不限"
+        else:
+            target_hint = "含已做种 + 在途总体积，0=不限（巡检运行后显示实时数值）"
         form = [{
             "component": "VForm",
             "content": [
@@ -1276,7 +1540,7 @@ class RainbowReviveButler(_PluginBase):
                 {"component": "VRow", "content": [
                     {"component": "VCol", "props": {"cols": 12, "md": 4},
                      "content": [{"component": "VCronField", "props": {
-                         "model": "cron", "label": "执行周期（全景/捡漏/自动下载）",
+                         "model": "cron", "label": "执行周期（全景/复活/自动下载）",
                          "placeholder": "0 */2 * * *（每2小时）"}}]},
                     {"component": "VCol", "props": {"cols": 12, "md": 4},
                      "content": [{"component": "VTextField", "props": {
@@ -1293,8 +1557,8 @@ class RainbowReviveButler(_PluginBase):
                          "hint": "自动匹配站点管理中的彩虹岛（ptchdbits）", "persistent-hint": True}}]},
                     {"component": "VCol", "props": {"cols": 12, "md": 4},
                      "content": [{"component": "VTextField", "props": {
-                         "model": "low_seeder_max", "label": "捡漏做种阈值（人）", "type": "number",
-                         "hint": "免费且做种≤N 推送；0=关闭捡漏", "persistent-hint": True}}]},
+                         "model": "low_seeder_max", "label": "复活做种阈值（人）", "type": "number",
+                         "hint": "免费且做种≤N 推送；0=关闭复活", "persistent-hint": True}}]},
                     {"component": "VCol", "props": {"cols": 12, "md": 4},
                      "content": [{"component": "VSelect", "props": {
                          "model": "downloaders", "label": "受管控下载器（到期处置）",
@@ -1307,22 +1571,32 @@ class RainbowReviveButler(_PluginBase):
                          "hint": "按当前速率 ETA 超过剩余免费时长即提前删", "persistent-hint": True}}]},
                     {"component": "VCol", "props": {"cols": 12, "md": 4},
                      "content": [{"component": "VSwitch", "props": {
-                         "model": "auto_download", "label": "捡漏自动下载",
+                         "model": "auto_download", "label": "复活自动下载",
                          "hint": "低做种免费种子自动推送下载器", "persistent-hint": True}}]},
                     {"component": "VCol", "props": {"cols": 12, "md": 4},
                      "content": [{"component": "VTextField", "props": {
-                         "model": "target_volume", "label": "自动下载体积上限（GB）", "type": "number",
-                         "hint": "0=不限", "persistent-hint": True}}]},
+                         "model": "target_volume", "label": "目标体积（GB，总保种上限）", "type": "number",
+                         "hint": target_hint, "persistent-hint": True}}]},
+                ]},
+                {"component": "VRow", "content": [
+                    {"component": "VCol", "props": {"cols": 12, "md": 6},
+                     "content": [{"component": "VSelect", "props": {
+                         "model": "mode", "label": "优选模式",
+                         "items": [
+                             {"title": "增量优选（不删保种&补齐体积）", "value": "incremental"},
+                             {"title": "换种优选（删低档位&补高档位）", "value": "wash"}
+                         ]}}]},
                 ]},
                 {"component": "VRow", "content": [
                     {"component": "VCol", "props": {"cols": 12, "md": 4},
                      "content": [{"component": "VSelect", "props": {
                          "model": "push_downloader", "label": "推送下载器（自动下载）",
-                         "items": downloaders, "hint": "捡漏种子加到哪个下载器", "persistent-hint": True}}]},
+                         "items": downloaders, "hint": "复活种子加到哪个下载器", "persistent-hint": True}}]},
                     {"component": "VCol", "props": {"cols": 12, "md": 4},
                      "content": [{"component": "VTextField", "props": {
                          "model": "save_path", "label": "保存路径（可选）",
-                         "placeholder": "留空用下载器默认目录"}}]},
+                         "placeholder": "留空用下载器默认目录",
+                         "hint": "换种淘汰只动保存在此目录内的复活区种子；留空则只按复活区匹配", "persistent-hint": True}}]},
                     {"component": "VCol", "props": {"cols": 12, "md": 4},
                      "content": [{"component": "VTextField", "props": {
                          "model": "tag", "label": "任务标签（可选）", "placeholder": "留空不打标签"}}]},
@@ -1335,7 +1609,7 @@ class RainbowReviveButler(_PluginBase):
             "warn_hours": 2, "delete_files": True, "early_delete": True,
             "low_seeder_max": 3, "dispose_minutes": 5,
             "auto_download": False, "push_downloader": "", "save_path": "",
-            "tag": "", "target_volume": 0,
+            "tag": "", "target_volume": 0, "mode": "incremental",
         }
         return form, defaults
 
@@ -1432,7 +1706,7 @@ class RainbowReviveButler(_PluginBase):
                     rs.append(
                         f'<div style="display:flex;gap:8px;padding:3px 0;border-bottom:1px solid rgba(var(--v-theme-on-surface),.05);font-size:12px;">'
                         f'<span style="width:20px;color:rgba(var(--v-theme-on-surface),.4);">{i}</span>'
-                        f'<span style="flex:1;word-break:break-all;">{p["title"][:70]}</span>'
+                        f'<span style="flex:1;word-break:break-all;">{_esc(p["title"][:70])}</span>'
                         f'<span style="width:70px;text-align:right;">{p.get("size_gb", 0):.1f}G</span>'
                         f'<span style="width:60px;text-align:right;color:{color};font-weight:600;">{p.get("seeders", 0)}人</span>'
                         f'<span style="width:80px;text-align:right;">↑{p.get("upload_gb", 0):.2f}G</span></div>')
@@ -1463,12 +1737,12 @@ class RainbowReviveButler(_PluginBase):
             "content": [{
                 "component": "VCol", "props": {"cols": 12},
                 "content": [
-                    {"component": "div", "props": {"html": top_bar}},
-                    {"component": "div", "props": {"html": self._overview_html(ov)}},
+                    {"component": "div", "html": top_bar},
+                    {"component": "div", "html": self._overview_html(ov)},
                     {"component": "VAlert", "props": {"type": "info", "variant": "tonal",
                                                       "text": f"最近运行状态：{self._last_result}"}},
-                    {"component": "div", "props": {"html": links}},
-                    {"component": "div", "props": {"html": portfolio_html}},
+                    {"component": "div", "html": links},
+                    {"component": "div", "html": portfolio_html},
                     {"component": "div", "props": {"class": "text-caption",
                                                    "style": "margin:6px 0 2px;color:rgba(var(--v-theme-on-surface),.6);"},
                      "text": "我在复活区的做种（按做种人数稀少优先）"},
@@ -1503,7 +1777,7 @@ class RainbowReviveButler(_PluginBase):
     # 工作台（单文件 HTML，移植 HHClubButler 全套交互）
     # ------------------------------------------------------------------ #
     def _append_credit_sample(self, credit: float):
-        """记录做种积分采样（供统计表算日增量），上限 500 条、30 天自清。"""
+        """记录做种积分采样（供统计表算日增量与月度表），上限 5000 条、400 天自清（覆盖近12个月月度表）。"""
         if not credit:
             return
         try:
@@ -1512,8 +1786,8 @@ class RainbowReviveButler(_PluginBase):
                 hist = []
             now = time.time()
             hist.append({"ts": now, "credit": float(credit)})
-            hist = [h for h in hist if isinstance(h, dict) and h.get("ts", 0) > now - 30 * 86400]
-            self.save_data("credit_history", hist[-500:])
+            hist = [h for h in hist if isinstance(h, dict) and h.get("ts", 0) > now - 400 * 86400]
+            self.save_data("credit_history", hist[-5000:])
         except Exception as e:
             logger.warning(f"彩虹岛复活区管家：记录做种积分采样失败：{e}")
 
@@ -1531,10 +1805,32 @@ class RainbowReviveButler(_PluginBase):
                 return m.group(1).strip() if m else default
 
             um = re.search(r"class=['\"](\w+)_Name['\"]><b>([^<]+)</b>", r.text)
+            # 头像：优先 class 含 avatar 的 img，其次 src 含 avatar 的 img；解析为绝对地址
+            avatar = ""
+            try:
+                am = re.search(r'<img[^>]+class=["\'][^"\']*avatar[^"\']*["\'][^>]*>', r.text, re.I)
+                src_m = None
+                if am:
+                    src_m = re.search(r'(?:data-src|src)=["\']([^"\']+)["\']', am.group(0), re.I)
+                if not src_m:
+                    src_m = re.search(r'<img[^>]+(?:data-src|src)=["\']([^"\']*avatar[^"\']*)["\']', r.text, re.I)
+                if src_m:
+                    u = src_m.group(1).strip()
+                    if u.startswith("//"):
+                        u = "https:" + u
+                    elif u.startswith("/"):
+                        u = base + u
+                    elif not re.match(r"https?://", u, re.I):
+                        u = base.rstrip("/") + "/" + u
+                    if re.match(r"https?://", u, re.I):
+                        avatar = u
+            except Exception:
+                avatar = ""
             return {
                 "uid": uid,
                 "username": um.group(2).strip() if um else "-",
                 "user_class": um.group(1) if um else "Member",
+                "avatar": avatar,
                 "reg_date": g(r"加入日期\s*([\d-]+ [\d:]+)"),
                 "last_active": g(r"最近动向\s*([\d-]+ [\d:]+)"),
                 "inviter": g(r"邀请人\s*(\S+)", "-"),
@@ -1550,7 +1846,7 @@ class RainbowReviveButler(_PluginBase):
     def _fetch_task_stats(self, session: requests.Session, base: str) -> dict:
         """从任务页解析彩虹岛原生任务系统全站统计（各档完成/失败/比例）。"""
         try:
-            r = s = session.get(base + "/selfassess.php", timeout=25)
+            r = session.get(base + "/selfassess.php", timeout=25)
             t = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", r.text))
             tiers = {}
             for name in ("Master", "Ultimate", "Extreme", "Veteran", "Insane"):
@@ -1567,12 +1863,14 @@ class RainbowReviveButler(_PluginBase):
     def api_stats_page(self):
         """做种积分统计独立页（完整移植原作者「结算统计表」模板：渐变底/ECharts柱状图/双仪表/网格表/月表）。"""
         hist = self.get_data("credit_history") or []
-        # 按自然日聚合采样
+        # 按自然日聚合采样（日表只看近 40 天，避免 %m-%d 跨年撞键）
+        now_ts = time.time()
+        daily_hist = [h for h in hist if isinstance(h, dict) and h.get("ts", 0) > now_ts - 40 * 86400]
         days: Dict[str, dict] = {}
-        for h in hist:
-            if not isinstance(h, dict) or not h.get("credit"):
+        for h in daily_hist:
+            if not h.get("credit"):
                 continue
-            day = datetime.fromtimestamp(h["ts"]).strftime("%m-%d")
+            day = datetime.fromtimestamp(h["ts"], pytz.timezone("Asia/Shanghai")).strftime("%m-%d")
             d = days.setdefault(day, {"first": h["credit"], "last": h["credit"], "n": 0})
             d["last"] = h["credit"]
             d["n"] += 1
@@ -1587,7 +1885,26 @@ class RainbowReviveButler(_PluginBase):
                             "delta": delta, "n": d["n"], "cum": round(cum, 1)})
         cur = records[-1]["last"] if records else 0
         cum30 = round(sum((r["delta"] or 0) for r in records[-30:]), 1)
+        # 近12个月收益月度表：全量采样按自然月聚合；月收益 = 月末采样 − 上月末采样（首月按 末−首）
+        tz_sh = pytz.timezone("Asia/Shanghai")
+        month_map: Dict[str, dict] = {}
+        for h in sorted((x for x in hist if isinstance(x, dict) and x.get("credit")),
+                        key=lambda x: x.get("ts", 0)):
+            mk = datetime.fromtimestamp(h["ts"], tz_sh).strftime("%Y-%m")
+            m = month_map.setdefault(mk, {"first": h["credit"], "last": h["credit"], "n": 0})
+            m["last"] = h["credit"]
+            m["n"] += 1
+        monthly = []
+        prev_last = None
+        for mk in sorted(month_map):
+            d = month_map[mk]
+            delta = (d["last"] - prev_last) if prev_last is not None else (d["last"] - d["first"])
+            monthly.append({"month": mk, "first": d["first"], "last": d["last"],
+                            "delta": round(delta, 1), "n": d["n"]})
+            prev_last = d["last"]
+        monthly = monthly[-12:]
         payload = json.dumps({"records": records, "current": cur, "cum30": cum30,
+                              "monthly": monthly,
                               "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")},
                              ensure_ascii=False)
         html = _STATS_HTML.replace("__DATA__", payload)
@@ -1688,7 +2005,10 @@ class RainbowReviveButler(_PluginBase):
         foot = ("数据来源：ptchdbits.co 档案页/任务页/页头实时解析 · "
                 "任务系统完成率为全站统计（Master/Ultimate/Extreme/Veteran/Insane）· "
                 "做种积分增速由巡检跨次采样计算")
+        avatar_url = prof.get("avatar") or ""
+        avatar_html = f'<img src="{_esc(avatar_url)}" alt="">' if avatar_url else _AVATAR_SVG
         html = (_LEVEL_HTML
+                .replace("__AVATAR__", avatar_html)
                 .replace("__USERNAME__", _esc(username))
                 .replace("__META__", _esc(meta))
                 .replace("__BADGE__", _esc(cls))
@@ -2046,6 +2366,6 @@ buildHead();load();
 # ---------------------------------------------------------------------- #
 # 独立工作台页模板（照原作者「结算统计表」「数据与等级」版式整体移植，仅换数据）
 # ---------------------------------------------------------------------- #
-_STATS_HTML = '<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">\n<meta name="viewport" content="width=device-width,initial-scale=1">\n<title>做种积分统计</title><style>\n\n*{box-sizing:border-box;margin:0;padding:0}\nbody{font-family:"Segoe UI","PingFang SC",Arial,sans-serif;color:#F0ECFF;\nbackground:radial-gradient(800px 420px at 6% -8%,rgba(255,64,160,.13),transparent 55%),\nradial-gradient(900px 460px at 94% -6%,rgba(64,200,255,.15),transparent 55%),#0B0714;\nmin-height:100vh;height:100vh;height:100dvh;display:flex;flex-direction:column;overflow:hidden;font-size:12px}\n.wrap{width:100%;margin:0 auto;flex:1;overflow:auto;padding:20px 28px 16px;display:flex;flex-direction:column}\n.head{display:flex;justify-content:space-between;align-items:center;margin-bottom:18px}\n.head .t{font-size:22px;font-weight:700}\n.head .t b{color:#FF8A3C}\n.head .src{font-size:12px;color:#9A8FC0;margin-top:5px}\n.exit{border:1px solid rgba(255,64,160,.35);background:rgba(255,64,160,.06);color:#D9A0CF;font-size:13px;padding:7px 16px;border-radius:10px;cursor:pointer;font-family:inherit}\n.exit:hover{background:rgba(255,64,160,.16)}\n.topcard{background:rgba(16,10,28,.75);border:1px solid rgba(64,200,255,.25);border-radius:18px;padding:16px 18px 12px;\nbox-shadow:0 0 30px rgba(64,200,255,.07);margin-bottom:18px}\n.ct{display:flex;align-items:baseline;gap:10px;margin-bottom:8px}\n.ct .nm{font-size:16px;font-weight:700}.ct .sb{font-size:11px;color:#9A8FC0}\n.stp{display:inline-flex;align-items:center;gap:4px;margin:0 2px;vertical-align:1px}\n.stp button{width:20px;height:20px;line-height:1;border-radius:6px;border:1px solid rgba(64,200,255,.35);background:rgba(64,200,255,.08);color:#38D9FF;cursor:pointer;font-size:13px;padding:0;font-family:inherit}\n.stp button:hover{background:rgba(64,200,255,.22)}\n.stp b{min-width:22px;text-align:center;font-size:14px;color:#F0ECFF}\n.chart{width:100%;height:300px}\n/* 柱状图下方达标三行对齐表格（列与柱严格对齐；窄屏整体横滑） */\n.qwrap{overflow-x:auto;overflow-y:hidden}\n.qinner{min-width:920px}\n.qtbl{display:grid;grid-template-columns:40px 80px repeat(10,minmax(56px,1fr));\npadding-right:14px;border-top:1px solid rgba(64,200,255,.22);margin-top:2px}\n.qc{display:flex;align-items:center;justify-content:center;text-align:center;white-space:nowrap;overflow:hidden;\npadding:5px 1px;border-right:1px solid rgba(64,200,255,.10);border-bottom:1px solid rgba(64,200,255,.10);font-size:11px}\n.qc.ax{border-right:none}\n.qc.rl{justify-content:flex-end;padding-right:8px;font-size:10px;color:#9A8FC0;font-weight:600;letter-spacing:.3px}\n.qc.q{color:#34D399;font-weight:700;font-size:13px}\n.qc.s{color:#38D9FF;font-weight:600;font-size:12px}\n.qc.d{color:#9A8FC0;font-size:10.5px;border-bottom:1px solid rgba(64,200,255,.30)}\n.qc.mute{color:#5d5478}\n.low{display:grid;grid-template-columns:1fr 1.15fr;gap:18px}\n.card{background:rgba(16,10,28,.72);border:1px solid rgba(255,64,160,.28);border-radius:18px;padding:16px 18px;\nbox-shadow:0 0 24px rgba(255,64,160,.07)}\n.duals{position:relative;width:100%;height:330px;display:flex;gap:14px}\n.duals .dbox{position:relative;flex:1 1 0;min-width:0}\n.duals .g{width:100%;height:330px}\n.duals .dlab{position:absolute;left:0;right:0;top:50%;transform:translateY(-50%);text-align:center;pointer-events:none}\n.duals .dlab .r{font-size:14px;color:#9A8FC0;margin-bottom:8px}\n.duals .dlab .v{font-size:26px;font-weight:700;line-height:1.15}\ntable{width:100%;border-collapse:collapse;font-size:12.5px}\nth{text-align:left;font-weight:600;color:#9A8FC0;font-size:11px;padding:7px 10px;border-bottom:1px solid rgba(255,64,160,.16);position:sticky;top:0;background:#150D24}\ntd{padding:8px 10px;border-bottom:1px solid rgba(120,90,220,.10);color:#DCD3F5;font-variant-numeric:tabular-nums}\ntd.d{color:#9A8FC0}\ntd.bean{color:#FF8A3C;font-weight:600}\ntd.pt{color:#38D9FF;font-weight:600}\n.scroll30{height:330px;overflow-y:auto;border-radius:12px;border:1px solid rgba(120,90,220,.20)}\n.scroll30::-webkit-scrollbar{width:8px}.scroll30::-webkit-scrollbar-thumb{background:#4A3A78;border-radius:4px}\n.status{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;font-size:14px;color:#F0ECFF;text-align:center;max-width:460px;padding:28px 36px;border-radius:14px;border:1px solid rgba(255,64,160,.25);background:rgba(16,10,28,.85);box-shadow:0 0 30px rgba(255,64,160,.12)}\n.status .bar{width:260px;height:4px;background:rgba(120,90,220,.18);border-radius:2px;overflow:hidden;position:relative}\n.status .bar i{position:absolute;top:0;left:0;height:100%;width:38%;background:linear-gradient(90deg,#FF8A3C,#38D9FF);border-radius:2px;animation:hhslide 1s linear infinite;box-shadow:0 0 8px rgba(255,138,60,.6)}\n@keyframes hhslide{0%{left:-38%}100%{left:100%}}\n.status .err{color:#FF6B6B;font-size:13px;max-width:80%;text-align:center;line-height:1.6}\n.status .retrybtn{background:linear-gradient(90deg,#FF8A3C,#38D9FF);color:#0B0714;border:none;padding:8px 26px;border-radius:8px;cursor:pointer;font-size:13px;margin-top:4px;font-weight:600}\n.warnbar{display:none;margin-bottom:14px;padding:10px 16px;border-radius:12px;background:rgba(255,107,107,.10);border:1px solid rgba(255,107,107,.45);color:#FFB3A0;font-size:12.5px;line-height:1.6;align-items:center}\n.warnbar b{font-weight:700;color:#FF8A6B}\n.warnbar .wbtn{margin-left:14px;background:rgba(255,107,107,.18);border:1px solid rgba(255,107,107,.55);color:#FFD0C0;padding:5px 16px;border-radius:8px;cursor:pointer;font-size:12px;font-family:inherit;flex-shrink:0}\n.warnbar .wbtn:hover{background:rgba(255,107,107,.32)}\n.bodywrap{position:relative;flex:1;display:flex;flex-direction:column}\n.footer{margin-top:16px;font-size:11.5px;color:#9A8FC0;line-height:1.7;text-align:center}\n@media (max-width:720px){\n.wrap{padding:14px 12px 12px}\n.head .t{font-size:18px}\n.head .src{font-size:11px}\n.low{grid-template-columns:1fr}\n.scroll30{overflow-x:auto}\n.chart{height:272px}\n.duals{height:280px}\n.duals .g{height:280px}\n.status{max-width:88vw;padding:22px 16px}\n.status .bar{width:200px}\n}\n\n</style></head><body>\n<div class="wrap">\n<div class="head">\n<div><div class="t">做种<b>积分统计</b></div>\n<div class="src">彩虹岛做种积分巡检采样 · 每轮巡检自动记录 · 按自然日聚合</div></div>\n<button class="exit" title="关闭页面" onclick="window.close()">退出</button>\n</div>\n<div class="bodywrap">\n<div id="status" class="status"><span>正在加载统计数据，请稍候…</span><div class="bar"><i></i></div></div>\n<div id="main" style="display:none">\n<div class="topcard"><div class="ct"><span class="nm">近<span id="dvl">15</span>日做种积分增量</span><span class="stp"><button onclick="adjD(-1)">−</button><button onclick="adjD(1)">＋</button></span><span class="sb">橙柱 = 当日做种积分增量 · 悬停查看当日首末次采样 · 下方网格与柱严格对齐</span></div>\n<div class="qwrap"><div class="qinner">\n<div class="chart" id="mb"></div>\n<div class="qtbl" id="qtbl"></div>\n</div></div></div>\n<div class="low">\n<div class="card"><div class="ct"><span class="nm">做种积分累计</span><span class="sb">左环 = 当前积分 · 右环 = 近30日增量</span></div>\n<div class="duals"><div class="dbox"><div class="g" id="dg1"></div><div class="dlab"><div class="r">当前积分</div><div class="v" id="cvb" style="color:#FF8A3C">—</div></div></div>\n<div class="dbox"><div class="g" id="dg2"></div><div class="dlab"><div class="r">30日增量</div><div class="v" id="cvp" style="color:#38D9FF">—</div></div></div></div></div>\n<div class="card"><div class="ct"><span class="nm">采样明细</span><span class="sb">最新日期在最上方 · 首/末 = 当日首末次采样值</span></div>\n<div class="scroll30" id="tbl"></div></div>\n</div>\n</div>\n</div>\n<div class="footer" id="foot">做种积分数据来自插件每轮巡检对页头「做种积分」的采样 · 增量按相邻日末次采样差计算 · 采样积累后方有数据</div>\n</div>\n<script src="https://cdn.jsdelivr.net/npm/echarts@5.4.3/dist/echarts.min.js"></script>\n<script>\nvar data=__DATA__;\nvar chb=null,chd1=null,chd2=null,R={days:15};\nfunction esc(s){return String(s==null?"":s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;")}\nfunction fmtBig(n){if(n===null||n===undefined)return "—";return Number(n).toLocaleString()}\nfunction adjD(d){R.days=Math.min(30,Math.max(1,(R.days||15)+d));renderAll();}\nfunction renderAll(){\nvar rec=(data.records||[]).slice(-R.days);\ndocument.getElementById(\'dvl\').textContent=R.days;\nvar st=document.getElementById(\'status\');st.style.display=\'none\';\ndocument.getElementById(\'main\').style.display=\'block\';\ndocument.getElementById(\'foot\').textContent=\'数据更新于 \'+(data.updated_at||\'—\')+\' · 做种积分数据来自插件每轮巡检采样 · 增量按相邻日末次采样差计算\';\nif(typeof echarts===\'undefined\'){renderTable(rec);return;}\nrenderChart(rec);buildQTable(rec);renderGauges();renderTable((data.records||[]));\n}\nfunction renderChart(rec){\nif(chb){chb.dispose();chb=null;}\nchb=echarts.init(document.getElementById(\'mb\'));\nvar x=[],d=[];\nfor(var i=0;i<rec.length;i++){var r=rec[i];x.push(r.date);d.push(r.delta===null||r.delta===undefined?0:Math.round(r.delta));}\nchb.setOption({backgroundColor:\'transparent\',\ntooltip:{trigger:\'axis\',triggerOn:\'click\',renderMode:\'richText\',confine:true,textStyle:{fontSize:11,color:\'#F0ECFF\',lineHeight:15},backgroundColor:\'rgba(21,13,36,.95)\',borderColor:\'rgba(64,200,255,.3)\',padding:[6,8],\nformatter:function(ps){var r=rec[ps[0].dataIndex];var h=\'<b>\'+esc(r.date)+\'</b><br/>当日增量：\'+fmtBig(r.delta)+\'<br/>首采：\'+fmtBig(r.first)+\'<br/>末采：\'+fmtBig(r.last)+\'<br/>采样数：\'+r.n+\'<br/>累计增量：\'+fmtBig(r.cum);return h;}},\ngrid:{left:80,right:14,top:30,bottom:8},\nxAxis:{type:\'category\',data:x,axisTick:{show:false},axisLine:{show:false},axisLabel:{show:false}},\nyAxis:{type:\'value\',axisLabel:{fontSize:10,color:\'#9A8FC0\',formatter:function(v){return v>=10000?(v/10000).toFixed(1).replace(\'.0\',\'\')+\'万\':v}},splitLine:{lineStyle:{color:\'rgba(64,200,255,.12)\'}}},\nseries:[{name:\'当日增量\',type:\'bar\',data:d,itemStyle:{color:\'#FF8A3C\',borderRadius:[4,4,0,0]},\nlabel:{show:true,position:\'top\',fontSize:9,color:\'#FF8A3C\',distance:2,formatter:function(p){return (p.value===null||p.value===undefined||p.value===0)?\'\':fmtBig(p.value)}},labelLayout:{hideOverlap:true}}]});\nchb.resize();\n}\nfunction buildQTable(rec){\nvar tb=document.getElementById(\'qtbl\');if(!tb)return;\nvar n=rec.length;\ntb.style.gridTemplateColumns=\'40px 80px repeat(\'+n+\',minmax(56px,1fr))\';\nvar inner=document.querySelector(\'.qinner\');if(inner)inner.style.minWidth=Math.max(920,134+n*60)+\'px\';\nfunction row(lab,cls,fn){var h=\'<div class="qc ax"></div><div class="qc rl">\'+lab+\'</div>\';for(var i=0;i<n;i++){h+=\'<div class="qc \'+cls+\'">\'+fn(rec[i])+\'</div>\';}return h;}\ntb.innerHTML=\nrow(\'增量\',\'q\',function(r){return (r.delta===null||r.delta===undefined)?\'<span class="mute">—</span>\':fmtBig(Math.round(r.delta));})+\nrow(\'累计\',\'s\',function(r){return fmtBig(r.cum);})+\nrow(\'日期\',\'d\',function(r){return r.date||\'\';});\n}\nfunction renderGauges(){\nif(chd1){chd1.dispose();chd1=null;}if(chd2){chd2.dispose();chd2=null;}\nchd1=echarts.init(document.getElementById(\'dg1\'));\nchd2=echarts.init(document.getElementById(\'dg2\'));\nvar cur=Number(data.current)||0,c30=Number(data.cum30)||0;\ndocument.getElementById(\'cvb\').textContent=fmtBig(Math.round(cur));\ndocument.getElementById(\'cvp\').textContent=\'+\'+fmtBig(Math.round(c30));\nchd1.setOption({backgroundColor:\'transparent\',series:[\n{type:\'gauge\',startAngle:210,endAngle:-30,min:0,max:Math.max(cur,1),radius:\'78%\',center:[\'50%\',\'52%\'],\nprogress:{show:true,width:22,itemStyle:{color:\'#FF8A3C\',shadowColor:\'#FF8A3C\',shadowBlur:16}},\naxisLine:{lineStyle:{width:22,color:[[1,\'rgba(255,138,60,.10)\']]}},\naxisTick:{show:false},splitLine:{show:false},axisLabel:{show:false},pointer:{show:false},detail:{show:false},data:[{value:cur}]}]});\nchd2.setOption({backgroundColor:\'transparent\',series:[\n{type:\'gauge\',startAngle:210,endAngle:-30,min:0,max:Math.max(c30,1),radius:\'78%\',center:[\'50%\',\'52%\'],\nprogress:{show:true,width:22,itemStyle:{color:\'#38D9FF\',shadowColor:\'#38D9FF\',shadowBlur:16}},\naxisLine:{lineStyle:{width:22,color:[[1,\'rgba(56,217,255,.10)\']]}},\naxisTick:{show:false},splitLine:{show:false},axisLabel:{show:false},pointer:{show:false},detail:{show:false},data:[{value:c30}]}]});\nchd1.resize();chd2.resize();\n}\nfunction renderTable(rec){\nvar rows=\'\';\nfor(var j=rec.length-1;j>=0;j--){var r=rec[j];\nrows+=\'<tr><td class="d">\'+esc(r.date)+\'</td><td class="bean">\'+fmtBig(r.delta===null||r.delta===undefined?null:Math.round(r.delta))+\'</td><td class="pt">\'+fmtBig(r.first)+\'</td><td>\'+fmtBig(r.last)+\'</td><td>\'+r.n+\'</td><td>\'+fmtBig(r.cum)+\'</td></tr>\';}\nif(!rows)rows=\'<tr><td colspan="6" style="text-align:center;color:#5d5478;padding:24px;">暂无采样数据（巡检一次记录一条，运行后自动积累）</td></tr>\';\ndocument.getElementById(\'tbl\').innerHTML=\'<table><thead><tr><th>日期</th><th>当日增量</th><th>首采</th><th>末采</th><th>采样数</th><th>累计增量</th></tr></thead><tbody>\'+rows+\'</tbody></table>\';\n}\nwindow.addEventListener(\'resize\',function(){if(chb)chb.resize();if(chd1)chd1.resize();if(chd2)chd2.resize();});\nrenderAll();\n</script></body></html>'
+_STATS_HTML = '<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">\n<meta name="viewport" content="width=device-width,initial-scale=1">\n<title>做种积分统计</title><style>\n\n*{box-sizing:border-box;margin:0;padding:0}\nbody{font-family:"Segoe UI","PingFang SC",Arial,sans-serif;color:#F0ECFF;\nbackground:radial-gradient(800px 420px at 6% -8%,rgba(255,64,160,.13),transparent 55%),\nradial-gradient(900px 460px at 94% -6%,rgba(64,200,255,.15),transparent 55%),#0B0714;\nmin-height:100vh;height:100vh;height:100dvh;display:flex;flex-direction:column;overflow:hidden;font-size:12px}\n.wrap{width:100%;margin:0 auto;flex:1;overflow:auto;padding:20px 28px 16px;display:flex;flex-direction:column}\n.head{display:flex;justify-content:space-between;align-items:center;margin-bottom:18px}\n.head .t{font-size:22px;font-weight:700}\n.head .t b{color:#FF8A3C}\n.head .src{font-size:12px;color:#9A8FC0;margin-top:5px}\n.exit{border:1px solid rgba(255,64,160,.35);background:rgba(255,64,160,.06);color:#D9A0CF;font-size:13px;padding:7px 16px;border-radius:10px;cursor:pointer;font-family:inherit}\n.exit:hover{background:rgba(255,64,160,.16)}\n.topcard{background:rgba(16,10,28,.75);border:1px solid rgba(64,200,255,.25);border-radius:18px;padding:16px 18px 12px;\nbox-shadow:0 0 30px rgba(64,200,255,.07);margin-bottom:18px}\n.ct{display:flex;align-items:baseline;gap:10px;margin-bottom:8px}\n.ct .nm{font-size:16px;font-weight:700}.ct .sb{font-size:11px;color:#9A8FC0}\n.stp{display:inline-flex;align-items:center;gap:4px;margin:0 2px;vertical-align:1px}\n.stp button{width:20px;height:20px;line-height:1;border-radius:6px;border:1px solid rgba(64,200,255,.35);background:rgba(64,200,255,.08);color:#38D9FF;cursor:pointer;font-size:13px;padding:0;font-family:inherit}\n.stp button:hover{background:rgba(64,200,255,.22)}\n.stp b{min-width:22px;text-align:center;font-size:14px;color:#F0ECFF}\n.chart{width:100%;height:300px}\n/* 柱状图下方达标三行对齐表格（列与柱严格对齐；窄屏整体横滑） */\n.qwrap{overflow-x:auto;overflow-y:hidden}\n.qinner{min-width:920px}\n.qtbl{display:grid;grid-template-columns:40px 80px repeat(10,minmax(56px,1fr));\npadding-right:14px;border-top:1px solid rgba(64,200,255,.22);margin-top:2px}\n.qc{display:flex;align-items:center;justify-content:center;text-align:center;white-space:nowrap;overflow:hidden;\npadding:5px 1px;border-right:1px solid rgba(64,200,255,.10);border-bottom:1px solid rgba(64,200,255,.10);font-size:11px}\n.qc.ax{border-right:none}\n.qc.rl{justify-content:flex-end;padding-right:8px;font-size:10px;color:#9A8FC0;font-weight:600;letter-spacing:.3px}\n.qc.q{color:#34D399;font-weight:700;font-size:13px}\n.qc.s{color:#38D9FF;font-weight:600;font-size:12px}\n.qc.d{color:#9A8FC0;font-size:10.5px;border-bottom:1px solid rgba(64,200,255,.30)}\n.qc.mute{color:#5d5478}\n.low{display:grid;grid-template-columns:1fr 1.15fr;gap:18px}\n.card{background:rgba(16,10,28,.72);border:1px solid rgba(255,64,160,.28);border-radius:18px;padding:16px 18px;\nbox-shadow:0 0 24px rgba(255,64,160,.07)}\n.duals{position:relative;width:100%;height:330px;display:flex;gap:14px}\n.duals .dbox{position:relative;flex:1 1 0;min-width:0}\n.duals .g{width:100%;height:330px}\n.duals .dlab{position:absolute;left:0;right:0;top:50%;transform:translateY(-50%);text-align:center;pointer-events:none}\n.duals .dlab .r{font-size:14px;color:#9A8FC0;margin-bottom:8px}\n.duals .dlab .v{font-size:26px;font-weight:700;line-height:1.15}\ntable{width:100%;border-collapse:collapse;font-size:12.5px}\nth{text-align:left;font-weight:600;color:#9A8FC0;font-size:11px;padding:7px 10px;border-bottom:1px solid rgba(255,64,160,.16);position:sticky;top:0;background:#150D24}\ntd{padding:8px 10px;border-bottom:1px solid rgba(120,90,220,.10);color:#DCD3F5;font-variant-numeric:tabular-nums}\ntd.d{color:#9A8FC0}\ntd.bean{color:#FF8A3C;font-weight:600}\ntd.pt{color:#38D9FF;font-weight:600}\n.scroll30{height:330px;overflow-y:auto;border-radius:12px;border:1px solid rgba(120,90,220,.20)}\n.scroll30::-webkit-scrollbar{width:8px}.scroll30::-webkit-scrollbar-thumb{background:#4A3A78;border-radius:4px}\n.status{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;font-size:14px;color:#F0ECFF;text-align:center;max-width:460px;padding:28px 36px;border-radius:14px;border:1px solid rgba(255,64,160,.25);background:rgba(16,10,28,.85);box-shadow:0 0 30px rgba(255,64,160,.12)}\n.status .bar{width:260px;height:4px;background:rgba(120,90,220,.18);border-radius:2px;overflow:hidden;position:relative}\n.status .bar i{position:absolute;top:0;left:0;height:100%;width:38%;background:linear-gradient(90deg,#FF8A3C,#38D9FF);border-radius:2px;animation:hhslide 1s linear infinite;box-shadow:0 0 8px rgba(255,138,60,.6)}\n@keyframes hhslide{0%{left:-38%}100%{left:100%}}\n.status .err{color:#FF6B6B;font-size:13px;max-width:80%;text-align:center;line-height:1.6}\n.status .retrybtn{background:linear-gradient(90deg,#FF8A3C,#38D9FF);color:#0B0714;border:none;padding:8px 26px;border-radius:8px;cursor:pointer;font-size:13px;margin-top:4px;font-weight:600}\n.warnbar{display:none;margin-bottom:14px;padding:10px 16px;border-radius:12px;background:rgba(255,107,107,.10);border:1px solid rgba(255,107,107,.45);color:#FFB3A0;font-size:12.5px;line-height:1.6;align-items:center}\n.warnbar b{font-weight:700;color:#FF8A6B}\n.warnbar .wbtn{margin-left:14px;background:rgba(255,107,107,.18);border:1px solid rgba(255,107,107,.55);color:#FFD0C0;padding:5px 16px;border-radius:8px;cursor:pointer;font-size:12px;font-family:inherit;flex-shrink:0}\n.warnbar .wbtn:hover{background:rgba(255,107,107,.32)}\n.bodywrap{position:relative;flex:1;display:flex;flex-direction:column}\n.footer{margin-top:16px;font-size:11.5px;color:#9A8FC0;line-height:1.7;text-align:center}\n@media (max-width:720px){\n.wrap{padding:14px 12px 12px}\n.head .t{font-size:18px}\n.head .src{font-size:11px}\n.low{grid-template-columns:1fr}\n.scroll30{overflow-x:auto}\n.chart{height:272px}\n.duals{height:280px}\n.duals .g{height:280px}\n.status{max-width:88vw;padding:22px 16px}\n.status .bar{width:200px}\n}\n\n</style></head><body>\n<div class="wrap">\n<div class="head">\n<div><div class="t">做种<b>积分统计</b></div>\n<div class="src">彩虹岛做种积分巡检采样 · 每轮巡检自动记录 · 按自然日聚合</div></div>\n<button class="exit" title="关闭页面" onclick="window.close()">退出</button>\n</div>\n<div class="bodywrap">\n<div id="status" class="status"><span>正在加载统计数据，请稍候…</span><div class="bar"><i></i></div></div>\n<div id="main" style="display:none">\n<div class="topcard"><div class="ct"><span class="nm">近<span id="dvl">15</span>日做种积分增量</span><span class="stp"><button onclick="adjD(-1)">−</button><button onclick="adjD(1)">＋</button></span><span class="sb">橙柱 = 当日做种积分增量 · 悬停查看当日首末次采样 · 下方网格与柱严格对齐</span></div>\n<div class="qwrap"><div class="qinner">\n<div class="chart" id="mb"></div>\n<div class="qtbl" id="qtbl"></div>\n</div></div></div>\n<div class="low">\n<div class="card"><div class="ct"><span class="nm">做种积分累计</span><span class="sb">左环 = 当前积分 · 右环 = 近30日增量</span></div>\n<div class="duals"><div class="dbox"><div class="g" id="dg1"></div><div class="dlab"><div class="r">当前积分</div><div class="v" id="cvb" style="color:#FF8A3C">—</div></div></div>\n<div class="dbox"><div class="g" id="dg2"></div><div class="dlab"><div class="r">30日增量</div><div class="v" id="cvp" style="color:#38D9FF">—</div></div></div></div></div>\n<div class="card"><div class="ct"><span class="nm">采样明细</span><span class="sb">最新日期在最上方 · 首/末 = 当日首末次采样值</span></div>\n<div class="scroll30" id="tbl"></div></div>\n</div>\n<div class="card" style="margin-top:10px"><div class="ct"><span class="nm">近12个月收益</span><span class="sb">月收益 = 月末采样 − 上月末采样 · 首月按 末采 − 首采</span></div>\n<div class="scroll30" id="mtbl"></div></div>\n</div>\n</div>\n<div class="footer" id="foot">做种积分数据来自插件每轮巡检对页头「做种积分」的采样 · 增量按相邻日末次采样差计算 · 采样积累后方有数据</div>\n</div>\n<script src="https://cdn.jsdelivr.net/npm/echarts@5.4.3/dist/echarts.min.js"></script>\n<script>\nvar data=__DATA__;\nvar chb=null,chd1=null,chd2=null,R={days:15};\nfunction esc(s){return String(s==null?"":s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;")}\nfunction fmtBig(n){if(n===null||n===undefined)return "—";return Number(n).toLocaleString()}\nfunction adjD(d){R.days=Math.min(30,Math.max(1,(R.days||15)+d));renderAll();}\nfunction renderAll(){\nvar rec=(data.records||[]).slice(-R.days);\ndocument.getElementById(\'dvl\').textContent=R.days;\nvar st=document.getElementById(\'status\');st.style.display=\'none\';\ndocument.getElementById(\'main\').style.display=\'block\';\ndocument.getElementById(\'foot\').textContent=\'数据更新于 \'+(data.updated_at||\'—\')+\' · 做种积分数据来自插件每轮巡检采样 · 增量按相邻日末次采样差计算\';\nrenderMonthly();\nif(typeof echarts===\'undefined\'){renderTable(rec);return;}\nrenderChart(rec);buildQTable(rec);renderGauges();renderTable((data.records||[]));\n}\nfunction renderChart(rec){\nif(chb){chb.dispose();chb=null;}\nchb=echarts.init(document.getElementById(\'mb\'));\nvar x=[],d=[];\nfor(var i=0;i<rec.length;i++){var r=rec[i];x.push(r.date);d.push(r.delta===null||r.delta===undefined?0:Math.round(r.delta));}\nchb.setOption({backgroundColor:\'transparent\',\ntooltip:{trigger:\'axis\',triggerOn:\'click\',renderMode:\'richText\',confine:true,textStyle:{fontSize:11,color:\'#F0ECFF\',lineHeight:15},backgroundColor:\'rgba(21,13,36,.95)\',borderColor:\'rgba(64,200,255,.3)\',padding:[6,8],\nformatter:function(ps){var r=rec[ps[0].dataIndex];var h=\'<b>\'+esc(r.date)+\'</b><br/>当日增量：\'+fmtBig(r.delta)+\'<br/>首采：\'+fmtBig(r.first)+\'<br/>末采：\'+fmtBig(r.last)+\'<br/>采样数：\'+r.n+\'<br/>累计增量：\'+fmtBig(r.cum);return h;}},\ngrid:{left:80,right:14,top:30,bottom:8},\nxAxis:{type:\'category\',data:x,axisTick:{show:false},axisLine:{show:false},axisLabel:{show:false}},\nyAxis:{type:\'value\',axisLabel:{fontSize:10,color:\'#9A8FC0\',formatter:function(v){return v>=10000?(v/10000).toFixed(1).replace(\'.0\',\'\')+\'万\':v}},splitLine:{lineStyle:{color:\'rgba(64,200,255,.12)\'}}},\nseries:[{name:\'当日增量\',type:\'bar\',data:d,itemStyle:{color:\'#FF8A3C\',borderRadius:[4,4,0,0]},\nlabel:{show:true,position:\'top\',fontSize:9,color:\'#FF8A3C\',distance:2,formatter:function(p){return (p.value===null||p.value===undefined||p.value===0)?\'\':fmtBig(p.value)}},labelLayout:{hideOverlap:true}}]});\nchb.resize();\n}\nfunction buildQTable(rec){\nvar tb=document.getElementById(\'qtbl\');if(!tb)return;\nvar n=rec.length;\ntb.style.gridTemplateColumns=\'40px 80px repeat(\'+n+\',minmax(56px,1fr))\';\nvar inner=document.querySelector(\'.qinner\');if(inner)inner.style.minWidth=Math.max(920,134+n*60)+\'px\';\nfunction row(lab,cls,fn){var h=\'<div class="qc ax"></div><div class="qc rl">\'+lab+\'</div>\';for(var i=0;i<n;i++){h+=\'<div class="qc \'+cls+\'">\'+fn(rec[i])+\'</div>\';}return h;}\ntb.innerHTML=\nrow(\'增量\',\'q\',function(r){return (r.delta===null||r.delta===undefined)?\'<span class="mute">—</span>\':fmtBig(Math.round(r.delta));})+\nrow(\'累计\',\'s\',function(r){return fmtBig(r.cum);})+\nrow(\'日期\',\'d\',function(r){return r.date||\'\';});\n}\nfunction renderGauges(){\nif(chd1){chd1.dispose();chd1=null;}if(chd2){chd2.dispose();chd2=null;}\nchd1=echarts.init(document.getElementById(\'dg1\'));\nchd2=echarts.init(document.getElementById(\'dg2\'));\nvar cur=Number(data.current)||0,c30=Number(data.cum30)||0;\ndocument.getElementById(\'cvb\').textContent=fmtBig(Math.round(cur));\ndocument.getElementById(\'cvp\').textContent=\'+\'+fmtBig(Math.round(c30));\nchd1.setOption({backgroundColor:\'transparent\',series:[\n{type:\'gauge\',startAngle:210,endAngle:-30,min:0,max:Math.max(cur,1),radius:\'78%\',center:[\'50%\',\'52%\'],\nprogress:{show:true,width:22,itemStyle:{color:\'#FF8A3C\',shadowColor:\'#FF8A3C\',shadowBlur:16}},\naxisLine:{lineStyle:{width:22,color:[[1,\'rgba(255,138,60,.10)\']]}},\naxisTick:{show:false},splitLine:{show:false},axisLabel:{show:false},pointer:{show:false},detail:{show:false},data:[{value:cur}]}]});\nchd2.setOption({backgroundColor:\'transparent\',series:[\n{type:\'gauge\',startAngle:210,endAngle:-30,min:0,max:Math.max(c30,1),radius:\'78%\',center:[\'50%\',\'52%\'],\nprogress:{show:true,width:22,itemStyle:{color:\'#38D9FF\',shadowColor:\'#38D9FF\',shadowBlur:16}},\naxisLine:{lineStyle:{width:22,color:[[1,\'rgba(56,217,255,.10)\']]}},\naxisTick:{show:false},splitLine:{show:false},axisLabel:{show:false},pointer:{show:false},detail:{show:false},data:[{value:c30}]}]});\nchd1.resize();chd2.resize();\n}\nfunction renderTable(rec){\nvar rows=\'\';\nfor(var j=rec.length-1;j>=0;j--){var r=rec[j];\nrows+=\'<tr><td class="d">\'+esc(r.date)+\'</td><td class="bean">\'+fmtBig(r.delta===null||r.delta===undefined?null:Math.round(r.delta))+\'</td><td class="pt">\'+fmtBig(r.first)+\'</td><td>\'+fmtBig(r.last)+\'</td><td>\'+r.n+\'</td><td>\'+fmtBig(r.cum)+\'</td></tr>\';}\nif(!rows)rows=\'<tr><td colspan="6" style="text-align:center;color:#5d5478;padding:24px;">暂无采样数据（巡检一次记录一条，运行后自动积累）</td></tr>\';\ndocument.getElementById(\'tbl\').innerHTML=\'<table><thead><tr><th>日期</th><th>当日增量</th><th>首采</th><th>末采</th><th>采样数</th><th>累计增量</th></tr></thead><tbody>\'+rows+\'</tbody></table>\';\n}\nfunction renderMonthly(){\nvar mt=data.monthly||[];var rows=\'\';for(var j=mt.length-1;j>=0;j--){var m=mt[j];rows+=\'<tr><td class="d">\'+esc(m.month)+\'</td><td class="bean">\'+fmtBig(m.delta===null||m.delta===undefined?null:Math.round(m.delta))+\'</td><td class="pt">\'+fmtBig(m.last)+\'</td><td>\'+m.n+\'</td></tr>\';}if(!rows)rows=\'<tr><td colspan="4" style="text-align:center;color:#5d5478;padding:24px;">暂无月度数据（采样按自然月聚合，运行后自动积累）</td></tr>\';document.getElementById(\'mtbl\').innerHTML=\'<table><thead><tr><th>月份</th><th>当月收益</th><th>月末积分</th><th>采样数</th></tr></thead><tbody>\'+rows+\'</tbody></table>\';}\nwindow.addEventListener(\'resize\',function(){if(chb)chb.resize();if(chd1)chd1.resize();if(chd2)chd2.resize();});\nrenderAll();\n</script></body></html>'
 
 _LEVEL_HTML = '<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">\n<meta name="viewport" content="width=device-width,initial-scale=1">\n<title>数据与等级</title><style>\n\n  * { margin:0; padding:0; box-sizing:border-box; }\n  body { background:#0d1321; color:#e8edf7; font-family:"PingFang SC","Microsoft YaHei",sans-serif; padding:10px; }\n  .card { background:#111c33; border:1px solid #1e3357; border-radius:12px; }\n  .head { display:flex; align-items:center; gap:14px; height:64px; padding:0 20px; background:linear-gradient(135deg,#12203a,#0f1830); border-radius:12px; margin-bottom:10px; }\n  .avatar { width:44px; height:44px; border-radius:10px; background:#fff; display:flex; align-items:center; justify-content:center; overflow:hidden; flex-shrink:0; }\n  .avatar img { width:100%; height:100%; }\n  .head .nm { font-size:20px; font-weight:700; }\n  .head .meta { font-size:10px; color:#7d8db1; margin-top:2px; }\n  .head .right { margin-left:auto; text-align:right; }\n  .badge { display:inline-block; background:linear-gradient(135deg,#f59e0b,#d97706); color:#1a1205; font-size:12px; font-weight:700; padding:5px 14px; border-radius:14px; margin-bottom:5px; }\n  .lvline { font-size:10px; color:#9fb3d8; }\n  .band { display:flex; gap:10px; margin-bottom:10px; }\n  .kpi { flex:1 1 0; min-width:0; background:#111c33; border:1px solid #1e3357; border-radius:11px; padding:10px 8px; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:3px; text-align:center; min-height:120px; }\n  .kpi .ic { width:34px; height:34px; border-radius:9px; background:#16233f; display:flex; align-items:center; justify-content:center; margin-bottom:2px; }\n  .kpi .ic svg { width:18px; height:18px; }\n  .kpi .k { font-size:10px; color:#7d8db1; line-height:1.25; }\n  .kpi .v { font-size:16px; font-weight:700; white-space:nowrap; line-height:1.15; }\n  .kpi .s { font-size:8.5px; color:#5a6b8c; white-space:nowrap; }\n  .green { color:#2ee6a8; } .blue { color:#38bdf8; } .bean { color:#FF8A3C; }\n  .main { display:flex; gap:10px; margin-bottom:10px; }\n  .progCard { flex:1 1 0; min-width:0; padding:14px 20px; display:flex; flex-direction:column; }\n  .progCard h3 { font-size:13px; color:#9fb3d8; letter-spacing:1px; margin-bottom:12px; }\n  .bar { margin-bottom:16px; flex:1; display:flex; flex-direction:column; justify-content:center; }\n  .bar:last-child { margin-bottom:0; }\n  .bar .r { display:flex; justify-content:space-between; align-items:baseline; gap:10px; font-size:11px; margin-bottom:6px; }\n  .bar .r .need { color:#7d8db1; white-space:nowrap; }\n  .bar .r .val { color:#c6d3ec; font-weight:600; text-align:right; }\n  .miss { color:#f87171; font-weight:700; } .ok { color:#2ee6a8; }\n  .track { height:9px; background:#0a1326; border-radius:5px; overflow:hidden; }\n  .fill { height:100%; border-radius:5px; }\n  .radarCard { width:380px; flex-shrink:0; padding:14px; display:flex; flex-direction:column; }\n  .radarCard h3 { font-size:13px; color:#9fb3d8; letter-spacing:1px; margin-bottom:2px; }\n  .radarWrap { position:relative; flex:1; display:flex; align-items:center; justify-content:center; }\n  .radarWrap svg { width:285px; height:285px; max-width:100%; }\n  .rcenter { position:absolute; left:50%; top:48.5%; transform:translate(-50%,-50%); text-align:center; pointer-events:none; }\n  .rcenter .lv { font-size:26px; font-weight:800; color:#fbbf24; }\n  .rcenter .sub { font-size:10px; color:#7d8db1; }\n  .rextra { text-align:center; font-size:11px; color:#9fb3d8; border-top:1px solid #1e2d4e; padding-top:8px; }\n  .rextra b { color:#f87171; }\n  .ladderCard { padding:12px 20px; margin-bottom:10px; }\n  .ladderCard h3 { font-size:13px; color:#9fb3d8; letter-spacing:1px; margin-bottom:8px; }\n  .ladder { display:flex; align-items:flex-start; }\n  .step { flex:1; text-align:center; position:relative; padding-top:16px; }\n  .step::before { content:\'\'; position:absolute; top:0; left:50%; width:12px; height:12px; border-radius:50%; background:#27334d; z-index:2; transform:translateX(-50%); }\n  .step::after { content:\'\'; position:absolute; top:5px; left:-50%; width:100%; height:2px; background:#1e3357; }\n  .step:first-child::after { display:none; }\n  .step.done::before { background:#2ee6a8; }\n  .step.done::after { background:#2ee6a8; }\n  .step.cur::before { background:#fbbf24; box-shadow:0 0 0 4px rgba(251,191,36,.2); }\n  .step.cur::after { background:linear-gradient(to right,#2ee6a8,#fbbf24); }\n  .step.done .en { color:#2ee6a8; }\n  .step .en { font-size:10.5px; color:#c6d3ec; }\n  .step .cn { font-size:9.5px; color:#5a6b8c; }\n  .step.cur .en { color:#fbbf24; font-weight:700; }\n  .tagcur { position:absolute; top:-16px; left:50%; transform:translateX(-50%); background:#fbbf24; color:#1a1205; font-size:9px; font-weight:700; padding:2px 8px; border-radius:8px; white-space:nowrap; }\n  .next { display:flex; gap:10px; }\n  .ncard { flex:1 1 0; min-width:0; background:#0f1a30; border:1px solid #24355a; border-radius:11px; padding:12px 18px; display:flex; align-items:center; gap:14px; min-height:100px; }\n  .ncard .tt { flex:1; min-width:0; }\n  .ncard .t1 { font-size:13px; font-weight:700; }\n  .ncard .t2 { font-size:10px; color:#7d8db1; margin-top:4px; }\n  .ncard .dd { text-align:right; font-size:11px; color:#c6d3ec; white-space:nowrap; }\n  .ncard .dd b { color:#f87171; }\n  .foot { text-align:center; font-size:9px; color:#44567a; margin-top:10px; line-height:1.6; }\n  @keyframes radarExpand { from { transform:scale(0); opacity:0; } to { transform:scale(1); opacity:1; } }\n  @keyframes fadeIn { from { opacity:0; } to { opacity:1; } }\n  @keyframes fadeUp { from { opacity:0; transform:translateY(5px); } to { opacity:1; transform:none; } }\n  .poly-data { transform-box:view-box; transform-origin:115px 112px; animation:radarExpand .9s cubic-bezier(.22,.61,.36,1) .12s; }\n  .grid-in { animation:fadeIn .5s ease-out; }\n  .axis-in { animation:fadeIn .45s ease-out; }\n  .label-in { animation:fadeUp .5s ease-out; }\n  .l1 { animation-delay:.5s; } .l2 { animation-delay:.6s; } .l3 { animation-delay:.7s; } .l4 { animation-delay:.8s; }\n  @media (max-width:1100px){\n    .band { flex-wrap:wrap; }\n    .kpi { flex:1 1 30%; min-height:100px; }\n    .main { flex-direction:column; }\n    .radarCard { width:auto; }\n    .radarWrap { height:300px; }\n    .ladderCard { overflow-x:auto; } .ladder { min-width:760px; }\n    .next { flex-direction:column; }\n  }\n  @media (max-width:560px){\n    .kpi { flex:1 1 45%; }\n    .head { flex-wrap:wrap; height:auto; padding:10px 14px; }\n    .head .right { margin-left:0; text-align:left; }\n  }\n\n</style></head><body>\n<div class="panel">\n  <div class="head card">\n    <div class="avatar">__AVATAR__</div>\n    <div>\n      <div class="nm">__USERNAME__</div>\n      <div class="meta">__META__</div>\n    </div>\n    <div class="right">\n      <div class="badge">__BADGE__</div>\n      <div class="lvline">__LVLINE__</div>\n    </div>\n  </div>\n  <div class="band">__KPIS__</div>\n  <div class="main">\n    <div class="card progCard">\n      <h3>任务系统五档完成率（全站统计）</h3>\n      __BARS__\n    </div>\n    <div class="card radarCard">\n      <h3>账户四维概览</h3>\n      <div class="radarWrap">\n        <svg viewBox="-30 -16 290 262">__RADAR__</svg>\n        <div class="rcenter"><div class="lv">__UP_PCT__%</div><div class="sub">任务平均完成率</div></div>\n      </div>\n      <div class="rextra">四维 = 上传 / 下载 / 分享率 / 做种积分（各自归一化至 0-100）</div>\n    </div>\n  </div>\n  <div class="card ladderCard">\n    <h3>任务系统等级阶梯</h3>\n    <div class="ladder">__STEPS__</div>\n  </div>\n  <div class="next">__NEXT__</div>\n  <div class="foot">__FOOT__</div>\n<script>\n(function(){var el=document.querySelector(\'.rcenter .lv\');if(!el)return;var end=parseFloat(el.textContent)||0;var dur=1400,st=performance.now();el.textContent=\'0%\';var timer=setInterval(function(){var p=Math.min((performance.now()-st)/dur,1);el.textContent=Math.round(end*(1-Math.pow(1-p,3)))+\'%\';if(p>=1)clearInterval(timer);},16);})();\n</script>\n</div>\n</body>\n</html>'
