@@ -56,7 +56,7 @@ class RainbowReviveButler(_PluginBase):
     plugin_name = "彩虹岛复活区管家Q自用版"
     plugin_desc = "基于六个橙子「憨憨保种区管家」(HHClubButler) 架构复刻，致谢原作者 SixOrg。\n复活区全景 / 免费到期处置 / 复活推送 / 换种优选 / 做种到期提醒"
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/rainbowrevivebutler.png"
-    plugin_version = "1.6.0"
+    plugin_version = "1.7.0"
     plugin_label = "资源站点"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -272,6 +272,29 @@ class RainbowReviveButler(_PluginBase):
         return s
 
     @staticmethod
+    def _get_with_retry(session, url, timeout=30, retries=2, backoff=(3, 5)):
+        """带重试的 GET（HH 同款）：网络异常/5xx/429 重试并退避；
+        其余状态码原样返回交调用方按现状处理，不破坏既有优雅降级路径。"""
+        last_exc = None
+        r = None
+        for i in range(retries + 1):
+            try:
+                r = session.get(url, timeout=timeout)
+                if r.status_code == 429 or r.status_code >= 500:
+                    last_exc = None  # 服务端瞬时错误：记住响应等退避重试
+                else:
+                    return r
+            except Exception as e:
+                last_exc = e
+                r = None
+            if i < retries:
+                wait = backoff[i] if i < len(backoff) else 5
+                time.sleep(wait)
+        if last_exc is not None:
+            raise last_exc
+        return r
+
+    @staticmethod
     def _parse_ts(text: str) -> Optional[float]:
         """把站点时间（Asia/Shanghai）解析为 epoch 秒。"""
         try:
@@ -286,6 +309,21 @@ class RainbowReviveButler(_PluginBase):
         if not s:
             return ""
         return re.sub(r"[^0-9a-z一-鿿]", "", str(s).lower())
+
+    def _fuzzy_match_norm(self, norm: str, by_norm_long: Dict[str, dict]) -> Optional[dict]:
+        """模糊标题兜底（HH 同款互含，窄用）：norm 与站点 norm 均≥15 字符且互含时匹配；
+        仅唯一命中才返回（防多义误配），多义/无命中返回 None。"""
+        if not norm or len(norm) < 15:
+            return None
+        hit_sd = None
+        hits = 0
+        for tnorm, sd in by_norm_long.items():
+            if len(tnorm) >= 15 and (norm in tnorm or tnorm in norm):
+                hits += 1
+                if hits > 1:
+                    return None
+                hit_sd = sd
+        return hit_sd
 
     @staticmethod
     def _parse_size_gb(text: str) -> float:
@@ -353,7 +391,7 @@ class RainbowReviveButler(_PluginBase):
             for page in range(10):
                 url = f"{base}/renewtorrents.php?page={page}" if page else f"{base}/renewtorrents.php"
                 try:
-                    r = session.get(url, timeout=30)
+                    r = self._get_with_retry(session, url, timeout=30)
                     if r.status_code != 200:
                         break
                 except Exception as e:
@@ -381,7 +419,7 @@ class RainbowReviveButler(_PluginBase):
         try:
             for page in range(5):
                 url = base + "/renewtorrents.php?spstate=1" + (f"&page={page}" if page else "")
-                r = session.get(url, timeout=30)
+                r = self._get_with_retry(session, url, timeout=30)
                 # (?<!user) 排除 userdetails.php?id= 用户链接（其尾部与 details.php?id= 同形，会误抓页头/上传者 ID）
                 found = set(re.findall(r"(?<!user)details\.php\?id=(\d+)", r.text))
                 new = found - ids
@@ -396,7 +434,7 @@ class RainbowReviveButler(_PluginBase):
     def _get_site_uid(self, session: requests.Session, base: str) -> Optional[str]:
         """从首页解析当前登录用户 UID（做种组合接口需要）。"""
         try:
-            r = session.get(base + "/", timeout=20)
+            r = self._get_with_retry(session, base + "/", timeout=20)
             m = re.search(r"userdetails\.php\?id=(\d+)", r.text)
             return m.group(1) if m else None
         except Exception as e:
@@ -423,7 +461,7 @@ class RainbowReviveButler(_PluginBase):
     def _fetch_site_stats(self, session: requests.Session, base: str) -> dict:
         """从页头解析账户级数据：做种积分/魔力/分享率/上传/下载/当前做种数。"""
         try:
-            r = session.get(base + "/", timeout=20)
+            r = self._get_with_retry(session, base + "/", timeout=20)
             h = r.text
             def grab(pat, default=None):
                 m = re.search(pat, h)
@@ -461,7 +499,7 @@ class RainbowReviveButler(_PluginBase):
         if not uid:
             return []
         try:
-            r = session.get(base + f"/getusertorrentlistajax.php?userid={uid}&type=seeding", timeout=30)
+            r = self._get_with_retry(session, base + f"/getusertorrentlistajax.php?userid={uid}&type=seeding", timeout=30)
             h = r.text
         except Exception as e:
             logger.warning(f"彩虹岛复活区管家：拉取做种组合失败：{e}")
@@ -573,7 +611,7 @@ class RainbowReviveButler(_PluginBase):
             return ""
 
     def _get_downloader_seed_map(self, svcs: dict) -> Dict[str, dict]:
-        """从受管下载器种子 comment 提取 {种子ID(tid): {hash, name, downloader}}，零站点请求。
+        """从受管下载器种子 comment 提取 {种子ID(tid): {hash, name, downloader, progress, speed, eta, save_path, state}}，零站点请求。
 
         TR：一次 RPC 带 comment 字段；QB：先按站点 tracker 过滤，再定向查 properties 的 comment
         （避免对全部种子逐个发 properties 请求）。comment 未带 tid 的站点返回空映射，
@@ -592,7 +630,8 @@ class RainbowReviveButler(_PluginBase):
                     trc = getattr(sv.instance, "trc", None)
                     if trc is None:
                         continue
-                    tts = trc.get_torrents(arguments=["id", "name", "hashString", "comment", "percentDone"])
+                    tts = trc.get_torrents(arguments=["id", "name", "hashString", "comment", "percentDone",
+                                                      "rateDownload", "eta", "downloadDir", "status"])
                     for t in tts or []:
                         try:
                             sid = self._extract_seed_id_from_comment(str(t.get("comment") or ""))
@@ -601,6 +640,11 @@ class RainbowReviveButler(_PluginBase):
                                     "hash": str(t.get("hashString") or ""),
                                     "name": str(t.get("name") or ""),
                                     "downloader": dl_name,
+                                    "progress": float(t.get("percentDone") or 0),
+                                    "speed": int(t.get("rateDownload") or 0),
+                                    "eta": int(t.get("eta") or 0),
+                                    "save_path": str(t.get("downloadDir") or ""),
+                                    "state": str(t.get("status") or ""),
                                 })
                         except Exception:
                             continue
@@ -630,6 +674,11 @@ class RainbowReviveButler(_PluginBase):
                                     "hash": h,
                                     "name": str(it.get("name") or ""),
                                     "downloader": dl_name,
+                                    "progress": float(it.get("progress") or 0),
+                                    "speed": int(it.get("dlspeed") or 0),
+                                    "eta": int(it.get("eta") or 0),
+                                    "save_path": str(it.get("save_path") or ""),
+                                    "state": str(it.get("state") or ""),
                                 })
                         except Exception:
                             continue
@@ -961,6 +1010,7 @@ class RainbowReviveButler(_PluginBase):
         except Exception as e:
             logger.error(f"彩虹岛复活区管家运行异常：{e}", exc_info=True)
             self._last_result = f"运行失败：{e}"
+            self._save_log([f"运行异常：{e}"])
             if self._notify:
                 try:
                     self.post_message(title="【彩虹岛复活区管家】运行异常", text=str(e))
@@ -976,6 +1026,7 @@ class RainbowReviveButler(_PluginBase):
         if stats.get("skipped"):
             self._last_result = f"{datetime.now().strftime('%m-%d %H:%M')} 上一轮处置进行中，本轮跳过"
             logger.info(f"彩虹岛复活区管家：{self._last_result}")
+            self._save_log([f"跳过：{self._last_result}"])
             return
         seeds = stats["seeds"]
         base = self._get_site_url()
@@ -1089,6 +1140,21 @@ class RainbowReviveButler(_PluginBase):
             f"彩虹岛复活区管家：{datetime.now().strftime('%m-%d %H:%M')} 巡检：复活区 {len(seeds)} 种（免费中 {free_active}），"
             f"我的做种 {len(my_ids)}，到期删 {len(stats['deleted'])}，提前删 {len(stats['early_deleted'])}，"
             f"预警 {len(stats['warned'])}，自动下载 {len(downloaded)}，淘汰 {len(evicted)}，耗时 {time.time()-t0:.1f}s")
+        # 持久运行日志（工作台弹窗可查历史巡检摘要）
+        try:
+            _log_lines = [
+                f"巡检完成：复活区 {len(seeds)} 种 | 免费 {free_active} | 我的做种 {len(my_ids)}",
+                f"处置：到期删 {len(stats['deleted'])} | 提前删 {len(stats['early_deleted'])} | 预警 {len(stats['warned'])}",
+            ]
+            for s in downloaded[:10]:
+                _log_lines.append(
+                    f"下载：{s.get('title', '')[:60]}（{s.get('size_gb', 0):.1f}GB → {self._push_downloader or '—'}）")
+            for s in evicted[:10]:
+                _log_lines.append(f"淘汰：{s.get('title', '')[:60]}（{s.get('downloader') or '—'}）")
+            _log_lines.append(f"耗时 {time.time()-t0:.1f}s")
+            self._save_log(_log_lines)
+        except Exception as e:
+            logger.warning(f"彩虹岛复活区管家：写运行日志失败：{e}")
 
     def _auto_download_deals(self, seeds: List[dict], pool: List[dict], my_ids: set, now: float) -> Tuple[List[dict], List[dict]]:
         """HH 同款优选：总保种上限内选种推送；换种（wash）放不下时踢低档位腾位。
@@ -1151,8 +1217,6 @@ class RainbowReviveButler(_PluginBase):
                     existing.add(norm)
                     if seed is None:
                         seed = by_norm.get(norm)
-                    if not seed:
-                        continue
                     # 目录范围对在途/已完成统一生效（防在途占预算、下完又不计入的口径漂移）
                     if want_dir:
                         tpath = str(self._tf(t, "save_path", "downloadDir", "download_dir", default="") or "")
@@ -1160,6 +1224,17 @@ class RainbowReviveButler(_PluginBase):
                             continue  # 配置了目录但任务目录读不到 → 不纳入（不删不动、不计体积）
                         if not (tpath.rstrip("/") + "/").startswith(want_dir + "/"):
                             continue  # 不在复活区设置的目录 → 不纳入
+                    if seed is None and want_dir:
+                        # 模糊标题兜底（窄用）：仅复活目录内任务、精确匹配未命中时才尝试；
+                        # 互含唯一匹配才生效（多义/无命中返回 None 保持原行为），
+                        # 命中后把站点 norm 加入去重集，防同一资源被重复下载
+                        seed = self._fuzzy_match_norm(norm, by_norm)
+                        if seed is None:
+                            continue
+                        existing.add(seed["norm"])
+                        logger.info(f"彩虹岛复活区管家：模糊匹配命中 {norm[:40]} → {seed['title'][:40]}")
+                    if seed is None:
+                        continue
                     progress = float(self._tf(t, "progress", "percentDone", default=0) or 0)
                     if progress < 1.0:
                         # 在途（下载中）计入已承诺体积（HH 同款：体积基准含在途）
@@ -1759,15 +1834,38 @@ class RainbowReviveButler(_PluginBase):
         seeds = ov.get("seeds", [])
         my_ids = set(ov.get("my_ids", []))
         now = time.time()
+        # 下载器任务详情合并（面板下载器/任务状态列）：进度/速度/ETA/路径/归属
+        dl_detail: Dict[str, dict] = {}
+        try:
+            svcs = self._get_manage_services()
+            if svcs:
+                for _sid, _info in (self._get_downloader_seed_map(svcs) or {}).items():
+                    dl_detail[str(_sid)] = {
+                        "downloader": _info.get("downloader"),
+                        "progress": round(float(_info.get("progress") or 0) * 100, 1),
+                        "speed": int(_info.get("speed") or 0),
+                        "eta": int(_info.get("eta") or 0),
+                        "save_path": _info.get("save_path") or "",
+                        "state": _info.get("state") or "",
+                    }
+        except Exception as e:
+            logger.warning(f"彩虹岛复活区管家：合并下载器任务详情失败：{e}")
         out = []
         for s in seeds:
             remain = int((s.get("free_until") or 0) - now)
+            d = dl_detail.get(str(s["tid"]))
             out.append({
                 "tid": s["tid"], "title": s["title"], "size_gb": s["size_gb"],
                 "seeders": s["seeders"], "leechers": s["leechers"],
                 "is_free": s["is_free"], "free_until": s.get("free_until"),
                 "remain_sec": remain, "expired": bool(s.get("free_until") and s["free_until"] <= now),
                 "hr": s.get("hr", False), "mine": s["tid"] in my_ids,
+                "dl": d.get("downloader") if d else None,
+                "dl_progress": d.get("progress") if d else None,
+                "dl_speed": d.get("speed") if d else None,
+                "dl_eta": d.get("eta") if d else None,
+                "dl_path": d.get("save_path") if d else None,
+                "dl_state": d.get("state") if d else None,
             })
         out.sort(key=lambda x: (not x["is_free"], x["remain_sec"]))
         return {
@@ -1780,9 +1878,41 @@ class RainbowReviveButler(_PluginBase):
             "portfolio": ov.get("portfolio", []),
             "last_result": self._last_result, "seeds": out,
             "disposal_log": list(reversed(self.get_data("disposal_log") or []))[:50],
+            "run_log": self._read_run_log(100),
             "cfg": {"delete_files": self._delete_files, "early_delete": self._early_delete,
                     "low_seeder_max": self._low_seeder_max, "auto_download": self._auto_download},
         }
+
+    def _save_log(self, lines: List[str]):
+        """持久运行日志：带时间戳追加写入 run_log.txt，并裁剪保留最近 300 行。"""
+        try:
+            if not lines:
+                return
+            path = self.get_data_path()
+            if not path.exists():
+                path.mkdir(parents=True, exist_ok=True)
+            f = path / "run_log.txt"
+            old = []
+            if f.exists():
+                try:
+                    old = f.read_text(encoding="utf-8").splitlines()
+                except Exception:
+                    old = []
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+            new = [f"[{ts}] {x}" for x in lines]
+            f.write_text("\n".join((old + new)[-300:]) + "\n", encoding="utf-8")
+        except Exception as e:
+            logger.error(f"彩虹岛复活区管家：保存运行日志失败：{e}")
+
+    def _read_run_log(self, limit: int = 100) -> List[str]:
+        """读取持久运行日志最后 limit 行（工作台运行日志弹窗数据源）。"""
+        try:
+            f = self.get_data_path() / "run_log.txt"
+            if not f.exists():
+                return []
+            return f.read_text(encoding="utf-8").splitlines()[-limit:]
+        except Exception:
+            return []
 
     def api_export(self):
         """导出复活区列表为 CSV。"""
@@ -2050,7 +2180,7 @@ class RainbowReviveButler(_PluginBase):
         if not uid:
             return {}
         try:
-            r = session.get(base + f"/userdetails.php?id={uid}", timeout=25)
+            r = self._get_with_retry(session, base + f"/userdetails.php?id={uid}", timeout=25)
             t = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", r.text))
 
             def g(pat, default=""):
@@ -2099,7 +2229,7 @@ class RainbowReviveButler(_PluginBase):
     def _fetch_task_stats(self, session: requests.Session, base: str) -> dict:
         """从任务页解析彩虹岛原生任务系统全站统计（各档完成/失败/比例）。"""
         try:
-            r = session.get(base + "/selfassess.php", timeout=25)
+            r = self._get_with_retry(session, base + "/selfassess.php", timeout=25)
             t = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", r.text))
             tiers = {}
             for name in ("Master", "Ultimate", "Extreme", "Veteran", "Insane"):
@@ -2444,13 +2574,21 @@ tr.sel td{background:var(--tr-sel);color:#fff}
 <label><input type="checkbox" data-col="c_remain">剩余时间</label>
 <label><input type="checkbox" data-col="c_mine" checked>我做种</label>
 <label><input type="checkbox" data-col="c_hr" checked>HR</label>
+<label><input type="checkbox" data-col="c_dl" checked>下载器</label>
+<label><input type="checkbox" data-col="c_dstat" checked>任务状态</label>
 </div>
 </div>
 <div class="table-wrap"><div id="status" class="status"><span>正在加载复活区数据，请稍候…</span><div class="bar"><i></i></div></div><table id="tbl"><thead><tr id="head"></tr></thead><tbody id="tbody"></tbody></table></div>
+<div id="logmodal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:99;" onclick="if(event.target===this)this.style.display='none'">
+<div style="background:var(--bg,#1e1e2a);margin:5vh auto;width:86%;max-width:900px;max-height:80vh;border-radius:6px;padding:14px;display:flex;flex-direction:column;gap:8px;border:1px solid var(--input-border,#444);">
+<div style="display:flex;justify-content:space-between;align-items:center;color:var(--fg,#eee);"><b>运行日志（最近巡检摘要）</b><button class="btn ghost" onclick="document.getElementById('logmodal').style.display='none'">关闭</button></div>
+<pre id="logtxt" style="overflow:auto;max-height:66vh;font-size:11px;line-height:1.7;white-space:pre-wrap;color:var(--fg,#ddd);background:transparent;">加载中…</pre>
+</div></div>
 <div class="footer">
 <span>已选 <b id="seln">0</b> 个 / 共 <b id="totaln">0</b> 个</span>
 <span>已选体积 <b id="selgb">0</b> GB</span>
 <span>总体积 <b id="totalgb">0</b> GB</span>
+<button class="btn ghost" id="btnLog">运行日志</button>
 <span id="runinfo" style="margin-left:auto;"></span>
 </div>
 <script>
@@ -2465,9 +2603,12 @@ var COLS=[
 {k:"c_free",t:"免费状态",w:"90",sortk:"free_until"},
 {k:"c_remain",t:"剩余时间",w:"100",sortk:"remain_sec"},
 {k:"c_mine",t:"我做种",w:"70",sortk:"mine"},
-{k:"c_hr",t:"HR",w:"50",sortk:"hr"}
+{k:"c_hr",t:"HR",w:"50",sortk:"hr"},
+{k:"c_dl",t:"下载器",w:"90",sortk:"dl"},
+{k:"c_dstat",t:"任务状态",w:"180",sortk:"dl_progress"}
 ];
 var seeds=[],filtered=[],sel={};
+var RUNLOG=[];
 var curF="all",sortKey="remain_sec",sortDir=1,query="";
 function tierOf(n){n=+n||0;return n<=1?0:(n<=3?1:2)}
 function fmtSize(gb){if(!isFinite(gb))return"-";gb=+gb;if(gb>=1024)return(gb/1024).toFixed(2)+" TB";return gb.toFixed(2)+" GB"}
@@ -2514,6 +2655,8 @@ if(c.k==="c_free"){if(s.expired)return'<span class="free-exp">已过期</span>';
 if(c.k==="c_remain"){if(!s.free_until)return"-";var cls=s.expired?"free-exp":(s.remain_sec<=7200?"free-soon":"free-yes");return'<span class="'+cls+'">'+fmtRemain(s.remain_sec)+"</span>"}
 if(c.k==="c_mine")return s.mine?'<span class="mine-y">是</span>':"-";
 if(c.k==="c_hr")return s.hr?'<span class="hr-y">HR</span>':"-";
+if(c.k==="c_dl")return s.dl?esc(s.dl):"-";
+if(c.k==="c_dstat"){if(!s.dl)return"-";var pc=Math.round(+s.dl_progress||0);var sp=+s.dl_speed||0;var spd=sp>=1048576?(sp/1048576).toFixed(1)+" MB/s":(sp>=1024?(sp/1024).toFixed(0)+" KB/s":sp+" B/s");var et=+s.dl_eta||0;var eta=(et>0&&et<8640000)?(Math.floor(et/3600)+"h"+Math.floor(et%3600/60)+"m"):"-";return'<span title="'+esc((s.dl_state||"")+" | "+(s.dl_path||""))+'">'+pc+"% · "+spd+" · "+eta+"</span>"}
 return "";
 }
 function render(){
@@ -2566,6 +2709,7 @@ var j=await r.json();
 if(!j.success){clearInterval(tmr);showErr(j.message||"数据加载失败");return}
 seeds=j.seeds||[];
 document.getElementById("runinfo").textContent=j.last_result||"";
+RUNLOG=j.run_log||[];
 doSort();render();clearInterval(tmr);st.style.display="none";
 }catch(e){clearInterval(tmr);showErr((e&&e.name==="AbortError")?"加载超时，请稍后重试":"请求失败："+e)}
 }
@@ -2595,6 +2739,7 @@ var a=document.createElement("a");a.href=URL.createObjectURL(new Blob([csv],{typ
 document.getElementById("btnDel").onclick=delSel;
 document.getElementById("btnExport").onclick=doExport;
 document.getElementById("btnRefresh").onclick=load;
+document.getElementById("btnLog").onclick=function(){var m=document.getElementById("logmodal");m.style.display="block";document.getElementById("logtxt").textContent=(RUNLOG&&RUNLOG.length)?RUNLOG.join("\n"):"暂无运行日志（首次巡检后生成）"};
 document.getElementById("q").oninput=function(){query=this.value.trim().toLowerCase();render()};
 document.querySelectorAll(".topbar .chip").forEach(function(c){c.onclick=function(){document.querySelectorAll(".topbar .chip").forEach(function(x){x.classList.remove("active")});this.classList.add("active");curF=this.dataset.f;render()}});
 var cp=document.getElementById("colpicker");
