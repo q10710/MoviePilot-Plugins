@@ -59,7 +59,7 @@ class RainbowReviveButler(_PluginBase):
     plugin_name = "彩虹岛复活区管家Q自用版"
     plugin_desc = "基于六个橙子「憨憨保种区管家」(HHClubButler) 架构复刻，致谢原作者 SixOrg。\n复活区全景 / 免费到期处置 / 复活推送 / 换种优选 / 做种到期提醒"
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/rainbowrevivebutler.png"
-    plugin_version = "1.7.14"
+    plugin_version = "1.7.15"
     plugin_label = "资源站点"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -147,6 +147,11 @@ class RainbowReviveButler(_PluginBase):
         self._mode = config.get("mode") or "incremental"
         if self._mode not in ("incremental", "wash"):
             self._mode = "incremental"
+        # 推送下载器若不在受管列表：其上的复活任务到期无人处置（持续计费）——启动即告警
+        if self._push_downloader and self._downloaders and self._push_downloader not in self._downloaders:
+            logger.warning(
+                f"彩虹岛复活区管家：推送下载器「{self._push_downloader}」不在受管下载器列表 "
+                f"{self._downloaders} 中——推过去的任务到期不会被自动删除，建议将其加入受管列表")
 
         self._dispose_lock = threading.RLock()
         # 巡检互斥锁：_running 是 check-then-set（TOCTOU），cron 与命令/api_run 同秒触发可双跑；
@@ -382,12 +387,15 @@ class RainbowReviveButler(_PluginBase):
         row 导致字段串行）。每行内每个 details 链接独立成种，无 title 的链接跳过。
         """
         seeds: List[dict] = []
+        seen: set = set()
         for row in re.split(r"<tr[^>]*>", html):
             if "rowfollow" not in row:
                 continue
             for m in re.finditer(r"(?<!user)details\.php\?id=(\d+)", row):
                 tid = m.group(1)
-                tm = re.search(r'<a title="([^"]+)"\s+href="details\.php\?id=' + tid, row)
+                if tid in seen:
+                    continue  # 页内去重：同一行/跨行重复链接防双计（跨页去重在 fetch 层）
+                tm = re.search(r'<a title="([^"]+)"\s+href="details\.php\?id=' + tid + '"', row)
                 title = tm.group(1).strip() if tm else ""
                 if not title:
                     continue  # 无 title 的链接（上传者/副链接）不算种子
@@ -409,6 +417,7 @@ class RainbowReviveButler(_PluginBase):
                     "size_gb": round(size_gb, 2), "seeders": seeders, "leechers": leechers,
                     "is_free": is_free, "free_until": free_until, "hr": hr,
                 })
+                seen.add(tid)
         return seeds
 
     def _fetch_revive_list(self, session: requests.Session, base: str) -> Tuple[List[dict], int]:
@@ -926,8 +935,10 @@ class RainbowReviveButler(_PluginBase):
         for s in seeds:
             by_norm.setdefault(s["norm"], s)
         by_tid: Dict[str, dict] = {s["tid"]: s for s in seeds}
+        services = self._get_manage_services()
         # comment tid 精确反查：跨站转载种站点标题与任务名不同词（如 Handicap vs Gandikap），
         # norm 必失败 → 到期漏删持续计费。用下载器 comment 里的本站详情页 URL 反查（含域名校验）
+        # 注意 services 必须在此前赋值（曾因先用后赋 UnboundLocalError 被 except 吞掉成死代码）
         try:
             _h2tid = {str(info.get("hash")).lower(): tid
                       for tid, info in self._get_downloader_seed_map(services).items()
@@ -947,7 +958,6 @@ class RainbowReviveButler(_PluginBase):
         early_deleted: List[dict] = []
         delete_failed: List[dict] = []
 
-        services = self._get_manage_services()
         for dl_name, sv in services.items():
             try:
                 torrents, error = sv.instance.get_torrents()
@@ -1030,6 +1040,21 @@ class RainbowReviveButler(_PluginBase):
                 except Exception as e:
                     logger.warning(f"彩虹岛复活区管家：处理任务出错：{e}")
                     continue
+
+        # 同一种子在多个下载器并存（转移做种瞬间/两份残留）：删除各下载器照做，
+        # 但计数与通知按 tid 去重，防 ×2 与通知重复列出
+        def _dedup_tid(items: List[dict]) -> List[dict]:
+            out, _seen_t = [], set()
+            for s in items:
+                t = str(s.get("tid", ""))
+                if t and t in _seen_t:
+                    continue
+                if t:
+                    _seen_t.add(t)
+                out.append(s)
+            return out
+        deleted = _dedup_tid(deleted)
+        early_deleted = _dedup_tid(early_deleted)
 
         self.save_data("notify_dedupe", dedupe)
         stats = {"seeds": seeds, "pages": pages, "deleted": deleted, "hr_skipped": hr_skipped,
@@ -1345,17 +1370,19 @@ class RainbowReviveButler(_PluginBase):
             _suffix = f" | 已达目标（{self._target_reached[0]:.0f}/{self._target_reached[1]:.0f} GB）"
         elif self._dl_aborted:
             _suffix = " | 已中止自动下载"
+        _my_n = len(my_ids) if my_ids_ok else _ov_prev.get("my_seeding", 0)
+        _my_note = "" if my_ids_ok else "（做种视图拉取失败，计数为上次值）"
         self._last_result = (
-            f"复活区 {len(seeds)} 种 | 免费 {free_active} | 我的做种 {len(my_ids)} | "
+            f"复活区 {len(seeds)} 种 | 免费 {free_active} | 我的做种 {_my_n}{_my_note} | "
             f"到期删 {len(stats['deleted'])} | 下载 {len(downloaded)} | 淘汰 {len(evicted)}{_suffix}")
         logger.info(
             f"彩虹岛复活区管家：{datetime.now().strftime('%m-%d %H:%M')} 巡检：复活区 {len(seeds)} 种（免费中 {free_active}），"
-            f"我的做种 {len(my_ids)}，到期删 {len(stats['deleted'])}，提前删 {len(stats['early_deleted'])}，"
+            f"我的做种 {_my_n}{_my_note}，到期删 {len(stats['deleted'])}，提前删 {len(stats['early_deleted'])}，"
             f"预警 {len(stats['warned'])}，自动下载 {len(downloaded)}，淘汰 {len(evicted)}，耗时 {time.time()-t0:.1f}s")
         # 持久运行日志（工作台弹窗可查历史巡检摘要）
         try:
             _log_lines = [
-                f"巡检完成：复活区 {len(seeds)} 种 | 免费 {free_active} | 我的做种 {len(my_ids)}",
+                f"巡检完成：复活区 {len(seeds)} 种 | 免费 {free_active} | 我的做种 {_my_n}{_my_note}",
                 f"处置：到期删 {len(stats['deleted'])} | 提前删 {len(stats['early_deleted'])} | 预警 {len(stats['warned'])}"
                 + (f" | 僵尸清理 {cleaned_stale}" if cleaned_stale else ""),
             ]
@@ -1445,8 +1472,10 @@ class RainbowReviveButler(_PluginBase):
                     if want_dir:
                         tpath = str(self._tf(t, "save_path", "downloadDir", "download_dir", default="") or "")
                         # 转移做种场景：任务被转移到其他下载器/目录做种后路径必然变化——
-                        # 带彩虹岛复活标签（转移插件保留标签）也视为复活区任务，可计体积可淘汰
-                        _has_rb_tag = "彩虹岛复活" in str(self._tf(t, "tags", "labels", default="") or "")
+                        # 带复活标签（转移插件保留标签）也视为复活区任务，可计体积可淘汰。
+                        # 认配置标签 self._tag 与默认「彩虹岛复活」两个（曾硬编码单值，改标签后豁免失效）
+                        _tags_s = str(self._tf(t, "tags", "labels", default="") or "")
+                        _has_rb_tag = (bool(self._tag) and self._tag in _tags_s) or "彩虹岛复活" in _tags_s
                         if not _has_rb_tag:
                             if not tpath:
                                 continue  # 配置了目录但任务目录读不到 → 不纳入（不删不动、不计体积）
@@ -1488,7 +1517,7 @@ class RainbowReviveButler(_PluginBase):
             self._last_current_gb = current_gb
             self._last_in_flight_gb = in_flight_gb
 
-            # 2) 目标体积与剩余额度（HH 同款；0=不限）
+            # 2) 目标体积与剩余额度（HH 同款；0=不推不删）
             target = self._target_volume
             committed_gb = current_gb + in_flight_gb
             if target and target > 0:
@@ -1496,11 +1525,11 @@ class RainbowReviveButler(_PluginBase):
                     logger.info(f"彩虹岛复活区管家：当前保种+在途已达标（{committed_gb:.1f} GB ≥ 目标 {target:g} GB），本次不推不删")
                     self._target_reached = (committed_gb, target)
                     return out, evicted
-                eff_target: Optional[float] = max(0.0, target - committed_gb)
+                eff_target: float = max(0.0, target - committed_gb)
                 logger.info(f"彩虹岛复活区管家：目标体积（总保种上限）{target:g} GB，当前 {current_gb:.1f}，"
                             f"在途 {in_flight_gb:.1f}，剩余可增 {eff_target:.1f} GB")
             else:
-                eff_target = None  # 0=不限
+                eff_target = 0.0  # HH 同款：0=不推不删（不是「不限」），两模式都不新增
 
             # 3) 候选池：排除已在下载器、已在做种；按 norm 去重防同名资源重复下载
             cands: List[dict] = []
@@ -1670,20 +1699,19 @@ class RainbowReviveButler(_PluginBase):
         """候选排序（HH 同款）：档位高（摊薄重）优先、同档位大体积优先（-size 降序）。"""
         return (tier_of(s.get("seeders", 1)), -s.get("size", 0.0))
 
-    def _optimize_incremental(self, seeds: List[dict], eff_target: Optional[float]) -> dict:
-        """HH 同款增量优选：不删在保，按档位高→低在剩余额度内补齐；eff_target=None 表示 0=不限。"""
-        if eff_target is not None and eff_target <= 0:
+    def _optimize_incremental(self, seeds: List[dict], eff_target: float) -> dict:
+        """HH 同款增量优选：不删在保，按档位高→低在剩余额度内补齐；额度≤0 不新增（HH：0=不推不删）。"""
+        if eff_target <= 0:
             logger.info("彩虹岛复活区管家：当前保种体积已达目标，无需新增")
             return {"picked": [], "del_seeds": []}
         candidates = sorted(seeds, key=RainbowReviveButler._tier_sort_key)
         picked: List[dict] = []
         used = 0.0
         for s in candidates:
-            if eff_target is None or used + s["size"] <= eff_target + 1e-6:
+            if used + s["size"] <= eff_target + 1e-6:
                 picked.append(s)
                 used += s["size"]
-        cap_txt = "不限" if eff_target is None else f"{eff_target:.1f} GB"
-        logger.info(f"彩虹岛复活区管家：增量优选：剩余额度 {cap_txt}，按档位高→低补 {len(picked)} 个，新增 {used:.1f} GB")
+        logger.info(f"彩虹岛复活区管家：增量优选：剩余可增 {eff_target:.1f} GB，按档位高→低补 {len(picked)} 个，新增 {used:.1f} GB")
         return {"picked": picked, "del_seeds": []}
 
     def _optimize_wash(self, candidates: List[dict], current: List[dict], in_flight_gb: float) -> dict:
@@ -1693,8 +1721,8 @@ class RainbowReviveButler(_PluginBase):
         """
         cap = self._target_volume
         if not cap or cap <= 0:
-            # 0=不限：不淘汰、新增不受限（按「0=不限」文案语义）
-            return {"picked": list(candidates), "del_seeds": []}
+            # HH 同款：0=不推不删（不是「不限」）——不新增也不淘汰
+            return {"picked": [], "del_seeds": []}
         cur_norms = {c["norm"] for c in current}
         final: List[dict] = list(current)
         total_gb = sum(s.get("size", 0.0) for s in final) + in_flight_gb
@@ -1765,7 +1793,7 @@ class RainbowReviveButler(_PluginBase):
             remain = max(0.0, self._target_volume - final_gb - in_flight_gb)
             lines.append(f"目标体积：{self._target_volume:.0f} GB（在途 {in_flight_gb:.1f} GB · 剩余可增 {remain:.1f} GB）")
         else:
-            lines.append("目标体积：不限")
+            lines.append("目标体积：未设置（0=不推不删，HH 同款）")
         dist = {"0-1人": {"count": 0, "gb": 0.0}, "2-3人": {"count": 0, "gb": 0.0}, "4+人": {"count": 0, "gb": 0.0}}
         for c in final:
             n = c.get("seeders", 0)
@@ -2289,11 +2317,14 @@ class RainbowReviveButler(_PluginBase):
         _hit_hash = str(_hit.get("hash")).lower() if _hit and _hit.get("hash") else ""
         done_dls: List[str] = []
         failed_dls: List[str] = []
+        err_dls: List[str] = []
         total_deleted = 0
         for dl_name, sv in services.items():
             try:
                 ts, err = sv.instance.get_torrents()
                 if err or not ts:
+                    if err:
+                        err_dls.append(dl_name)  # 查询失败要上报，否则「未找到」误导（任务可能就在该下载器）
                     continue
                 if _hit_hash:
                     del_ids = [self._thash(t) for t in ts
@@ -2331,7 +2362,10 @@ class RainbowReviveButler(_PluginBase):
         if failed_dls:
             return {"success": False, "message": f"{'、'.join(failed_dls)} 删除未生效，请重试"}
         if not done_dls:
-            return {"success": False, "message": "下载器中未找到匹配任务"}
+            _msg = "下载器中未找到匹配任务"
+            if err_dls:
+                _msg += f"（{'、'.join(err_dls)} 查询失败，请稍后重试）"
+            return {"success": False, "message": _msg}
         # 删除成功后本地回写概况（不发站点请求）：列表剔除该种子并重算计数
         try:
             if isinstance(self._last_overview, dict) and self._last_overview.get("seeds"):
@@ -2371,9 +2405,9 @@ class RainbowReviveButler(_PluginBase):
         cur_gb = getattr(self, "_last_current_gb", None)
         infl_gb = getattr(self, "_last_in_flight_gb", 0.0) or 0.0
         if cur_gb is not None:
-            target_hint = f"含复活区已做种 {cur_gb:.1f} GB + 在途 {infl_gb:.1f} GB，0=不限"
+            target_hint = f"含复活区已做种 {cur_gb:.1f} GB + 在途 {infl_gb:.1f} GB，0=不推不删（HH 同款）"
         else:
-            target_hint = "含复活区已做种 + 在途总体积，0=不限（巡检运行后显示实时数值）"
+            target_hint = "含复活区已做种 + 在途总体积，0=不推不删（HH 同款，巡检运行后显示实时数值）"
         form = [{
             "component": "VForm",
             "content": [
