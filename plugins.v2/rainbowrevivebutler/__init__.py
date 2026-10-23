@@ -59,7 +59,7 @@ class RainbowReviveButler(_PluginBase):
     plugin_name = "彩虹岛复活区管家Q自用版"
     plugin_desc = "基于六个橙子「憨憨保种区管家」(HHClubButler) 架构复刻，致谢原作者 SixOrg。\n复活区全景 / 免费到期处置 / 复活推送 / 换种优选 / 做种到期提醒"
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/rainbowrevivebutler.png"
-    plugin_version = "1.7.13"
+    plugin_version = "1.7.14"
     plugin_label = "资源站点"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -375,46 +375,40 @@ class RainbowReviveButler(_PluginBase):
         return {"TB": val * 1024, "GB": val, "MB": val / 1024, "KB": val / 1024 / 1024}.get(unit, 0.0)
 
     def _parse_revive_page(self, html: str) -> List[dict]:
-        """解析复活区列表页，提取种子行字段。"""
+        """解析复活区列表页，提取种子行字段。
+
+        按 <tr> 严格分割行（2026-10-23 实测：原实现从 </table> 后找 </tr> 会跨行，
+        105 颗种子漏解析 5 颗——方向保守无误删但损失候选；且双链接行此前会共用同一个
+        row 导致字段串行）。每行内每个 details 链接独立成种，无 title 的链接跳过。
+        """
         seeds: List[dict] = []
-        seen = set()
-        for m in re.finditer(r"(?<!user)details\.php\?id=(\d+)", html):
-            tid = m.group(1)
-            if tid in seen:
-                continue
-            start = html.rfind("<tr", 0, m.start())
-            tbl_end = html.find("</table>", m.end())
-            if start == -1 or tbl_end == -1:
-                continue
-            end = html.find("</tr>", tbl_end)
-            if end == -1:
-                continue
-            row = html[start:end]
+        for row in re.split(r"<tr[^>]*>", html):
             if "rowfollow" not in row:
                 continue
-            seen.add(tid)
-            tm = re.search(r'<a title="([^"]+)"\s+href="details\.php\?id=' + tid, row)
-            title = tm.group(1).strip() if tm else ""
-            size_gb = self._parse_size_gb(row)
-            sm = re.search(r'<span class="(red|green)">(\d+)</span>', row)
-            seeders = int(sm.group(2)) if sm else 0
-            lm = re.search(r'#leechers">(\d+)</a>', row)
-            leechers = int(lm.group(1)) if lm else 0
-            is_free = "pro_free" in row
-            free_until = None
-            if is_free:
-                fm = re.search(r"限时\s*<span title=\"([^\"]+)\"", row)
-                if fm:
-                    free_until = self._parse_ts(fm.group(1))
-            plain = re.sub(r"<[^>]+>", " ", row)
-            hr = bool(re.search(r"\bH[35]\b", plain))
-            if not title:
-                continue
-            seeds.append({
-                "tid": tid, "title": title, "norm": self._norm_title(title),
-                "size_gb": round(size_gb, 2), "seeders": seeders, "leechers": leechers,
-                "is_free": is_free, "free_until": free_until, "hr": hr,
-            })
+            for m in re.finditer(r"(?<!user)details\.php\?id=(\d+)", row):
+                tid = m.group(1)
+                tm = re.search(r'<a title="([^"]+)"\s+href="details\.php\?id=' + tid, row)
+                title = tm.group(1).strip() if tm else ""
+                if not title:
+                    continue  # 无 title 的链接（上传者/副链接）不算种子
+                size_gb = self._parse_size_gb(row)
+                sm = re.search(r'<span class="(red|green)">(\d+)</span>', row)
+                seeders = int(sm.group(2)) if sm else 0
+                lm = re.search(r'#leechers">(\d+)</a>', row)
+                leechers = int(lm.group(1)) if lm else 0
+                is_free = "pro_free" in row
+                free_until = None
+                if is_free:
+                    fm = re.search(r"限时\s*<span title=\"([^\"]+)\"", row)
+                    if fm:
+                        free_until = self._parse_ts(fm.group(1))
+                plain = re.sub(r"<[^>]+>", " ", row)
+                hr = bool(re.search(r"\bH[35]\b", plain))
+                seeds.append({
+                    "tid": tid, "title": title, "norm": self._norm_title(title),
+                    "size_gb": round(size_gb, 2), "seeders": seeders, "leechers": leechers,
+                    "is_free": is_free, "free_until": free_until, "hr": hr,
+                })
         return seeds
 
     def _fetch_revive_list(self, session: requests.Session, base: str) -> Tuple[List[dict], int]:
@@ -931,6 +925,15 @@ class RainbowReviveButler(_PluginBase):
         by_norm: Dict[str, dict] = {}
         for s in seeds:
             by_norm.setdefault(s["norm"], s)
+        by_tid: Dict[str, dict] = {s["tid"]: s for s in seeds}
+        # comment tid 精确反查：跨站转载种站点标题与任务名不同词（如 Handicap vs Gandikap），
+        # norm 必失败 → 到期漏删持续计费。用下载器 comment 里的本站详情页 URL 反查（含域名校验）
+        try:
+            _h2tid = {str(info.get("hash")).lower(): tid
+                      for tid, info in self._get_downloader_seed_map(services).items()
+                      if info.get("hash")}
+        except Exception:
+            _h2tid = {}
 
         now = time.time()
         warn_sec = self._warn_hours * 3600
@@ -956,7 +959,12 @@ class RainbowReviveButler(_PluginBase):
             for t in torrents:
                 try:
                     tname = str(self._tf(t, "name", default="") or "")
-                    seed = by_norm.get(self._norm_title(tname))
+                    _th0 = str(self._thash(t) or "").lower()
+                    # 三级匹配：① comment tid 精确（跨站转载种唯一可靠路径，infohash 全局唯一）
+                    #           ② norm 精确 ③ 无命中跳过
+                    seed = by_tid.get(_h2tid.get(_th0, ""), None)
+                    if seed is None:
+                        seed = by_norm.get(self._norm_title(tname))
                     if not seed:
                         continue
                     progress = float(self._tf(t, "progress", "percentDone", default=0) or 0)
@@ -1319,11 +1327,15 @@ class RainbowReviveButler(_PluginBase):
 
         # 概览缓存
         free_active = sum(1 for s in seeds if s["is_free"] and s.get("free_until") and s["free_until"] > now)
+        _ov_prev = self._last_overview or {}
         self._last_overview = {
             "ts": now, "total": len(seeds), "pages": stats["pages"], "free_active": free_active,
-            "my_seeding": len(my_ids), "deleted": len(stats["deleted"]),
+            # my_ids 拉取失败时继承旧快照（否则面板「我的做种」被清零误导，与 _refresh_overview 防清空对齐）
+            "my_seeding": len(my_ids) if my_ids_ok else _ov_prev.get("my_seeding", 0),
+            "deleted": len(stats["deleted"]),
             "early": len(stats["early_deleted"]), "warned": len(stats["warned"]),
-            "auto_downloaded": len(downloaded), "seeds": seeds, "my_ids": sorted(my_ids),
+            "auto_downloaded": len(downloaded), "seeds": seeds,
+            "my_ids": sorted(my_ids) if my_ids_ok else _ov_prev.get("my_ids", []),
             "stats": acct_stats, "portfolio": portfolio[:200], "portfolio_stats": portfolio_stats,
             "last_gain": self._last_credit_delta, "ran_at": now,
         }
@@ -1432,10 +1444,14 @@ class RainbowReviveButler(_PluginBase):
                     # 目录范围对在途/已完成统一生效（防在途占预算、下完又不计入的口径漂移）
                     if want_dir:
                         tpath = str(self._tf(t, "save_path", "downloadDir", "download_dir", default="") or "")
-                        if not tpath:
-                            continue  # 配置了目录但任务目录读不到 → 不纳入（不删不动、不计体积）
-                        if not (tpath.rstrip("/") + "/").startswith(want_dir + "/"):
-                            continue  # 不在复活区设置的目录 → 不纳入
+                        # 转移做种场景：任务被转移到其他下载器/目录做种后路径必然变化——
+                        # 带彩虹岛复活标签（转移插件保留标签）也视为复活区任务，可计体积可淘汰
+                        _has_rb_tag = "彩虹岛复活" in str(self._tf(t, "tags", "labels", default="") or "")
+                        if not _has_rb_tag:
+                            if not tpath:
+                                continue  # 配置了目录但任务目录读不到 → 不纳入（不删不动、不计体积）
+                            if not (tpath.rstrip("/") + "/").startswith(want_dir + "/"):
+                                continue  # 不在复活区设置的目录且无彩虹标签 → 不纳入
                     if seed is None and want_dir:
                         # 模糊标题兜底（窄用）：仅复活目录内任务、精确匹配未命中时才尝试；
                         # 互含唯一匹配才生效（多义/无命中返回 None 保持原行为），
@@ -2263,21 +2279,26 @@ class RainbowReviveButler(_PluginBase):
             return {"success": False, "message": f"复活区未找到种子 {tid}"}
         norm = self._norm_title(seed["title"])
         services = self._get_manage_services()
-        # 三级匹配（HH _norm_match 语义 + seed_id 主键优先）：跨站转载种站点标题与任务名
-        # 不同词（如 Handicap vs Gandikap），仅靠 norm 精确相等会漏删 → 先按下载器 comment
-        # 里的站点 seed_id 精确命中，命中即单下载器定向删；未命中再模糊标题兜底
+        # comment seed_id 精确优先 + 标题兜底（HH _norm_match 语义，双向非空+≥15）。
+        # infohash 全局唯一：_hit 命中后对**全部受管下载器**按 hash 清理——转移做种后
+        # hash 不变，单下载器定向删会漏掉转移到其他下载器的任务（2026-10-23 审计项③）
         try:
             _hit = self._get_downloader_seed_map(services).get(str(tid))
         except Exception:
             _hit = None
+        _hit_hash = str(_hit.get("hash")).lower() if _hit and _hit.get("hash") else ""
+        done_dls: List[str] = []
+        failed_dls: List[str] = []
+        total_deleted = 0
         for dl_name, sv in services.items():
             try:
-                if _hit and _hit.get("downloader") == dl_name and _hit.get("hash"):
-                    del_ids = [str(_hit["hash"])]
+                ts, err = sv.instance.get_torrents()
+                if err or not ts:
+                    continue
+                if _hit_hash:
+                    del_ids = [self._thash(t) for t in ts
+                               if str(self._thash(t) or "").lower() == _hit_hash]
                 else:
-                    ts, err = sv.instance.get_torrents()
-                    if err or not ts:
-                        continue
                     del_ids = []
                     for t in ts:
                         tn = self._norm_title(self._tf(t, "name", default=""))
@@ -2299,29 +2320,36 @@ class RainbowReviveButler(_PluginBase):
                 self._append_disposal({"time": int(time.time()), "tid": seed["tid"], "title": seed["title"],
                                        "size_gb": seed["size_gb"], "progress": 0, "downloader": dl_name,
                                        "action": "manual_delete", "ok": ok})
-                if not ok:
-                    return {"success": False, "message": f"{dl_name} 删除未生效（仍剩 {leftover} 个任务），请重试"}
-                # 删除成功后本地回写概况（不发站点请求）：列表剔除该种子并重算计数
-                try:
-                    if isinstance(self._last_overview, dict) and self._last_overview.get("seeds"):
-                        _tid = seed["tid"]
-                        _ov = self._last_overview
-                        _ov["seeds"] = [x for x in _ov["seeds"] if x.get("tid") != _tid]
-                        _ov["total"] = len(_ov["seeds"])
-                        _now_ts = time.time()
-                        _ov["free_active"] = sum(
-                            1 for x in _ov["seeds"]
-                            if x.get("is_free") and x.get("free_until") and x["free_until"] > _now_ts)
-                        if isinstance(_ov.get("my_ids"), (list, set)):
-                            _ov["my_ids"] = sorted(t for t in _ov["my_ids"] if t != _tid)
-                            _ov["my_seeding"] = len(_ov["my_ids"])
-                        _ov["ts"] = _now_ts
-                except Exception:
-                    pass
-                return {"success": True, "message": f"已从 {dl_name} 删除 {len(del_ids)} 个任务"}
+                if ok:
+                    done_dls.append(dl_name)
+                    total_deleted += len(del_ids)
+                else:
+                    failed_dls.append(f"{dl_name}(仍剩 {leftover})")
             except Exception as e:
                 logger.error(f"彩虹岛复活区管家：手动删除失败 {seed['title'][:40]}（{dl_name}）：{e}")
-        return {"success": False, "message": "下载器中未找到匹配任务"}
+                failed_dls.append(dl_name)
+        if failed_dls:
+            return {"success": False, "message": f"{'、'.join(failed_dls)} 删除未生效，请重试"}
+        if not done_dls:
+            return {"success": False, "message": "下载器中未找到匹配任务"}
+        # 删除成功后本地回写概况（不发站点请求）：列表剔除该种子并重算计数
+        try:
+            if isinstance(self._last_overview, dict) and self._last_overview.get("seeds"):
+                _tid = seed["tid"]
+                _ov = self._last_overview
+                _ov["seeds"] = [x for x in _ov["seeds"] if x.get("tid") != _tid]
+                _ov["total"] = len(_ov["seeds"])
+                _now_ts = time.time()
+                _ov["free_active"] = sum(
+                    1 for x in _ov["seeds"]
+                    if x.get("is_free") and x.get("free_until") and x["free_until"] > _now_ts)
+                if isinstance(_ov.get("my_ids"), (list, set)):
+                    _ov["my_ids"] = sorted(t for t in _ov["my_ids"] if t != _tid)
+                    _ov["my_seeding"] = len(_ov["my_ids"])
+                _ov["ts"] = _now_ts
+        except Exception:
+            pass
+        return {"success": True, "message": f"已从 {'、'.join(done_dls)} 删除 {total_deleted} 个任务"}
 
     def api_panel(self):
         """工作台单文件 HTML 页。"""
