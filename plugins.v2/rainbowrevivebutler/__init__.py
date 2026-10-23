@@ -59,7 +59,7 @@ class RainbowReviveButler(_PluginBase):
     plugin_name = "彩虹岛复活区管家Q自用版"
     plugin_desc = "基于六个橙子「憨憨保种区管家」(HHClubButler) 架构复刻，致谢原作者 SixOrg。\n复活区全景 / 免费到期处置 / 复活推送 / 换种优选 / 做种到期提醒"
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/rainbowrevivebutler.png"
-    plugin_version = "1.7.15"
+    plugin_version = "1.7.16"
     plugin_label = "资源站点"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -395,7 +395,9 @@ class RainbowReviveButler(_PluginBase):
                 tid = m.group(1)
                 if tid in seen:
                     continue  # 页内去重：同一行/跨行重复链接防双计（跨页去重在 fetch 层）
-                tm = re.search(r'<a title="([^"]+)"\s+href="details\.php\?id=' + tid + '"', row)
+                # 数字边界锚（非引号锚）：实测 href 形如 id=54345&hit=1（id 后是 & 不是引号，
+                # 引号锚会全量匹配失败）；(?!\d) 防 tid=12 前缀误配 id=12345
+                tm = re.search(r'<a title="([^"]+)"\s+href="details\.php\?id=' + tid + r'(?!\d)', row)
                 title = tm.group(1).strip() if tm else ""
                 if not title:
                     continue  # 无 title 的链接（上传者/副链接）不算种子
