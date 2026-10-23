@@ -59,7 +59,7 @@ class RainbowReviveButler(_PluginBase):
     plugin_name = "彩虹岛复活区管家Q自用版"
     plugin_desc = "基于六个橙子「憨憨保种区管家」(HHClubButler) 架构复刻，致谢原作者 SixOrg。\n复活区全景 / 免费到期处置 / 复活推送 / 换种优选 / 做种到期提醒"
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/rainbowrevivebutler.png"
-    plugin_version = "1.7.4"
+    plugin_version = "1.7.5"
     plugin_label = "资源站点"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -2354,7 +2354,9 @@ class RainbowReviveButler(_PluginBase):
             elif days_list and not unknown:
                 days_txt = f"预计约 {math.ceil(max(days_list))} 天"
             elif days_list:
-                days_txt = f"最快约 {math.ceil(max(days_list))} 天（另有条件需手动）"
+                top = math.ceil(max(days_list))
+                days_txt = ("自动条件已达标，其余条件需手动满足" if top <= 0
+                            else f"最快约 {top} 天（另有条件需手动）")
             else:
                 days_txt = "采样积累中，暂无法预估"
             return {"maxed": False, "cur": cur_cn, "next": nn_cn, "next_key": nkey,
