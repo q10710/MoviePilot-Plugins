@@ -59,7 +59,7 @@ class RainbowReviveButler(_PluginBase):
     plugin_name = "彩虹岛复活区管家Q自用版"
     plugin_desc = "基于六个橙子「憨憨保种区管家」(HHClubButler) 架构复刻，致谢原作者 SixOrg。\n复活区全景 / 免费到期处置 / 复活推送 / 换种优选 / 做种到期提醒"
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/rainbowrevivebutler.png"
-    plugin_version = "1.7.9"
+    plugin_version = "1.7.10"
     plugin_label = "资源站点"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -662,12 +662,14 @@ class RainbowReviveButler(_PluginBase):
         except Exception:
             return ""
 
-    def _extract_seed_id_from_comment(self, comment: str) -> str:
+    def _extract_seed_id_from_comment(self, comment: str, site_domain: Optional[str] = None) -> str:
         """从下载器种子 comment 提取站点种子ID（形如 .../details.php?id=12345）。
 
         跨站转载种子的 comment 保留的是**原发布站** URL（如 cspt.top/details.php?id=N），
         直接取数字会得到错站 tid，可能与本站同号种子误配——comment 能解析出 host 时
         必须校验为本站域名才提取；无法解析 host（裸相对路径）才按原逻辑提取。未命中返回空串。
+
+        site_domain 由调用方在循环外取一次传入（TR 大库逐条调 _get_site_domain 是 O(N) 次 DB 查询）；缺省时退回内部获取。
         """
         try:
             c = comment or ""
@@ -677,8 +679,8 @@ class RainbowReviveButler(_PluginBase):
             if c.startswith(("http://", "https://")):
                 from urllib.parse import urlparse
                 host = (urlparse(c).hostname or "").lower()
-                site_domain = self._get_site_domain()
-                if host and site_domain and site_domain not in host:
+                domain = site_domain if site_domain is not None else self._get_site_domain()
+                if host and domain and domain not in host:
                     logger.debug(f"彩虹岛复活区管家：comment 为跨站 URL（{host}），跳过 tid 提取：{c[:80]}")
                     return ""
             return m.group(1)
@@ -709,7 +711,7 @@ class RainbowReviveButler(_PluginBase):
                                                       "rateDownload", "eta", "downloadDir", "status"])
                     for t in tts or []:
                         try:
-                            sid = self._extract_seed_id_from_comment(str(t.get("comment") or ""))
+                            sid = self._extract_seed_id_from_comment(str(t.get("comment") or ""), domain)
                             if sid:
                                 out.setdefault(sid, {
                                     "hash": str(t.get("hashString") or ""),
@@ -745,7 +747,7 @@ class RainbowReviveButler(_PluginBase):
                                     else str(getattr(p, "comment", "") or "")
                             except Exception:
                                 comment = ""
-                            sid = self._extract_seed_id_from_comment(comment)
+                            sid = self._extract_seed_id_from_comment(comment, domain)
                             if sid:
                                 out.setdefault(sid, {
                                     "hash": h,
@@ -1421,6 +1423,20 @@ class RainbowReviveButler(_PluginBase):
             # 推送历史（防重复 add 跨站转载种子：站点标题与任务名不同词、comment 是原站 URL，
             # 两级匹配都失效 → 每轮重复推送。推过即记住；误删后可面板手动补推）
             pushed_history: dict = self.get_data("pushed_history") or {}
+            # 读取时即裁剪（400 天过期+2000 条上限）：原逻辑只在有新推送时裁剪，
+            # 长期无推送会让陈旧条目无限滞留
+            _ph_now = time.time()
+            _ph_clean = {k: v for k, v in pushed_history.items()
+                         if isinstance(v, dict) and v.get("ts", 0) > _ph_now - 400 * 86400}
+            if len(_ph_clean) > 2000:
+                _ph_sk = sorted(_ph_clean, key=lambda k: _ph_clean[k].get("ts", 0))
+                _ph_clean = {k: _ph_clean[k] for k in _ph_sk[-2000:]}
+            if len(_ph_clean) != len(pushed_history):
+                pushed_history = _ph_clean
+                try:
+                    self.save_data("pushed_history", pushed_history)
+                except Exception:
+                    pass
             for s in pool:
                 if s.get("norm") in existing or str(s.get("tid")) in pushed_history:
                     filtered_in_dl += 1   # 已在下载器/已推送过 → 计入「已过滤 N 个」通知口径
@@ -2161,7 +2177,10 @@ class RainbowReviveButler(_PluginBase):
                     del_ids = []
                     for t in ts:
                         tn = self._norm_title(self._tf(t, "name", default=""))
-                        if tn == norm or (len(norm) >= 15 and (norm in tn or tn in norm)):
+                        # 守卫与 _fuzzy_match_norm 对齐（双向非空+≥15 字符）：空名任务的
+                        # `"" in norm` 恒 True、短名（如 "4k"）是标题子串也放行，都会误删无关任务
+                        if tn == norm or (tn and len(tn) >= 15 and len(norm) >= 15
+                                          and (norm in tn or tn in norm)):
                             del_ids.append(self._thash(t))
                 if not del_ids:
                     continue
@@ -2464,8 +2483,10 @@ class RainbowReviveButler(_PluginBase):
                     idx = i
                     break
             else:
-                for i, (key, _, _, _, _, _) in enumerate(self.LEVEL_RULES):
-                    kl = key.lower()
+                # 子串层反序（高级→低级）：NexusPHP 高级类名（EliteUser/CrazyUser/InsaneUser）
+                # 都带 User 后缀，正序会让 "user" 在 i=0 先命中，仅升到 Elite 及以上就会再次全错
+                for i in range(len(self.LEVEL_RULES) - 1, -1, -1):
+                    kl = self.LEVEL_RULES[i][0].lower()
                     if kl in uc or uc in kl:
                         idx = i
                         break
