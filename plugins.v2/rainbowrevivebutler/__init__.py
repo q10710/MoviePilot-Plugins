@@ -59,7 +59,7 @@ class RainbowReviveButler(_PluginBase):
     plugin_name = "彩虹岛复活区管家Q自用版"
     plugin_desc = "基于六个橙子「憨憨保种区管家」(HHClubButler) 架构复刻，致谢原作者 SixOrg。\n复活区全景 / 免费到期处置 / 复活推送 / 换种优选 / 做种到期提醒"
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/rainbowrevivebutler.png"
-    plugin_version = "1.7.3"
+    plugin_version = "1.7.4"
     plugin_label = "资源站点"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -2271,11 +2271,18 @@ class RainbowReviveButler(_PluginBase):
         try:
             uc = str(prof.get("user_class") or "").lower()
             idx = 0
+            # 两遍匹配：先精确等值，再子串兜底。
+            # 单遍子串会让 "user" in "poweruser" 先命中 User 规则，把 PowerUser 误判为未烧。
             for i, (key, _, _, _, _, _) in enumerate(self.LEVEL_RULES):
-                kl = key.lower()
-                if kl == uc or kl in uc or uc in kl:
+                if key.lower() == uc:
                     idx = i
                     break
+            else:
+                for i, (key, _, _, _, _, _) in enumerate(self.LEVEL_RULES):
+                    kl = key.lower()
+                    if kl in uc or uc in kl:
+                        idx = i
+                        break
             if idx >= len(self.LEVEL_RULES) - 1:
                 return {"maxed": True, "cur": self.LEVEL_RULES[idx][1]}
             _, cur_cn, _, _, _, _ = self.LEVEL_RULES[idx]
