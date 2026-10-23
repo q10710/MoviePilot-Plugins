@@ -59,7 +59,7 @@ class RainbowReviveButler(_PluginBase):
     plugin_name = "彩虹岛复活区管家Q自用版"
     plugin_desc = "基于六个橙子「憨憨保种区管家」(HHClubButler) 架构复刻，致谢原作者 SixOrg。\n复活区全景 / 免费到期处置 / 复活推送 / 换种优选 / 做种到期提醒"
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/rainbowrevivebutler.png"
-    plugin_version = "1.7.7"
+    plugin_version = "1.7.8"
     plugin_label = "资源站点"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -628,16 +628,26 @@ class RainbowReviveButler(_PluginBase):
         except Exception:
             return ""
 
-    @staticmethod
-    def _extract_seed_id_from_comment(comment: str) -> str:
+    def _extract_seed_id_from_comment(self, comment: str) -> str:
         """从下载器种子 comment 提取站点种子ID（形如 .../details.php?id=12345）。
 
-        通用正则（不限域名）：NexusPHP 站点常把详情页 URL 写进种子 comment，
-        提取到的数字即站点 tid，可作精确匹配主键。未命中返回空串。
+        跨站转载种子的 comment 保留的是**原发布站** URL（如 cspt.top/details.php?id=N），
+        直接取数字会得到错站 tid，可能与本站同号种子误配——comment 能解析出 host 时
+        必须校验为本站域名才提取；无法解析 host（裸相对路径）才按原逻辑提取。未命中返回空串。
         """
         try:
-            m = re.search(r"details\.php\?id=(\d+)", comment or "", re.I)
-            return m.group(1) if m else ""
+            c = comment or ""
+            m = re.search(r"details\.php\?id=(\d+)", c, re.I)
+            if not m:
+                return ""
+            if c.startswith(("http://", "https://")):
+                from urllib.parse import urlparse
+                host = (urlparse(c).hostname or "").lower()
+                site_domain = self._get_site_domain()
+                if host and site_domain and site_domain not in host:
+                    logger.debug(f"彩虹岛复活区管家：comment 为跨站 URL（{host}），跳过 tid 提取：{c[:80]}")
+                    return ""
+            return m.group(1)
         except Exception:
             return ""
 
@@ -1354,9 +1364,12 @@ class RainbowReviveButler(_PluginBase):
             cands: List[dict] = []
             cand_norms: set = set()
             filtered_in_dl = 0
+            # 推送历史（防重复 add 跨站转载种子：站点标题与任务名不同词、comment 是原站 URL，
+            # 两级匹配都失效 → 每轮重复推送。推过即记住；误删后可面板手动补推）
+            pushed_history: dict = self.get_data("pushed_history") or {}
             for s in pool:
-                if s.get("norm") in existing:
-                    filtered_in_dl += 1   # 已在下载器 → 计入「已过滤 N 个」通知口径
+                if s.get("norm") in existing or str(s.get("tid")) in pushed_history:
+                    filtered_in_dl += 1   # 已在下载器/已推送过 → 计入「已过滤 N 个」通知口径
                     continue
                 if (not s["norm"] or s["norm"] in cand_norms or s["tid"] in my_ids):
                     continue
@@ -1388,8 +1401,10 @@ class RainbowReviveButler(_PluginBase):
             base = self._get_site_url()
             cookie = self._get_site_cookie()
             fail_count = 0
+            # 推送历史在 cands 过滤段已读（pushed_history），此处只收集本轮成功推送
+            pushed_now: List[str] = []
             for s in res.get("picked", []):
-                if s["norm"] in existing or s["tid"] in my_ids:
+                if s["norm"] in existing or s["tid"] in my_ids or str(s["tid"]) in pushed_history:
                     continue
                 url = f"{base}/download.php?id={s['tid']}"
                 try:
@@ -1422,6 +1437,7 @@ class RainbowReviveButler(_PluginBase):
                         time.sleep(1)  # 推送间隔（HH 同款），防打爆下载器/站点
                         continue
                     out.append(s)
+                    pushed_now.append(str(s["tid"]))
                     existing.add(s["norm"])  # 推送成功即入清单，防同 norm 后续候选重复推送
                     logger.info(f"彩虹岛复活区管家：自动下载 {s['title'][:50]}（{s['size_gb']:.1f}GB → {self._push_downloader}）")
                 except Exception as e:
@@ -1429,6 +1445,22 @@ class RainbowReviveButler(_PluginBase):
                     self._last_fail_reasons.append(f"{s['title'][:40]}：{str(e)[:120]}")
                     logger.error(f"彩虹岛复活区管家：自动下载失败 {s['title'][:40]}：{e}")
                 time.sleep(1)  # 推送间隔（HH 同款），防打爆下载器/站点
+
+            # 落库推送历史（tid → {ts, title}，上限 2000 条、400 天自清）
+            if pushed_now:
+                try:
+                    _now_ts = time.time()
+                    for _tid in pushed_now:
+                        _s = next((x for x in res.get("picked", []) if str(x.get("tid")) == _tid), {})
+                        pushed_history[_tid] = {"ts": _now_ts, "title": (_s.get("title") or "")[:120]}
+                    pushed_history = {k: v for k, v in pushed_history.items()
+                                      if isinstance(v, dict) and v.get("ts", 0) > _now_ts - 400 * 86400}
+                    if len(pushed_history) > 2000:
+                        _sk = sorted(pushed_history, key=lambda k: pushed_history[k].get("ts", 0))
+                        pushed_history = {k: pushed_history[k] for k in _sk[-2000:]}
+                    self.save_data("pushed_history", pushed_history)
+                except Exception as e:
+                    logger.warning(f"彩虹岛复活区管家：写推送历史失败：{e}")
 
             # HH 同款优选完成汇总通知（有新增或淘汰才发，防 2 小时一轮刷屏）
             if self._notify and (out or evicted):
@@ -1572,7 +1604,7 @@ class RainbowReviveButler(_PluginBase):
         else:
             lines.append("无需新增下载")
             if getattr(self, "_last_filtered_n", 0):
-                lines.append(f"已过滤 {self._last_filtered_n} 个已在下载器的种子")
+                lines.append(f"已过滤 {self._last_filtered_n} 个已在下载器/推送过的种子")
         if evicted:
             lines.append(f"删除低档位种子：{len(evicted)} 个")
             for v in evicted[:5]:
