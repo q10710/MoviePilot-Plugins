@@ -59,7 +59,7 @@ class RainbowReviveButler(_PluginBase):
     plugin_name = "彩虹岛复活区管家Q自用版"
     plugin_desc = "基于六个橙子「憨憨保种区管家」(HHClubButler) 架构复刻，致谢原作者 SixOrg。\n复活区全景 / 免费到期处置 / 复活推送 / 换种优选 / 做种到期提醒"
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/rainbowrevivebutler.png"
-    plugin_version = "1.7.11"
+    plugin_version = "1.7.12"
     plugin_label = "资源站点"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -954,7 +954,7 @@ class RainbowReviveButler(_PluginBase):
                             key = f"hr:{seed['tid']}:{int(free_until)}"
                             if key not in dedupe:
                                 dedupe[key] = now
-                                hr_skipped.append(seed)
+                                hr_skipped.append(dict(seed, progress_pct=round(progress * 100, 1)))
                             continue
                         if not self._recheck_incomplete(sv, thash):
                             continue
@@ -1048,6 +1048,42 @@ class RainbowReviveButler(_PluginBase):
         except Exception as e:
             logger.warning(f"彩虹岛复活区管家：写处置日志失败：{e}")
 
+    def _check_hp_guard(self, session: requests.Session, base: str) -> Optional[int]:
+        """HP 守护：hnr.php 解析当前 HP，≤2 发预警（每值每天最多一条，防刷屏）。
+
+        注意页头「H&R:N」是当前违规计数，不是 HP 值；HP 在 hnr.php 页内
+        「您当前HP：N」。其他 NexusPHP 站文案不同，解析不到即跳过（fail-open）。
+        HP=0 下载受限且超 20 天自动封禁——低值预警优先级高。
+        """
+        try:
+            uid = getattr(self, "_uid_cache", "") or self._get_site_uid(session, base)
+            if not uid:
+                return None
+            r = self._get_with_retry(session, f"{base}/hnr.php?id={uid}", timeout=20)
+            m = re.search(r"您当前HP[:：]\s*(\d+)", r.text)
+            if not m:
+                return None
+            hp = int(m.group(1))
+            if hp <= 2 and self._notify:
+                dedupe = self.get_data("notify_dedupe") or {}
+                day = datetime.now().strftime("%Y%m%d")
+                key = f"hp:{hp}:{day}"
+                if key not in dedupe:
+                    dedupe[key] = time.time()
+                    try:
+                        self.save_data("notify_dedupe", dedupe)
+                    except Exception:
+                        pass
+                    self.post_message(
+                        title=f"【彩虹岛复活区管家】⚠️ 站点 HP 仅剩 {hp}，请尽快处理",
+                        text=("HP=0 账号将进入下载受限模式，且 HP=0 超过 20 天自动封禁！\n"
+                              "恢复方式：做种积分 50 万可兑 1 HP（hnr.php 页面操作；兑换不可恢复，请确认余量充足再兑）。\n"
+                              "HR 种下载≥50% 即计 H&R，保够时长（H3=72h/H5=120h/20天内）可免扣。"))
+            return hp
+        except Exception as e:
+            logger.debug(f"彩虹岛复活区管家：HP 守护查询失败（不影响主流程）：{e}")
+            return None
+
     def _notify_disposal(self, deleted, hr_skipped, warned, early_deleted, delete_failed=None):
         """到期处置相关通知（逐类一条，不刷屏）。"""
         try:
@@ -1060,10 +1096,12 @@ class RainbowReviveButler(_PluginBase):
                     title=f"【彩虹岛复活区管家】免费到期已删除 {len(deleted)+len(early_deleted)} 个任务",
                     text=("删除含数据文件" if self._delete_files else "仅删任务") + "，避免转为计费下载：\n" + "\n".join(lines))
             if hr_skipped:
-                lines = [f"  {s['title'][:60]}" for s in hr_skipped[:10]]
+                lines = [f"  {s['title'][:60]}（已下 {s.get('progress_pct', '?')}%）" for s in hr_skipped[:10]]
                 self.post_message(
                     title=f"【彩虹岛复活区管家】{len(hr_skipped)} 个 HR 种到期未删，转人工",
-                    text="HR 种不自动删除，请手动决定：\n" + "\n".join(lines))
+                    text=("HR 种不自动删除，请手动决定。注意：下载≥50%已计 H&R，删任务也无法免除——"
+                          "要么保够时长（H3=20天内72h / H5=20天内120h），要么接受扣 1 HP：\n"
+                          + "\n".join(lines)))
             if delete_failed:
                 try:
                     lines = [f"  {s['title'][:60]}（{s['size_gb']:.1f}GB）" for s in delete_failed[:10]]
@@ -1073,11 +1111,18 @@ class RainbowReviveButler(_PluginBase):
                 except Exception:
                     pass
             if warned:
+                # HR 种到期不自动删（转人工），从「将自动删除」列表分出，避免误导
+                warned_hr = [s for s in warned if s.get("hr")]
+                warned_norm = [s for s in warned if not s.get("hr")]
                 lines = [f"  {s['title'][:50]}（进度 {s.get('progress_pct', '?')}%，剩 {s.get('remain_min', '?')} 分钟）"
-                         for s in warned[:10]]
+                         for s in warned_norm[:10]]
+                if warned_hr:
+                    lines.append(f"⚠️ 其中 {len(warned_hr)} 个 HR 种到期不自动删、转人工：")
+                    lines += [f"  {s['title'][:50]}（进度 {s.get('progress_pct', '?')}%，剩 {s.get('remain_min', '?')} 分钟）"
+                              for s in warned_hr[:6]]
                 self.post_message(
                     title=f"【彩虹岛复活区管家】{len(warned)} 个免费下载即将到期",
-                    text=f"到期后仍未下完将自动删除（{self._warn_hours:g} 小时预警）：\n" + "\n".join(lines))
+                    text=f"到期后仍未下完，非 HR 种将自动删除（{self._warn_hours:g} 小时预警）：\n" + "\n".join(lines))
         except Exception as e:
             logger.error(f"彩虹岛复活区管家：发送通知失败：{e}")
 
@@ -1137,6 +1182,11 @@ class RainbowReviveButler(_PluginBase):
         if not my_ids_ok:
             logger.warning("彩虹岛复活区管家：我的做种视图拉取失败，本轮中止自动下载（防重复下载手动保种）")
         acct_stats = self._fetch_site_stats(session, base)
+        # HP 守护（hnr.php「您当前HP」解析，≤2 预警；每值每天一条）
+        try:
+            self._check_hp_guard(session, base)
+        except Exception as e:
+            logger.debug(f"彩虹岛复活区管家：HP 守护异常（不影响巡检）：{e}")
         portfolio = self._fetch_seeding_portfolio(session, base)
         # 做种积分增速
         try:
