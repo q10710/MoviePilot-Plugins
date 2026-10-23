@@ -56,7 +56,7 @@ class RainbowReviveButler(_PluginBase):
     plugin_name = "彩虹岛复活区管家Q自用版"
     plugin_desc = "基于六个橙子「憨憨保种区管家」(HHClubButler) 架构复刻，致谢原作者 SixOrg。\n复活区全景 / 免费到期处置 / 复活推送 / 换种优选 / 做种到期提醒"
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/rainbowrevivebutler.png"
-    plugin_version = "1.5.4"
+    plugin_version = "1.5.5"
     plugin_label = "资源站点"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -1528,10 +1528,13 @@ class RainbowReviveButler(_PluginBase):
         return {"success": True, "message": "巡检已启动，完成后通知"}
 
     def api_refresh(self):
-        """立即刷新概况快照（只读）。"""
+        """立即刷新概况快照（只读）。返回 MP 标准信封 {success,message,data}，否则前端提示「服务器返回了无效响应」。"""
         self._refresh_overview(manual=True)
         ov = self._last_overview or {}
-        return {"success": True, "total": ov.get("total", 0), "my_seeding": ov.get("my_seeding", 0)}
+        if self._last_overview_ts > 0:
+            return {"success": True, "message": "概况已刷新",
+                    "data": {"total": ov.get("total", 0), "my_seeding": ov.get("my_seeding", 0)}}
+        return {"success": False, "message": "概况刷新失败（站点不可达或 Cookie 失效）", "data": None}
 
     def api_data(self):
         """返回概况 + 种子列表 + 处置日志（工作台数据源）。"""
