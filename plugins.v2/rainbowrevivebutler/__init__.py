@@ -59,7 +59,7 @@ class RainbowReviveButler(_PluginBase):
     plugin_name = "彩虹岛复活区管家Q自用版"
     plugin_desc = "基于六个橙子「憨憨保种区管家」(HHClubButler) 架构复刻，致谢原作者 SixOrg。\n复活区全景 / 免费到期处置 / 复活推送 / 换种优选 / 做种到期提醒"
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/rainbowrevivebutler.png"
-    plugin_version = "1.7.10"
+    plugin_version = "1.7.11"
     plugin_label = "资源站点"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -2277,7 +2277,7 @@ class RainbowReviveButler(_PluginBase):
                     {"component": "VCol", "props": {"cols": 12, "md": 4},
                      "content": [{"component": "VTextField", "props": {
                          "model": "low_seeder_max", "label": "复活做种阈值（人）", "type": "number",
-                         "hint": "免费且做种≤N 推送；0=关闭复活", "persistent-hint": True}}]},
+                         "hint": "免费且当前做种人数≤N 的种子：开启自动下载时推送，未开启时仅提醒；0=关闭复活", "persistent-hint": True}}]},
                     {"component": "VCol", "props": {"cols": 12, "md": 4},
                      "content": [{"component": "VTextField", "props": {
                          "model": "auto_clean_days", "label": "僵尸任务清理（天）", "type": "number",
