@@ -59,7 +59,7 @@ class RainbowReviveButler(_PluginBase):
     plugin_name = "彩虹岛复活区管家Q自用版"
     plugin_desc = "基于六个橙子「憨憨保种区管家」(HHClubButler) 架构复刻，致谢原作者 SixOrg。\n复活区全景 / 免费到期处置 / 复活推送 / 换种优选 / 做种到期提醒"
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/rainbowrevivebutler.png"
-    plugin_version = "1.7.12"
+    plugin_version = "1.7.13"
     plugin_label = "资源站点"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -457,10 +457,13 @@ class RainbowReviveButler(_PluginBase):
         返回 None 表示拉取失败（与「真没做种」的空集区分），调用方据此中止自动下载防重复。
         """
         ids: set = set()
+        home_html = ""
         try:
             for page in range(5):
                 url = base + "/renewtorrents.php?spstate=1" + (f"&page={page}" if page else "")
                 r = self._get_with_retry(session, url, timeout=30)
+                if page == 0:
+                    home_html = r.text
                 # (?<!user) 排除 userdetails.php?id= 用户链接（其尾部与 details.php?id= 同形，会误抓页头/上传者 ID）
                 found = set(re.findall(r"(?<!user)details\.php\?id=(\d+)", r.text))
                 new = found - ids
@@ -468,6 +471,12 @@ class RainbowReviveButler(_PluginBase):
                     break
                 ids |= new
                 time.sleep(0.5)  # 页间限速（HH 同款），防站点限流
+            # Cookie 中途失效时 spstate=1 返回登录页 → findall 得空集，与「真没做种」不可区分，
+            # 会让自动下载失去「手动保种」防线。检测登录特征（密码框+登录表单）命中返回 None。
+            if not ids and re.search(r"<input[^>]+type=[\"']password[\"']", home_html, re.I) \
+                    and re.search(r"(?:takelogin|login)\.php", home_html, re.I):
+                logger.warning("彩虹岛复活区管家：我的做种视图疑似返回登录页（Cookie 失效），按拉取失败处理")
+                return None
             return ids
         except Exception as e:
             logger.warning(f"彩虹岛复活区管家：拉取我的做种视图失败：{e}")
@@ -888,6 +897,16 @@ class RainbowReviveButler(_PluginBase):
         返回统计 dict。异常向上抛由调用方处理。
         """
         if not self._dispose_lock.acquire(blocking=False):
+            if not quick:
+                # cron 巡检路径：守护线程处置每 5 分钟一轮持锁约 5-20s，撞锁概率约 7%——
+                # 90 秒后重试一次，仍拿不到才返回 skipped（2h 巡检周期下多等 90s 无副作用）
+                logger.info("彩虹岛复活区管家：上一轮处置持有锁，90 秒后重试一次")
+                time.sleep(90)
+                if self._dispose_lock.acquire(blocking=False):
+                    try:
+                        return self._dispose_pass_locked(notify=notify, quick=quick)
+                    finally:
+                        self._dispose_lock.release()
             # 另一轮处置进行中：跳过本轮，防 dedupe/日志并发丢写与双通知
             # skipped 标记让巡检方区分「跳过」与「真空」，不覆盖看板快照
             return {"seeds": [], "pages": 0, "deleted": [], "hr_skipped": [],
@@ -978,27 +997,28 @@ class RainbowReviveButler(_PluginBase):
                             dedupe[key] = now
                             warned.append({**seed, "progress_pct": round(progress * 100, 1),
                                            "remain_min": round(remain_sec / 60)})
-                        if self._early_delete:
-                            speed = float(self._tf(t, "dlspeed", "rateDownload", "downloadSpeed", default=0) or 0)
-                            size_b = float(self._tf(t, "size", "totalSize", default=0) or 0)
-                            if speed > 0 and size_b > 0:
-                                eta = size_b * (1 - progress) / speed
-                                if eta > remain_sec and not seed.get("hr"):
-                                    if not self._recheck_incomplete(sv, thash):
-                                        continue
-                                    ok = self._delete_task(sv, thash, dl_name)
-                                    entry = {"time": int(now), "tid": seed["tid"], "title": seed["title"],
-                                             "size_gb": seed["size_gb"], "progress": round(progress * 100, 1),
-                                             "downloader": dl_name, "action": "early_delete", "ok": ok}
-                                    self._append_disposal(entry)
-                                    if ok:
-                                        early_deleted.append(seed)
-                                    else:
-                                        fkey = f"delfail:{seed['tid']}:{int(free_until)}"
-                                        if fkey not in dedupe:
-                                            dedupe[fkey] = now
-                                            delete_failed.append(seed)
-                                    logger.info(f"彩虹岛复活区管家：预计完不成提前删 {seed['title'][:50]}（ETA {eta/60:.0f}min > 剩余 {remain_sec/60:.0f}min）成功={ok}")
+                    # 提前删独立于预警窗口：原嵌套在 warn 窗口内，warn_hours=0 会连带静默关闭提前删
+                    if self._early_delete and remain_sec > 0:
+                        speed = float(self._tf(t, "dlspeed", "rateDownload", "downloadSpeed", default=0) or 0)
+                        size_b = float(self._tf(t, "size", "totalSize", default=0) or 0)
+                        if speed > 0 and size_b > 0:
+                            eta = size_b * (1 - progress) / speed
+                            if eta > remain_sec and not seed.get("hr"):
+                                if not self._recheck_incomplete(sv, thash):
+                                    continue
+                                ok = self._delete_task(sv, thash, dl_name)
+                                entry = {"time": int(now), "tid": seed["tid"], "title": seed["title"],
+                                         "size_gb": seed["size_gb"], "progress": round(progress * 100, 1),
+                                         "downloader": dl_name, "action": "early_delete", "ok": ok}
+                                self._append_disposal(entry)
+                                if ok:
+                                    early_deleted.append(seed)
+                                else:
+                                    fkey = f"delfail:{seed['tid']}:{int(free_until)}"
+                                    if fkey not in dedupe:
+                                        dedupe[fkey] = now
+                                        delete_failed.append(seed)
+                                logger.info(f"彩虹岛复活区管家：预计完不成提前删 {seed['title'][:50]}（ETA {eta/60:.0f}min > 剩余 {remain_sec/60:.0f}min）成功={ok}")
                 except Exception as e:
                     logger.warning(f"彩虹岛复活区管家：处理任务出错：{e}")
                     continue
@@ -1487,6 +1507,40 @@ class RainbowReviveButler(_PluginBase):
                     self.save_data("pushed_history", pushed_history)
                 except Exception:
                     pass
+            # B2 假成功提示：推送记录超 6 小时仍不在下载器 comment 映射与做种列表。
+            # 无法区分「add_torrent 假成功」与「用户手动删除」→ 不自动移出历史（保留拦截防
+            # 重复推送，避免与手动删除意图打架），只提示一次（phck:{tid} 终身一条）供人工核实。
+            try:
+                _ph_now = time.time()
+                _stale = [k for k, v in pushed_history.items()
+                          if isinstance(v, dict) and v.get("ts", 0) < _ph_now - 6 * 3600]
+                if _stale:
+                    _dl_tids = None
+                    try:
+                        _dl_tids = set(self._get_downloader_seed_map(scan).keys())
+                    except Exception:
+                        pass  # 下载器查询失败时不判，防误报
+                    if _dl_tids is not None:
+                        _ph_dedupe = self.get_data("notify_dedupe") or {}
+                        for _tid in _stale:
+                            if _tid in my_ids or _tid in _dl_tids:
+                                continue
+                            _v = pushed_history[_tid]
+                            _t = (_v.get("title") or _tid)[:60]
+                            self._save_log([f"推送历史提示：{_t} 推送后未在下载器找到（可能未生效或已手动删除），保持拦截防重复"])
+                            if self._notify and f"phck:{_tid}" not in _ph_dedupe:
+                                _ph_dedupe[f"phck:{_tid}"] = _ph_now
+                                try:
+                                    self.save_data("notify_dedupe", _ph_dedupe)
+                                except Exception:
+                                    pass
+                                self.post_message(
+                                    title="【彩虹岛复活区管家】1 个推送记录未在下载器找到",
+                                    text=(f"{(_v.get('title') or _tid)[:80]}\n"
+                                          "推送后 6 小时未在下载器/做种列表找到该任务（可能推送未生效，或已被手动删除）。\n"
+                                          "已保持推送拦截防重复下载；如需重新下载请手动处理。"))
+            except Exception as e:
+                logger.debug(f"彩虹岛复活区管家：推送历史校验异常（不影响主流程）：{e}")
             for s in pool:
                 if s.get("norm") in existing or str(s.get("tid")) in pushed_history:
                     filtered_in_dl += 1   # 已在下载器/已推送过 → 计入「已过滤 N 个」通知口径
