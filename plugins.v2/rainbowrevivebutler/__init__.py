@@ -56,7 +56,7 @@ class RainbowReviveButler(_PluginBase):
     plugin_name = "彩虹岛复活区管家Q自用版"
     plugin_desc = "基于六个橙子「憨憨保种区管家」(HHClubButler) 架构复刻，致谢原作者 SixOrg。\n复活区全景 / 免费到期处置 / 复活推送 / 换种优选 / 做种到期提醒"
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/rainbowrevivebutler.png"
-    plugin_version = "1.5.6"
+    plugin_version = "1.6.0"
     plugin_label = "资源站点"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -75,6 +75,7 @@ class RainbowReviveButler(_PluginBase):
     _early_delete: bool = True
     _low_seeder_max: int = 3
     _dispose_minutes: float = 5.0
+    _auto_clean_days: int = 0
     # 复活自动下载
     _auto_download: bool = False
     _push_downloader: str = ""
@@ -128,6 +129,10 @@ class RainbowReviveButler(_PluginBase):
             self._dispose_minutes = max(1.0, float(config.get("dispose_minutes", 5) or 5))
         except (TypeError, ValueError):
             self._dispose_minutes = 5.0
+        try:
+            self._auto_clean_days = max(0, min(365, int(config.get("auto_clean_days", 0) or 0)))
+        except (TypeError, ValueError):
+            self._auto_clean_days = 0
         self._auto_download = bool(config.get("auto_download", False))
         self._push_downloader = str(config.get("push_downloader") or "")
         self._save_path = str(config.get("save_path") or "")
@@ -154,6 +159,7 @@ class RainbowReviveButler(_PluginBase):
                 "downloaders": self._downloaders, "warn_hours": self._warn_hours,
                 "delete_files": self._delete_files, "early_delete": self._early_delete,
                 "low_seeder_max": self._low_seeder_max, "dispose_minutes": self._dispose_minutes,
+                "auto_clean_days": self._auto_clean_days,
                 "auto_download": self._auto_download, "push_downloader": self._push_downloader,
                 "save_path": self._save_path, "tag": self._tag, "target_volume": self._target_volume,
                 "mode": self._mode,
@@ -544,6 +550,176 @@ class RainbowReviveButler(_PluginBase):
             return str(t.get("hash") or t.get("hashString") or "")
         return str(getattr(t, "hash", None) or getattr(t, "hashString", "") or "")
 
+    def _get_site_domain(self) -> str:
+        """取站点主机名（如 ptchdbits.co），供下载器 comment/tracker 过滤用。"""
+        try:
+            from urllib.parse import urlparse
+            host = urlparse(self._get_site_url() or "").hostname or ""
+            return host.lower()
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _extract_seed_id_from_comment(comment: str) -> str:
+        """从下载器种子 comment 提取站点种子ID（形如 .../details.php?id=12345）。
+
+        通用正则（不限域名）：NexusPHP 站点常把详情页 URL 写进种子 comment，
+        提取到的数字即站点 tid，可作精确匹配主键。未命中返回空串。
+        """
+        try:
+            m = re.search(r"details\.php\?id=(\d+)", comment or "", re.I)
+            return m.group(1) if m else ""
+        except Exception:
+            return ""
+
+    def _get_downloader_seed_map(self, svcs: dict) -> Dict[str, dict]:
+        """从受管下载器种子 comment 提取 {种子ID(tid): {hash, name, downloader}}，零站点请求。
+
+        TR：一次 RPC 带 comment 字段；QB：先按站点 tracker 过滤，再定向查 properties 的 comment
+        （避免对全部种子逐个发 properties 请求）。comment 未带 tid 的站点返回空映射，
+        调用方回退标题匹配，零回归。
+        """
+        out: Dict[str, dict] = {}
+        domain = self._get_site_domain()
+        for dl_name, sv in (svcs or {}).items():
+            dl_type = ""
+            try:
+                dl_type = str(getattr(sv, "type", "") or getattr(getattr(sv, "config", None), "type", "") or "").lower()
+            except Exception:
+                dl_type = ""
+            try:
+                if "transmission" in dl_type:
+                    trc = getattr(sv.instance, "trc", None)
+                    if trc is None:
+                        continue
+                    tts = trc.get_torrents(arguments=["id", "name", "hashString", "comment", "percentDone"])
+                    for t in tts or []:
+                        try:
+                            sid = self._extract_seed_id_from_comment(str(t.get("comment") or ""))
+                            if sid:
+                                out.setdefault(sid, {
+                                    "hash": str(t.get("hashString") or ""),
+                                    "name": str(t.get("name") or ""),
+                                    "downloader": dl_name,
+                                })
+                        except Exception:
+                            continue
+                elif "qbittorrent" in dl_type:
+                    qbc = getattr(sv.instance, "qbc", None)
+                    if qbc is None:
+                        continue
+                    infos = qbc.torrents_info()
+                    for it in infos or []:
+                        try:
+                            tracker = str(it.get("tracker") or "").lower()
+                            if domain and domain not in tracker:
+                                continue  # 非本站 tracker 不查 comment（省请求）
+                            h = str(it.get("hash") or "")
+                            if not h:
+                                continue
+                            comment = ""
+                            try:
+                                p = qbc.torrents_properties(torrent_hash=h)
+                                comment = str(p.get("comment") or "") if isinstance(p, dict) \
+                                    else str(getattr(p, "comment", "") or "")
+                            except Exception:
+                                comment = ""
+                            sid = self._extract_seed_id_from_comment(comment)
+                            if sid:
+                                out.setdefault(sid, {
+                                    "hash": h,
+                                    "name": str(it.get("name") or ""),
+                                    "downloader": dl_name,
+                                })
+                        except Exception:
+                            continue
+            except Exception as e:
+                logger.warning(f"彩虹岛复活区管家：下载器 {dl_name} comment 提取种子ID失败：{e}")
+                continue
+        return out
+
+    def _clean_stale_downloads(self, seeds: List[dict]) -> int:
+        """清理僵尸任务：本站 tracker 或标题命中复活列表 + 未完成 + 超 auto_clean_days 天 → 连文件删除。
+
+        仅在 auto_clean_days>0 时被调用；按下载器分组批量删，删除后各自复核计数。
+        """
+        if not self._auto_clean_days or self._auto_clean_days <= 0:
+            return 0
+        svcs = self._get_manage_services()
+        if not svcs:
+            return 0
+        domain = self._get_site_domain()
+        try:
+            site_titles = {self._norm_title(s.get("title") or "") for s in (seeds or [])}
+        except Exception:
+            site_titles = set()
+        now = time.time()
+        threshold = self._auto_clean_days * 86400
+        total_deleted = 0
+        per_dl: Dict[str, int] = {}
+        for name, sv in svcs.items():
+            try:
+                torrents, error = sv.instance.get_torrents()
+            except Exception:
+                continue
+            if error or not torrents:
+                continue
+            stale = []
+            for t in torrents:
+                try:
+                    tname = str(self._tf(t, "name", default="") or "")
+                    progress = self._tf(t, "progress", "percentDone", default=0) or 0
+                    added = self._tf(t, "added_on", "added_time", "added_date", default=0) or 0
+                    thash = self._thash(t)
+                    tracker = str(self._tf(t, "tracker", "trackerList", default="") or "").lower()
+                except Exception:
+                    continue
+                is_site = bool(domain and domain in tracker)
+                if not is_site and site_titles:
+                    n = self._norm_title(tname)
+                    if n and n in site_titles:
+                        is_site = True
+                if not is_site:
+                    continue
+                try:
+                    progress = float(progress)
+                except (TypeError, ValueError):
+                    progress = 1.0
+                if progress > 1.0:
+                    progress /= 100.0
+                if progress >= 1.0:
+                    continue  # 已完成（在保）不动
+                try:
+                    if hasattr(added, "timestamp"):
+                        added = added.timestamp()
+                    added = float(added)
+                except (TypeError, ValueError, OSError, OverflowError):
+                    added = 0.0
+                if added <= 0:
+                    continue
+                if now - added >= threshold and thash:
+                    stale.append((thash, tname))
+            if not stale:
+                continue
+            ids = [th for th, _ in stale]
+            try:
+                sv.instance.delete_torrents(delete_file=self._delete_files, ids=ids)
+                # 复核：仍存在的不算已删
+                ts, err = sv.instance.get_torrents()
+                remain = set()
+                if not err and ts:
+                    remain = {self._thash(x) for x in ts}
+                done = sum(1 for th in ids if th not in remain)
+                total_deleted += done
+                per_dl[name] = done
+            except Exception as e:
+                logger.warning(f"彩虹岛复活区管家：僵尸任务清理（下载器 {name}）失败：{e}")
+        if per_dl:
+            detail = "，".join(f"{k} {v} 个" for k, v in per_dl.items())
+            logger.info(f"彩虹岛复活区管家：僵尸清理——删除 {total_deleted} 个超 {self._auto_clean_days} 天未完成任务"
+                        f"（含文件={self._delete_files}，{detail}）")
+        return total_deleted
+
     # ------------------------------------------------------------------ #
     # 核心：到期处置（守护线程与巡检共用）
     # ------------------------------------------------------------------ #
@@ -860,6 +1036,13 @@ class RainbowReviveButler(_PluginBase):
             if pool:
                 downloaded, evicted = self._auto_download_deals(seeds, pool, my_ids, now)
 
+        # 僵尸任务清理（HH 同款，auto_clean_days>0 时启用）：本站未完成且超N天连文件删
+        if self._auto_clean_days and self._auto_clean_days > 0:
+            try:
+                self._clean_stale_downloads(seeds)
+            except Exception as e:
+                logger.warning(f"彩虹岛复活区管家：僵尸任务清理异常：{e}")
+
         if self._notify:
             if seeding_expiring:
                 try:
@@ -929,8 +1112,22 @@ class RainbowReviveButler(_PluginBase):
                 return out, evicted
 
             by_norm: Dict[str, dict] = {}
+            by_tid: Dict[str, dict] = {}
             for s in seeds:
                 by_norm.setdefault(s["norm"], s)
+                if s.get("tid"):
+                    by_tid[str(s["tid"])] = s
+            # seed_id 精确匹配（HH 同款）：从下载器 comment 提取站点 tid→infohash 映射，
+            # 命中则按 tid 精确对应复活种子，未命中回退标题匹配（comment 未带 tid 时零回归）。
+            hash_to_seed: Dict[str, dict] = {}
+            try:
+                for _sid, _info in (self._get_downloader_seed_map(scan) or {}).items():
+                    _sd = by_tid.get(str(_sid))
+                    _h = str(_info.get("hash") or "")
+                    if _sd is not None and _h:
+                        hash_to_seed[_h] = _sd
+            except Exception as e:
+                logger.warning(f"彩虹岛复活区管家：seed_id 映射构建失败，回退标题匹配：{e}")
 
             # 1) 扫描下载器：已有任务（去重）/ 当前在保（复活区已完成）/ 在途（未完成）
             existing: set = set()
@@ -946,11 +1143,14 @@ class RainbowReviveButler(_PluginBase):
                 if error or not torrents:
                     continue
                 for t in torrents:
-                    norm = self._norm_title(self._tf(t, "name", default=""))
+                    _th0 = self._thash(t)
+                    seed = hash_to_seed.get(_th0) if _th0 else None
+                    norm = seed["norm"] if seed is not None else self._norm_title(self._tf(t, "name", default=""))
                     if not norm:
                         continue
                     existing.add(norm)
-                    seed = by_norm.get(norm)
+                    if seed is None:
+                        seed = by_norm.get(norm)
                     if not seed:
                         continue
                     # 目录范围对在途/已完成统一生效（防在途占预算、下完又不计入的口径漂移）
@@ -1038,10 +1238,26 @@ class RainbowReviveButler(_PluginBase):
                 url = f"{base}/download.php?id={s['tid']}"
                 try:
                     # add_torrent 返回 (成功标志, 任务标识列表)，失败时 (False, [])
-                    result = sv_push.instance.add_torrent(
-                        content=url, cookie=cookie,
-                        download_dir=(self._save_path or None),
-                        tag=(self._tag or None))
+                    # 修复跨盘/自定义保存路径不生效：qBittorrent 开启自动种子管理时会忽略传入的
+                    # save_path，导致填了其他盘的路径仍落在默认盘。对 qBittorrent 显式关闭自动管理
+                    # （ignore_category_check=False），使下载目录严格按"保存路径"配置生效；
+                    # Transmission 无此问题，透传即可。
+                    _dl_l = ""
+                    try:
+                        _dl_l = str(getattr(sv_push, "type", "")
+                                    or getattr(getattr(sv_push, "config", None), "type", "") or "").lower()
+                    except Exception:
+                        _dl_l = ""
+                    if "qbittorrent" in _dl_l:
+                        result = sv_push.instance.add_torrent(
+                            content=url, cookie=cookie,
+                            download_dir=(self._save_path or None),
+                            tag=(self._tag or None), ignore_category_check=False)
+                    else:
+                        result = sv_push.instance.add_torrent(
+                            content=url, cookie=cookie,
+                            download_dir=(self._save_path or None),
+                            tag=(self._tag or None))
                     ok = result[0] if isinstance(result, tuple) else bool(result)
                     if not ok:
                         fail_count += 1
@@ -1683,6 +1899,10 @@ class RainbowReviveButler(_PluginBase):
                          "model": "low_seeder_max", "label": "复活做种阈值（人）", "type": "number",
                          "hint": "免费且做种≤N 推送；0=关闭复活", "persistent-hint": True}}]},
                     {"component": "VCol", "props": {"cols": 12, "md": 4},
+                     "content": [{"component": "VTextField", "props": {
+                         "model": "auto_clean_days", "label": "僵尸任务清理（天）", "type": "number",
+                         "hint": "本站未完成且超N天的任务连文件删除；0=关闭", "persistent-hint": True}}]},
+                    {"component": "VCol", "props": {"cols": 12, "md": 4},
                      "content": [{"component": "VSelect", "props": {
                          "model": "downloaders", "label": "管理下载器（多选）",
                          "items": downloaders, "multiple": True, "chips": True,
@@ -1731,7 +1951,7 @@ class RainbowReviveButler(_PluginBase):
             "enabled": False, "onlyonce": False, "notify": True,
             "cron": "0 */2 * * *", "site_name": "彩虹岛", "downloaders": [],
             "warn_hours": 2, "delete_files": True, "early_delete": True,
-            "low_seeder_max": 3, "dispose_minutes": 5,
+            "low_seeder_max": 3, "dispose_minutes": 5, "auto_clean_days": 0,
             "auto_download": False, "push_downloader": "", "save_path": "",
             "tag": "", "target_volume": 0, "mode": "incremental",
         }
