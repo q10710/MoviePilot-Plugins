@@ -59,7 +59,7 @@ class RainbowReviveButler(_PluginBase):
     plugin_name = "彩虹岛复活区管家Q自用版"
     plugin_desc = "基于六个橙子「憨憨保种区管家」(HHClubButler) 架构复刻，致谢原作者 SixOrg。\n复活区全景 / 免费到期处置 / 复活推送 / 换种优选 / 做种到期提醒"
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/rainbowrevivebutler.png"
-    plugin_version = "1.7.6"
+    plugin_version = "1.7.7"
     plugin_label = "资源站点"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -2523,9 +2523,10 @@ class RainbowReviveButler(_PluginBase):
             _saved_days = int(_saved_days or 15)
         except Exception:
             _saved_days = 15
-        if persist is not None:
-            _pd = max(1, min(30, int(persist)))
+        if persist is not None and days is not None:
+            _pd = max(1, min(30, int(days)))
             self.save_data("stats_range", {"days": _pd})
+            _saved_days = _pd
             return HTMLResponse(content="")
         view_days = max(1, min(30, int(days))) if days else _saved_days
         hist = self.get_data("credit_history") or []
