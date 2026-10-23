@@ -59,7 +59,7 @@ class RainbowReviveButler(_PluginBase):
     plugin_name = "彩虹岛复活区管家Q自用版"
     plugin_desc = "基于六个橙子「憨憨保种区管家」(HHClubButler) 架构复刻，致谢原作者 SixOrg。\n复活区全景 / 免费到期处置 / 复活推送 / 换种优选 / 做种到期提醒"
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/rainbowrevivebutler.png"
-    plugin_version = "1.7.8"
+    plugin_version = "1.7.9"
     plugin_label = "资源站点"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -149,6 +149,10 @@ class RainbowReviveButler(_PluginBase):
             self._mode = "incremental"
 
         self._dispose_lock = threading.RLock()
+        # 巡检互斥锁：_running 是 check-then-set（TOCTOU），cron 与命令/api_run 同秒触发可双跑；
+        # 用非阻塞锁拿不到即跳过，杜绝同一候选在 pushed_history 落库前被推两次（HH 模块级 lock 同款语义）
+        self._run_lock = threading.Lock()
+        self._uid_cache = ""  # 站点 UID 实例级内存缓存（省每轮重复抓首页）
         self._start_guard_thread()
 
         if self._onlyonce:
@@ -286,11 +290,18 @@ class RainbowReviveButler(_PluginBase):
         return (site.url or "").rstrip("/") if site else ""
 
     def _session(self, cookie: str) -> requests.Session:
-        """构建带 Cookie 的会话。"""
+        """构建带 Cookie 的会话；UA 优先继承 MP 站点管理该站点配置（HH 同款），无则回退默认。"""
         s = requests.Session()
-        s.headers["User-Agent"] = (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/120.0 Safari/537.36")
+        ua = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/120.0 Safari/537.36")
+        try:
+            site = self._get_mp_site()
+            site_ua = (getattr(site, "ua", "") or "").strip() if site else ""
+            if site_ua:
+                ua = site_ua
+        except Exception:
+            pass
+        s.headers["User-Agent"] = ua
         for part in cookie.split(";"):
             if "=" in part:
                 k, v = part.split("=", 1)
@@ -463,11 +474,20 @@ class RainbowReviveButler(_PluginBase):
             return None
 
     def _get_site_uid(self, session: requests.Session, base: str) -> Optional[str]:
-        """从首页解析当前登录用户 UID（做种组合接口需要）。"""
+        """从首页解析当前登录用户 UID（做种组合接口需要）。
+
+        实例级内存缓存：UID 进程内不变，缓存后省每轮 2-3 次首页请求（HH 是写回配置持久化，
+        内存级更保守——Cookie 失效重建会话后也不需手动清缓存，重新抓一次即可）。
+        """
+        if getattr(self, "_uid_cache", ""):
+            return self._uid_cache
         try:
             r = self._get_with_retry(session, base + "/", timeout=20)
             m = re.search(r"userdetails\.php\?id=(\d+)", r.text)
-            return m.group(1) if m else None
+            uid = m.group(1) if m else None
+            if uid:
+                self._uid_cache = uid
+            return uid
         except Exception as e:
             logger.warning(f"彩虹岛复活区管家：解析 UID 失败：{e}")
             return None
@@ -569,6 +589,20 @@ class RainbowReviveButler(_PluginBase):
     # ------------------------------------------------------------------ #
     # 下载器层
     # ------------------------------------------------------------------ #
+    @staticmethod
+    def _inst_inactive(inst) -> bool:
+        """下载器实例是否已停用（HH 同款防御）：跳过对停用下载器的 RPC 调用。
+
+        is_inactive 在不同适配器上可能是方法或属性，缺失一律视为活跃（不误杀）。
+        """
+        try:
+            flag = getattr(inst, "is_inactive", None)
+            if flag is None:
+                return False
+            return bool(flag() if callable(flag) else flag)
+        except Exception:
+            return False
+
     def _get_manage_services(self) -> dict:
         """获取配置的（受管控）下载器服务。"""
         if not self._downloaders:
@@ -586,7 +620,7 @@ class RainbowReviveButler(_PluginBase):
                     sv = got.get(name) if got else None
                 except Exception:
                     sv = None
-            if sv and getattr(sv, "instance", None):
+            if sv and getattr(sv, "instance", None) and not self._inst_inactive(sv.instance):
                 out[name] = sv
         return out
 
@@ -597,7 +631,7 @@ class RainbowReviveButler(_PluginBase):
         try:
             sv = DownloaderHelper().get_services(name_filters=[self._push_downloader])
             sv = sv.get(self._push_downloader) if sv else None
-            if sv and getattr(sv, "instance", None):
+            if sv and getattr(sv, "instance", None) and not self._inst_inactive(sv.instance):
                 return sv
         except Exception:
             pass
@@ -763,7 +797,13 @@ class RainbowReviveButler(_PluginBase):
                     progress = self._tf(t, "progress", "percentDone", default=0) or 0
                     added = self._tf(t, "added_on", "added_time", "added_date", default=0) or 0
                     thash = self._thash(t)
-                    tracker = str(self._tf(t, "tracker", "trackerList", default="") or "").lower()
+                    # tracker 多字段拼取（HH _extract_tracker_text 同款语义）：TR 默认 RPC
+                    # 字段里 tracker 可能为空，合并 trackers/trackerList/magnet_uri 兜底，
+                    # 否则只剩标题匹配
+                    tracker = " ".join(
+                        str(self._tf(t, k, default="") or "")
+                        for k in ("tracker", "trackers", "trackerList", "magnet_uri")
+                    ).lower()
                 except Exception:
                     continue
                 is_site = bool(domain and domain in tracker)
@@ -1044,7 +1084,16 @@ class RainbowReviveButler(_PluginBase):
     # ------------------------------------------------------------------ #
     def run(self):
         """巡检入口（Cron 驱动）。"""
-        if self._running:
+        _lock = getattr(self, "_run_lock", None)
+        if _lock is not None and not _lock.acquire(blocking=False):
+            logger.info("彩虹岛复活区管家正在运行中，跳过本次触发")
+            return
+        if self._running:  # 兜底（极端残留）：已置位则释放刚拿到的锁后跳过
+            if _lock is not None:
+                try:
+                    _lock.release()
+                except RuntimeError:
+                    pass
             logger.info("彩虹岛复活区管家正在运行中，跳过本次触发")
             return
         self._running = True
@@ -1061,6 +1110,11 @@ class RainbowReviveButler(_PluginBase):
                     pass
         finally:
             self._running = False
+            if _lock is not None:
+                try:
+                    _lock.release()
+                except RuntimeError:
+                    pass
 
     def _do_run(self):
         """巡检主逻辑：到期处置 + 全景 + 复活 + 做种到期提醒 + 自动下载。"""
@@ -1160,7 +1214,7 @@ class RainbowReviveButler(_PluginBase):
                 try:
                     self.post_message(
                         title=f"【彩虹岛复活区管家】清理超时未完成 {cleaned_stale} 个",
-                        text=(f"自动清理阈值 {self._auto_clean_days} 天，本站未完成任务连同数据文件一并删除。\\n"
+                        text=(f"自动清理阈值 {self._auto_clean_days} 天，本站未完成任务连同数据文件一并删除。\n"
                               f"处置明细见工作台「运行日志」与「处置日志」。"))
                 except Exception:
                     pass
@@ -1700,10 +1754,22 @@ class RainbowReviveButler(_PluginBase):
                 "early": (self._last_overview or {}).get("early", 0),
                 "warned": (self._last_overview or {}).get("warned", 0),
                 "auto_downloaded": (self._last_overview or {}).get("auto_downloaded", 0),
+                # 手动/自动刷新继承巡检写入的收益字段，否则「上次收益」会变「—」
+                "last_gain": (self._last_overview or {}).get("last_gain"),
+                "ran_at": (self._last_overview or {}).get("ran_at"),
                 "seeds": seeds, "my_ids": sorted(my_ids),
                 "stats": stats, "portfolio": portfolio[:200], "portfolio_stats": portfolio_stats,
             }
             self._last_overview_ts = now
+            # 同步「已做种」体积供表单 target hint（auto_download 关闭时巡检不走优选分支，
+            # _last_current_gb 永不赋值、hint 一直是静态文案）；在途体积仅由优选巡检更新，此处保留
+            try:
+                _mine = {str(t) for t in my_ids}
+                _cur_gb = sum(float(s.get("size_gb") or 0) for s in seeds if str(s.get("tid")) in _mine)
+                if _cur_gb > 0 or getattr(self, "_last_current_gb", None) is None:
+                    self._last_current_gb = _cur_gb
+            except Exception:
+                pass
             logger.info(f"彩虹岛复活区管家：概况已刷新（复活区 {len(seeds)} 种，我的做种 {len(my_ids)}，"
                         f"做种组合 {len(portfolio)} 种，做种积分 {stats.get('credit', 0):.0f}，增速 {credit_rate}/h）")
         except Exception as e:
@@ -1809,7 +1875,7 @@ class RainbowReviveButler(_PluginBase):
                f'<td style="height:10px;width:{pct("2-3人"):.2f}%;background:{C["2-3人"]};"></td>'
                f'<td style="height:10px;width:{pct("4+人"):.2f}%;background:{C["4+人"]};border-radius:0 5px 5px 0;"></td>'
                '</tr></table>')
-        legend = ('<table style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:10.5px;color:{ON60};"><tr>'
+        legend = (f'<table style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:10.5px;color:{ON60};"><tr>'
                   f'<td style="text-align:left;white-space:nowrap;"><span style="display:inline-block;width:7px;height:7px;border-radius:2px;background:{C["0-1人"]};margin-right:3px;"></span>0-1人 {dist["0-1人"]["count"]}个 {dist["0-1人"]["gb"]:.1f}GB</td>'
                   f'<td style="text-align:center;white-space:nowrap;"><span style="display:inline-block;width:7px;height:7px;border-radius:2px;background:{C["2-3人"]};margin-right:3px;"></span>2-3人 {dist["2-3人"]["count"]}个 {dist["2-3人"]["gb"]:.0f}GB</td>'
                   f'<td style="text-align:right;white-space:nowrap;"><span style="display:inline-block;width:7px;height:7px;border-radius:2px;background:{C["4+人"]};margin-right:3px;"></span>4+人 {dist["4+人"]["count"]}个 {dist["4+人"]["gb"]:.1f}GB</td>'
@@ -2077,13 +2143,26 @@ class RainbowReviveButler(_PluginBase):
             return {"success": False, "message": f"复活区未找到种子 {tid}"}
         norm = self._norm_title(seed["title"])
         services = self._get_manage_services()
+        # 三级匹配（HH _norm_match 语义 + seed_id 主键优先）：跨站转载种站点标题与任务名
+        # 不同词（如 Handicap vs Gandikap），仅靠 norm 精确相等会漏删 → 先按下载器 comment
+        # 里的站点 seed_id 精确命中，命中即单下载器定向删；未命中再模糊标题兜底
+        try:
+            _hit = self._get_downloader_seed_map(services).get(str(tid))
+        except Exception:
+            _hit = None
         for dl_name, sv in services.items():
             try:
-                ts, err = sv.instance.get_torrents()
-                if err or not ts:
-                    continue
-                del_ids = [self._thash(t) for t in ts
-                           if self._norm_title(self._tf(t, "name", default="")) == norm]
+                if _hit and _hit.get("downloader") == dl_name and _hit.get("hash"):
+                    del_ids = [str(_hit["hash"])]
+                else:
+                    ts, err = sv.instance.get_torrents()
+                    if err or not ts:
+                        continue
+                    del_ids = []
+                    for t in ts:
+                        tn = self._norm_title(self._tf(t, "name", default=""))
+                        if tn == norm or (len(norm) >= 15 and (norm in tn or tn in norm)):
+                            del_ids.append(self._thash(t))
                 if not del_ids:
                     continue
                 sv.instance.delete_torrents(delete_file=self._delete_files, ids=del_ids)
@@ -2566,17 +2645,17 @@ class RainbowReviveButler(_PluginBase):
         # 按自然日聚合采样（日表只看近 40 天；聚合键用完整日期保证 12月/1月 跨年排序正确，展示仍用月-日）
         now_ts = time.time()
         daily_hist = [h for h in hist if isinstance(h, dict) and h.get("ts", 0) > now_ts - 40 * 86400]
-        days: Dict[str, dict] = {}
+        day_map: Dict[str, dict] = {}
         for h in daily_hist:
             if not h.get("credit"):
                 continue
             dt = datetime.fromtimestamp(h["ts"], tz_sh)
             key = dt.strftime("%Y-%m-%d")
-            d = days.setdefault(key, {"label": dt.strftime("%m-%d"),
-                                      "first": h["credit"], "last": h["credit"], "n": 0})
+            d = day_map.setdefault(key, {"label": dt.strftime("%m-%d"),
+                                         "first": h["credit"], "last": h["credit"], "n": 0})
             d["last"] = h["credit"]
             d["n"] += 1
-        ordered = sorted(days.items())  # 完整日期键 → 跨年顺序正确
+        ordered = sorted(day_map.items())  # 完整日期键 → 跨年顺序正确
         cum = 0.0
         records = []
         for key, d in ordered:
@@ -2643,7 +2722,7 @@ class RainbowReviveButler(_PluginBase):
                 'padding:40px;text-align:center}.card{max-width:520px;margin:0 auto;background:#111c33;'
                 'border:1px solid #1e3357;border-radius:14px;padding:30px}</style></head><body><div class="card">'
                 f'<div style="font-size:16px;font-weight:700;margin-bottom:10px;">数据与等级 · 获取失败</div>'
-                f'<div style="color:#f87171;line-height:1.8;">{str(e)}</div>'
+                f'<div style="color:#f87171;line-height:1.8;">{_esc(str(e))}</div>'
                 '<div style="margin-top:14px;font-size:12px;color:#7d8db1;">请检查站点 Cookie 是否有效</div>'
                 '</div></body></html>'))
 
