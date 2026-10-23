@@ -56,7 +56,7 @@ class RainbowReviveButler(_PluginBase):
     plugin_name = "彩虹岛复活区管家Q自用版"
     plugin_desc = "基于六个橙子「憨憨保种区管家」(HHClubButler) 架构复刻，致谢原作者 SixOrg。\n复活区全景 / 免费到期处置 / 复活推送 / 换种优选 / 做种到期提醒"
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/rainbowrevivebutler.png"
-    plugin_version = "1.7.0"
+    plugin_version = "1.7.1"
     plugin_label = "资源站点"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -406,6 +406,7 @@ class RainbowReviveButler(_PluginBase):
                 all_seeds.extend(new)
                 if len(new) == 0:
                     break
+                time.sleep(0.5)  # 页间限速（HH 同款），防站点限流
             if all_seeds or attempt == 1:
                 break
             # 首页拿到 0 个种子：可能是站点瞬时限流/返回登录页，等 5 秒重试一次
@@ -413,8 +414,11 @@ class RainbowReviveButler(_PluginBase):
             time.sleep(5)
         return all_seeds, page + 1
 
-    def _fetch_my_seeding_ids(self, session: requests.Session, base: str) -> set:
-        """spstate=1 视图 = 我在做种的复活区种子。"""
+    def _fetch_my_seeding_ids(self, session: requests.Session, base: str) -> Optional[set]:
+        """spstate=1 视图 = 我在做种的复活区种子。
+
+        返回 None 表示拉取失败（与「真没做种」的空集区分），调用方据此中止自动下载防重复。
+        """
         ids: set = set()
         try:
             for page in range(5):
@@ -426,10 +430,11 @@ class RainbowReviveButler(_PluginBase):
                 if not new:
                     break
                 ids |= new
+                time.sleep(0.5)  # 页间限速（HH 同款），防站点限流
             return ids
         except Exception as e:
             logger.warning(f"彩虹岛复活区管家：拉取我的做种视图失败：{e}")
-            return ids
+            return None
 
     def _get_site_uid(self, session: requests.Session, base: str) -> Optional[str]:
         """从首页解析当前登录用户 UID（做种组合接口需要）。"""
@@ -1031,7 +1036,12 @@ class RainbowReviveButler(_PluginBase):
         seeds = stats["seeds"]
         base = self._get_site_url()
         session = self._session(self._get_site_cookie())
-        my_ids = self._fetch_my_seeding_ids(session, base)
+        my_ids_raw = self._fetch_my_seeding_ids(session, base)
+        # None=拉取失败（与空集区分）：本轮中止自动下载，防止把手动保种的复活种重复下载
+        my_ids_ok = my_ids_raw is not None
+        my_ids = my_ids_raw if my_ids_ok else set()
+        if not my_ids_ok:
+            logger.warning("彩虹岛复活区管家：我的做种视图拉取失败，本轮中止自动下载（防重复下载手动保种）")
         acct_stats = self._fetch_site_stats(session, base)
         portfolio = self._fetch_seeding_portfolio(session, base)
         # 做种积分增速
@@ -1079,7 +1089,9 @@ class RainbowReviveButler(_PluginBase):
         # 自动下载复活（默认关）：HH 同款优选（增量/换种循环淘汰）
         downloaded: List[dict] = []
         evicted: List[dict] = []
-        if self._auto_download and self._low_seeder_max > 0:
+        if self._auto_download and not my_ids_ok:
+            self._save_log(["跳过自动下载：我的做种视图拉取失败（防重复下载手动保种）"])
+        if self._auto_download and self._low_seeder_max > 0 and my_ids_ok:
             # 候选池 = 免费且在窗口内、做种≤阈值的全部复活种子（预算跨轮复算，HH 同款每轮重选）
             pool = [s for s in seeds
                     if s["is_free"] and s.get("free_until") and s["free_until"] > now
@@ -1337,6 +1349,7 @@ class RainbowReviveButler(_PluginBase):
                     if not ok:
                         fail_count += 1
                         logger.warning(f"彩虹岛复活区管家：自动下载被下载器拒绝 {s['title'][:40]}（返回 {result}）")
+                        time.sleep(1)  # 推送间隔（HH 同款），防打爆下载器/站点
                         continue
                     out.append(s)
                     existing.add(s["norm"])  # 推送成功即入清单，防同 norm 后续候选重复推送
@@ -1344,6 +1357,7 @@ class RainbowReviveButler(_PluginBase):
                 except Exception as e:
                     fail_count += 1
                     logger.error(f"彩虹岛复活区管家：自动下载失败 {s['title'][:40]}：{e}")
+                time.sleep(1)  # 推送间隔（HH 同款），防打爆下载器/站点
 
             # HH 同款优选完成汇总通知（有新增或淘汰才发，防 2 小时一轮刷屏）
             if self._notify and (out or evicted):
@@ -2562,6 +2576,7 @@ tr.sel td{background:var(--tr-sel);color:#fff}
 <button class="btn danger" id="btnDel">删除选中</button>
 <button class="btn ghost" id="colsBtn">列选择</button>
 <select class="themebtn" id="themeSel" title="选择皮肤" style="cursor:pointer;"><option value="light">纯白</option><option value="cream">米黄暖</option><option value="sakura">樱花粉</option><option value="mint">薄荷绿</option><option value="sky">天空蓝</option><option value="lavender">薰衣草紫</option><option value="silver">银灰金属</option><option value="dark">深灰</option><option value="graphite">石墨蓝</option><option value="midnight">午夜蓝</option><option value="navy">深蓝</option><option value="plum">暗紫</option><option value="charcoal">炭灰暖</option><option value="forest">暗夜绿</option><option value="hc">高对比</option></select>
+<select class="themebtn" id="dlSel" title="按下载器筛选"><option value="">全部下载器</option></select>
 <button class="btn ghost" id="btnRefresh">刷新</button>
 <div class="colpicker" id="colpicker"><h4>勾选要显示的列</h4>
 <label><input type="checkbox" data-col="c_tid" checked>种子ID</label>
@@ -2609,7 +2624,7 @@ var COLS=[
 ];
 var seeds=[],filtered=[],sel={};
 var RUNLOG=[];
-var curF="all",sortKey="remain_sec",sortDir=1,query="";
+var curF="all",sortKey="remain_sec",sortDir=1,query="",curDl="";
 function tierOf(n){n=+n||0;return n<=1?0:(n<=3?1:2)}
 function fmtSize(gb){if(!isFinite(gb))return"-";gb=+gb;if(gb>=1024)return(gb/1024).toFixed(2)+" TB";return gb.toFixed(2)+" GB"}
 function fmtRemain(sec){if(sec==null)return"-";if(sec<=0)return"已过期";var d=Math.floor(sec/86400),h=Math.floor(sec%86400/3600),m=Math.floor(sec%3600/60);return(d?d+"天":"")+h+"小时"+m+"分"}
@@ -2666,6 +2681,7 @@ if(curF==="soon"&&!(s.is_free&&!s.expired&&s.remain_sec<=7200))return false;
 if(curF==="low"&&!(s.seeders<=3))return false;
 if(curF==="mine"&&!s.mine)return false;
 if(curF==="expired"&&!s.expired)return false;
+if(curDl&&(s.dl||"")!==curDl)return false;
 if(query&&(s.title||"").toLowerCase().indexOf(query)<0)return false;
 return true});
 filtered=f;
@@ -2708,6 +2724,11 @@ if(to)clearTimeout(to);
 var j=await r.json();
 if(!j.success){clearInterval(tmr);showErr(j.message||"数据加载失败");return}
 seeds=j.seeds||[];
+var dls=[];seeds.forEach(function(s){if(s.dl&&dls.indexOf(s.dl)<0)dls.push(s.dl)});dls.sort();
+var dsel=document.getElementById("dlSel");dsel.innerHTML='<option value="">全部下载器</option>';
+dls.forEach(function(d){dsel.innerHTML+='<option value="'+esc(d)+'">'+esc(d)+'</option>'});
+if(curDl&&dls.indexOf(curDl)<0)curDl="";
+dsel.value=curDl;
 document.getElementById("runinfo").textContent=j.last_result||"";
 RUNLOG=j.run_log||[];
 doSort();render();clearInterval(tmr);st.style.display="none";
@@ -2739,6 +2760,7 @@ var a=document.createElement("a");a.href=URL.createObjectURL(new Blob([csv],{typ
 document.getElementById("btnDel").onclick=delSel;
 document.getElementById("btnExport").onclick=doExport;
 document.getElementById("btnRefresh").onclick=load;
+document.getElementById("dlSel").onchange=function(){curDl=this.value;render()};
 document.getElementById("btnLog").onclick=function(){var m=document.getElementById("logmodal");m.style.display="block";document.getElementById("logtxt").textContent=(RUNLOG&&RUNLOG.length)?RUNLOG.join("\n"):"暂无运行日志（首次巡检后生成）"};
 document.getElementById("q").oninput=function(){query=this.value.trim().toLowerCase();render()};
 document.querySelectorAll(".topbar .chip").forEach(function(c){c.onclick=function(){document.querySelectorAll(".topbar .chip").forEach(function(x){x.classList.remove("active")});this.classList.add("active");curF=this.dataset.f;render()}});
