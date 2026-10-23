@@ -56,7 +56,7 @@ class RainbowReviveButler(_PluginBase):
     plugin_name = "彩虹岛复活区管家Q自用版"
     plugin_desc = "基于六个橙子「憨憨保种区管家」(HHClubButler) 架构复刻，致谢原作者 SixOrg。\n复活区全景 / 免费到期处置 / 复活推送 / 换种优选 / 做种到期提醒"
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/rainbowrevivebutler.png"
-    plugin_version = "1.5.5"
+    plugin_version = "1.5.6"
     plugin_label = "资源站点"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -160,10 +160,12 @@ class RainbowReviveButler(_PluginBase):
             })
             self.update_config(_cfg)
             try:
-                self._scheduler = BackgroundScheduler(timezone=settings.TIMEZONE)
+                # MP v3 时区属性是 settings.TZ（无 settings.TIMEZONE），与原作者 HHClubButler 一致
+                self._scheduler = BackgroundScheduler(timezone=settings.TZ)
                 self._scheduler.add_job(
                     func=self.run, trigger="date", id="RainbowReviveButlerOnce",
-                    next_run_time=datetime.now(pytz.timezone(settings.TIMEZONE)) + timedelta(seconds=3))
+                    run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3),
+                    name="彩虹岛复活区管家（立即运行）")
                 if not self._scheduler.running:
                     self._scheduler.start()
             except Exception as e:
@@ -970,14 +972,13 @@ class RainbowReviveButler(_PluginBase):
                         "tid": seed["tid"], "downloader": dl_name, "hash": thash,
                         "evictable": bool(thash),
                     })
-            # 站点侧我在做种但不在受管下载器里的（手动/其它客户端）：计入体积，不可淘汰
+            # 站点侧我在做种但不在复活目录内的（手动/其它客户端/其它目录）：
+            # 口径（2026-10-23 用户拍板「复活目录和影视目录分开算」）：只做去重（不重复下载），
+            # 不计入本插件的目录预算——500GB 目标只约束插件管理的复活目录，手动保种不占额度、也不可淘汰。
             cur_norms = {c["norm"] for c in current}
             for s in seeds:
                 if s["tid"] in my_ids and s["norm"] not in cur_norms:
-                    current.append({"title": s["title"], "norm": s["norm"], "size": s["size_gb"],
-                                    "seeders": s.get("seeders", 1), "hr": s.get("hr"),
-                                    "tid": s["tid"], "downloader": "", "hash": "",
-                                    "evictable": False})
+                    existing.add(s["norm"])
                     cur_norms.add(s["norm"])
 
             current_gb = sum(c["size"] for c in current)
