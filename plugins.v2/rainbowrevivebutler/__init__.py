@@ -56,7 +56,7 @@ class RainbowReviveButler(_PluginBase):
     plugin_name = "彩虹岛复活区管家Q自用版"
     plugin_desc = "基于六个橙子「憨憨保种区管家」(HHClubButler) 架构复刻，致谢原作者 SixOrg。\n复活区全景 / 免费到期处置 / 复活推送 / 换种优选 / 做种到期提醒"
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/rainbowrevivebutler.png"
-    plugin_version = "1.5.3"
+    plugin_version = "1.5.4"
     plugin_label = "资源站点"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -870,7 +870,8 @@ class RainbowReviveButler(_PluginBase):
             if deal_seeds and not self._auto_download:
                 try:
                     lines = ["──────────────",
-                             f"复活窗口：{len(deal_seeds)} 个低做种免费种子（做种 ≤ {self._low_seeder_max} 人）",
+                             f"复活区新发现 {len(deal_seeds)} 个候选（免费 · 做种 ≤ {self._low_seeder_max} 人）",
+                             "仅提醒，未加入下载器",
                              "──────────────"]
                     for s in deal_seeds[:10]:
                         t = (s.get("title") or "").strip()
@@ -880,7 +881,7 @@ class RainbowReviveButler(_PluginBase):
                     if len(deal_seeds) > 10:
                         lines.append(f"  …等共 {len(deal_seeds)} 个")
                     self.post_message(
-                        title=f"【彩虹岛复活区管家】复活：{len(deal_seeds)} 个低做种免费种子",
+                        title=f"【彩虹岛复活区管家】发现 {len(deal_seeds)} 个复活区免费种子（未下载）",
                         text="\n".join(lines))
                 except Exception:
                     pass
