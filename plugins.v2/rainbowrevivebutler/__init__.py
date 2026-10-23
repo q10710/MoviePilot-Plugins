@@ -56,7 +56,7 @@ class RainbowReviveButler(_PluginBase):
     plugin_name = "彩虹岛复活区管家Q自用版"
     plugin_desc = "基于六个橙子「憨憨保种区管家」(HHClubButler) 架构复刻，致谢原作者 SixOrg。\n复活区全景 / 免费到期处置 / 复活推送 / 换种优选 / 做种到期提醒"
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/rainbowrevivebutler.png"
-    plugin_version = "1.5.2"
+    plugin_version = "1.5.3"
     plugin_label = "资源站点"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -867,34 +867,21 @@ class RainbowReviveButler(_PluginBase):
                         text="免费结束后新下载骤减、上传收益下降，去留请自行判断：\n" + "\n".join(lines))
                 except Exception:
                     pass
-            if deal_seeds and not downloaded:
+            if deal_seeds and not self._auto_download:
                 try:
-                    lines = [f"  {s['title'][:60]}（{s['size_gb']:.1f}GB，做种 {s['seeders']}）" for s in deal_seeds[:10]]
-                    more = len(deal_seeds) - 10
-                    if more > 0:
+                    lines = ["──────────────",
+                             f"复活窗口：{len(deal_seeds)} 个低做种免费种子（做种 ≤ {self._low_seeder_max} 人）",
+                             "──────────────"]
+                    for s in deal_seeds[:10]:
+                        t = (s.get("title") or "").strip()
+                        t = t if len(t) <= 44 else t[:44] + "…"
+                        remain_h = round((s.get("free_until", 0) - time.time()) / 3600)
+                        lines.append(f"  · {t}（{s['size_gb']:.1f}GB · 做种 {s['seeders']} · 剩 {remain_h}h）")
+                    if len(deal_seeds) > 10:
                         lines.append(f"  …等共 {len(deal_seeds)} 个")
                     self.post_message(
                         title=f"【彩虹岛复活区管家】复活：{len(deal_seeds)} 个低做种免费种子",
-                        text="免费中且做种人数 ≤ {}，ratio 黄金窗口：\n{}".format(self._low_seeder_max, "\n".join(lines)))
-                except Exception:
-                    pass
-            if downloaded:
-                try:
-                    lines = [f"  {t['title'][:60]}（{t['size_gb']:.1f}GB）" for t in downloaded[:10]]
-                    self.post_message(
-                        title=f"【彩虹岛复活区管家】自动下载 {len(downloaded)} 个复活种子",
-                        text=f"已推送到 {self._push_downloader}：\n" + "\n".join(lines))
-                except Exception:
-                    pass
-            if evicted:
-                try:
-                    lines = [f"  {v['title'][:60]}（{v.get('size', 0.0):.1f}GB，做种 {v.get('seeders', '?')} 人）" for v in evicted[:10]]
-                    more = len(evicted) - 10
-                    if more > 0:
-                        lines.append(f"  …等共 {len(evicted)} 个")
-                    self.post_message(
-                        title=f"【彩虹岛复活区管家】换种淘汰 {len(evicted)} 个低档位种子",
-                        text=f"为腾出目标体积已删除任务{'（含文件）' if self._delete_files else ''}：\n" + "\n".join(lines))
+                        text="\n".join(lines))
                 except Exception:
                     pass
 
@@ -1042,6 +1029,7 @@ class RainbowReviveButler(_PluginBase):
             # 5) 推送选中的候选
             base = self._get_site_url()
             cookie = self._get_site_cookie()
+            fail_count = 0
             for s in res.get("picked", []):
                 if s["norm"] in existing or s["tid"] in my_ids:
                     continue
@@ -1054,13 +1042,22 @@ class RainbowReviveButler(_PluginBase):
                         tag=(self._tag or None))
                     ok = result[0] if isinstance(result, tuple) else bool(result)
                     if not ok:
+                        fail_count += 1
                         logger.warning(f"彩虹岛复活区管家：自动下载被下载器拒绝 {s['title'][:40]}（返回 {result}）")
                         continue
                     out.append(s)
                     existing.add(s["norm"])  # 推送成功即入清单，防同 norm 后续候选重复推送
                     logger.info(f"彩虹岛复活区管家：自动下载 {s['title'][:50]}（{s['size_gb']:.1f}GB → {self._push_downloader}）")
                 except Exception as e:
+                    fail_count += 1
                     logger.error(f"彩虹岛复活区管家：自动下载失败 {s['title'][:40]}：{e}")
+
+            # HH 同款优选完成汇总通知（有新增或淘汰才发，防 2 小时一轮刷屏）
+            if self._notify and (out or evicted):
+                try:
+                    self._notify_optimize(current, out, evicted, res, in_flight_gb, fail_count)
+                except Exception as e:
+                    logger.error(f"彩虹岛复活区管家：发送优选完成通知失败：{e}")
         except Exception as e:
             logger.error(f"彩虹岛复活区管家：自动下载流程异常：{e}")
         return out, evicted
@@ -1149,6 +1146,61 @@ class RainbowReviveButler(_PluginBase):
         for s in del_seeds[:8]:
             logger.info(f"彩虹岛复活区管家：  - 换种淘汰 {s.get('title', '')[:50]} | {s.get('size', 0.0):.1f} GB | 当前做种 {s.get('seeders', '?')} 人")
         return {"picked": add_seeds, "del_seeds": del_seeds, "keep_count": keep_count}
+
+    def _notify_optimize(self, current: List[dict], picked_ok: List[dict],
+                         evicted: List[dict], res: dict, in_flight_gb: float, fail_count: int):
+        """HH 同款优选完成汇总通知：一条式（在保状态 / 目标体积 / 做种分布 / 上次收益 + 新增与删除明细）。"""
+        mode_name = "换种" if self._mode == "wash" else "增量"
+        ev_norms = {v.get("norm") for v in evicted}
+        final = [c for c in current if c.get("norm") not in ev_norms]
+        seen = {c.get("norm") for c in final}
+        for s in picked_ok:
+            if s.get("norm") not in seen:
+                final.append({"size": s.get("size_gb", 0.0), "seeders": s.get("seeders", 0)})
+                seen.add(s.get("norm"))
+        final_count = len(final)
+        final_gb = sum(c.get("size", 0.0) for c in final)
+        lines = ["──────────────", f"在保种子：{final_count} 个 / {final_gb:.1f} GB"]
+        if self._target_volume and self._target_volume > 0:
+            remain = max(0.0, self._target_volume - final_gb - in_flight_gb)
+            lines.append(f"目标体积：{self._target_volume:.0f} GB（在途 {in_flight_gb:.1f} GB · 剩余可增 {remain:.1f} GB）")
+        else:
+            lines.append("目标体积：不限")
+        dist = {"0-1人": {"count": 0, "gb": 0.0}, "2-3人": {"count": 0, "gb": 0.0}, "4+人": {"count": 0, "gb": 0.0}}
+        for c in final:
+            n = c.get("seeders", 0)
+            k = "0-1人" if n <= 1 else ("2-3人" if n <= 3 else "4+人")
+            dist[k]["count"] += 1
+            dist[k]["gb"] += c.get("size", 0.0)
+        lines.append("做种人数分布")
+        for k in ("0-1人", "2-3人", "4+人"):
+            lines.append(f"  {k}  {dist[k]['count']}个  {dist[k]['gb']:.1f} GB")
+        if isinstance(self._last_credit_delta, (int, float)) and self._last_overview_ts:
+            ran = datetime.fromtimestamp(self._last_overview_ts, pytz.timezone("Asia/Shanghai")).strftime("%m-%d %H:%M")
+            lines.append(f"上次收益：+{self._last_credit_delta:.0f}（{ran}）")
+        lines.append("──────────────")
+        if picked_ok:
+            total_new = sum(s.get("size_gb", 0.0) for s in picked_ok)
+            lines.append(f"新增 {len(picked_ok)} 个种子：+{total_new:.1f} GB")
+            for s in picked_ok[:5]:
+                t = (s.get("title") or "").strip()
+                lines.append(f"  · {t if len(t) <= 36 else t[:36] + '…'}")
+            if len(picked_ok) > 5:
+                lines.append(f"  …等共 {len(picked_ok)} 个")
+            if fail_count:
+                lines.append(f"⚠️ 推送失败：{fail_count} 个（成功 {len(picked_ok)}）")
+            else:
+                lines.append(f"推送成功：{len(picked_ok)}")
+        else:
+            lines.append("无需新增下载")
+        if evicted:
+            lines.append(f"删除低档位种子：{len(evicted)} 个")
+            for v in evicted[:5]:
+                t = (v.get("title") or "").strip()
+                lines.append(f"  - {t if len(t) <= 32 else t[:32] + '…'}（做种{v.get('seeders', '?')}人/{v.get('size', 0.0):.0f}GB）")
+            if len(evicted) > 5:
+                lines.append(f"  …等共 {len(evicted)} 个")
+        self.post_message(title=f"【彩虹岛复活区管家】{mode_name}优选完成", text="\n".join(lines))
 
     # ------------------------------------------------------------------ #
     # 守护线程：高频到期处置
