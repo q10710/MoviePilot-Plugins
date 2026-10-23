@@ -59,7 +59,7 @@ class RainbowReviveButler(_PluginBase):
     plugin_name = "彩虹岛复活区管家Q自用版"
     plugin_desc = "基于六个橙子「憨憨保种区管家」(HHClubButler) 架构复刻，致谢原作者 SixOrg。\n复活区全景 / 免费到期处置 / 复活推送 / 换种优选 / 做种到期提醒"
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/rainbowrevivebutler.png"
-    plugin_version = "1.7.2"
+    plugin_version = "1.7.3"
     plugin_label = "资源站点"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -2596,7 +2596,7 @@ class RainbowReviveButler(_PluginBase):
                             f'<div class="tt"><div class="t1">⬆️ 等级升阶 · {upg.get("cur", "-")} → {upg.get("next", "-")}</div>'
                             f'<div class="t2">{upg.get("days_txt", "")}</div></div>'
                             f'<div style="margin-top:6px;">{cond_html}</div></div>')
-            next_cards = next_cards + (upg_card,)
+            next_cards = next_cards + upg_card
 
         foot = ("数据来源：ptchdbits.co 档案页/任务页/页头实时解析 · "
                 "任务系统完成率为全站统计（Master/Ultimate/Extreme/Veteran/Insane）· "
