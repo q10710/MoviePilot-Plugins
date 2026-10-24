@@ -24,15 +24,22 @@
    （manual_total_episode）的订阅不参与；同一订阅限频；同一集累计回退达止损次数（reconcile_stop_count）
    即拉黑该订阅、停止自动回退并推送高危清单；每轮最多处理 reconcile_max_per_run 部。
 
-判断逻辑：
-1. 该季是否播完：取该季全部分集的 air_date，全部已过才算播完（只考虑单季）；
-   若媒体库该季已齐全，同样按「已播完」处理，并兜住 TMDB 分集日期缺失/异常的情况
-2. 该季已播完但媒体库缺集（整季缺或个别集缺）→ 重置洗版进度（清 current_priority），
-   让主程序重新搜索补集 —— 顶档（current_priority=100）会被主程序视为「洗版完成」而不再搜索，
-   库缺集也补不回来
-3. 该季尚未播完 → 取消洗版（仅对洗版订阅；普通订阅不做动作）
-4. 库缺集且订阅却认为已下完（lack_episode<=0）→ 重置订阅触发重新下载（原有能力）
-5. 取不到该季分集信息 → 保守跳过本轮，不做任何改动
+判断逻辑（2.10.0 起为「多源完结信号 + 严取消门槛」，判定不对称，防误取消）：
+1. **「已播完」证据（任一成立即算播完，用于开洗版/保洗版）**：
+   - TMDB 剧级状态 Ended/Canceled，或该季末集有唯一 finale 标记且无后续集（强证据）；
+   - TMDB 有更晚的季（中置信：本季必然已播完）；
+   - 该季全部分集 air_date 均已过（单季全播完）；
+   - 媒体库该季已齐全（内容都在库里，本季没有可追的）；
+   - 豆瓣条目「更新至期数 >= 总期数」（国内综艺 TMDB 数据常缺，豆瓣按季独立建条目更准）；
+   - 站点缓存候选标题命中「全集/完结/全N集」等强完结表述（仅用于保住洗版，不用于开洗版）。
+2. **「未播完」强证据（只有它能触发取消）**：该季存在 air_date 明确在未来、且集号超出
+   最后已播集的分集。缺 air_date 的集只算「未知」，不再当未播完（旧口径误取消主因）。
+3. **取消洗版门槛（三层同时满足才取消）**：有明确未来集 + 三源（TMDB/豆瓣/站点）无任一
+   完结证据 + 连续 cancel_confirm_rounds 轮巡检同判；取消后自动监测——一旦出现完结证据，
+   自动重开整季洗版（同一订阅 reopen_cooldown_days 天内最多一次，防来回翻转）。
+4. 该季已播完但媒体库缺集 → 重置洗版进度（清 current_priority），让主程序重新搜索补集；
+5. 库缺集且订阅却认为已下完（lack_episode<=0）→ 重置订阅触发重新下载（原有能力）
+6. 取不到该季分集信息 → 保守跳过本轮，不做任何改动
 
 媒体库检查用「媒体身份 + 本地索引条目 ID」定位，条目名与 TMDB 中文名不一致时也能命中；
 已配置多台媒体服务器（如 Emby + 飞牛影视）时按并集合并，任一服务器上存在该集即视为存在（可播放）。
@@ -40,13 +47,15 @@
 
 import threading
 import time
-from datetime import datetime
+from datetime import date, datetime
+import re
 from app.log import logger
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from apscheduler.triggers.cron import CronTrigger
 
 from app.chain.tmdb import TmdbChain
+from app.chain.torrents import TorrentsChain
 from app.chain.mediaserver import MediaServerChain
 from app.core.config import settings
 from app.core.event import eventmanager, Event
@@ -64,9 +73,22 @@ try:
 except Exception:  # pragma: no cover - 兼容旧版主程序路径
     MediaServerOper = None
 
+# 豆瓣完结信号（2.10.0）：国内综艺在 TMDB 常缺分集日期，豆瓣按季独立建条目且带
+# 「更新至第 X 期 / 总期数」，作为 TMDB 之外的第二完结数据源。主程序路径变化时自动降级。
+try:
+    from app.modules.douban.apiv2 import DoubanApi
+except Exception:  # pragma: no cover - 兼容旧版主程序路径
+    DoubanApi = None
+
 
 # TMDB 身份来源标识：新版 MoviePilot 的订阅/媒体条目用 media_source + media_id 描述媒体身份
 TMDB_MEDIA_SOURCE = "themoviedb"
+
+# 站点完结证据：种子标题命中完结表述（强证据）；带「更至/更新至」或集数对不上总期数的
+# 只算弱证据（仅阻止取消洗版，不作为判完结依据）。
+_SITE_COMPLETE_RE = re.compile(r"\b(?:complete|completed)\b|完结|全集|全\s*\d+\s*[集期话]", re.IGNORECASE)
+_SITE_ONGOING_RE = re.compile(r"更至|更新至|ongoing|连载|预计|待更", re.IGNORECASE)
+_SITE_TOTAL_RE = re.compile(r"全\s*(\d+)\s*[集期话]")
 
 
 
@@ -76,9 +98,10 @@ class BestVersionGuard(_PluginBase):
     plugin_name = "洗版守护Q自用版"
     plugin_desc = ("只看订阅那一季：订阅新增时判定——该季已播完就直接开整季洗版，未播完保持普通订阅；"
                    "定时巡检维护已是洗版的订阅（未播完取消洗版、已播完维持整季洗版并在库缺集时重置进度）；"
-                   "普通订阅库缺集自动对账回退补齐（删掉的文件被订阅重新补回）。")
+                   "普通订阅库缺集自动对账回退补齐（删掉的文件被订阅重新补回）；"
+                   "TMDB+豆瓣+站点多源完结信号，严取消门槛（连续确认），误取消自动重开自愈。")
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/bestversionguard.png"
-    plugin_version = "2.9.1"
+    plugin_version = "2.10.0"
     plugin_label = "订阅"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -103,6 +126,16 @@ class BestVersionGuard(_PluginBase):
     _reconcile_stop_count: int = 3
     # 完结季转整季洗版后仍缺集的兜底天数：超过则回退普通订阅逐集补
     _reconcile_grace_days: int = 7
+    # 豆瓣完结信号：TMDB 之外的第二完结数据源（国内综艺 TMDB 分集数据常缺）
+    _douban_signal_enabled: bool = True
+    # 站点完结证据：RSS/spider 缓存标题命中「全集/完结/全N集」（仅用于保住洗版）
+    _site_signal_enabled: bool = True
+    # 取消洗版前的连续确认轮数（每轮 = 一次巡检，默认每小时）
+    _cancel_confirm_rounds: int = 3
+    # 取消洗版后出现完结证据时自动重开整季洗版（误取消自愈）
+    _reopen_enabled: bool = True
+    # 同一订阅自动重开限频天数（0 = 不限频），防取消↔重开来回翻转
+    _reopen_cooldown_days: int = 7
 
     _subscribe_oper = None
     _fixed_count: int = 0
@@ -126,6 +159,15 @@ class BestVersionGuard(_PluginBase):
     _reconcile_blocked: Set[str] = set()
     # 完结转洗版兜底：订阅 ID -> 转整季洗版时间戳（超过宽限仍缺集则回退普通订阅）
     _convert_records: Dict[str, float] = {}
+    # 取消洗版连续确认：订阅 ID -> {"count": 轮次, "signature": 证据签名}（证据变化即清零）
+    _cancel_pending: Dict[str, Dict[str, Any]] = {}
+    # 自动重开：订阅 ID -> 上次重开时间戳（限频用）
+    _reopen_records: Dict[str, float] = {}
+    # 紡计自动重开次数与最近一次明细（数据页/通知展示）
+    _reopened_count: int = 0
+    _last_reopened: List[Dict[str, Any]] = []
+    # 豆瓣完结查询缓存：「剧名|季播出年」-> (是否完结, 说明)（同轮巡检内复用）
+    _douban_cache: Dict[str, Tuple[Optional[bool], str]] = {}
     # 累计对账回退次数与最近一次明细（数据页/通知展示）
     _reconcile_count: int = 0
     _last_reconcile: List[Dict[str, Any]] = []
@@ -157,6 +199,12 @@ class BestVersionGuard(_PluginBase):
         }
         self._reconcile_blocked = set(str(x) for x in (saved.get("reconcile_blocked") or []))
         self._convert_records = {str(k): float(v) for k, v in (saved.get("convert_records") or {}).items()}
+        self._cancel_pending = {
+            str(k): dict(v or {}) for k, v in (saved.get("cancel_pending") or {}).items()
+        }
+        self._reopen_records = {str(k): float(v) for k, v in (saved.get("reopen_records") or {}).items()}
+        self._reopened_count = saved.get("reopened_count", 0)
+        self._last_reopened = saved.get("last_reopened") or []
         self._reconcile_count = saved.get("reconcile_count", 0)
         self._last_reconcile = saved.get("last_reconcile") or []
         self._last_high_risk = saved.get("last_high_risk") or []
@@ -179,11 +227,19 @@ class BestVersionGuard(_PluginBase):
         self._reconcile_max_per_run = max(1, self._int_cfg(config.get("reconcile_max_per_run"), 5))
         self._reconcile_stop_count = max(1, self._int_cfg(config.get("reconcile_stop_count"), 3))
         self._reconcile_grace_days = max(0, self._int_cfg(config.get("reconcile_grace_days"), 7))
+        self._douban_signal_enabled = bool(config.get("douban_signal_enabled", True))
+        self._site_signal_enabled = bool(config.get("site_signal_enabled", True))
+        self._cancel_confirm_rounds = max(1, self._int_cfg(config.get("cancel_confirm_rounds"), 3))
+        self._reopen_enabled = bool(config.get("reopen_enabled", True))
+        self._reopen_cooldown_days = max(0, self._int_cfg(config.get("reopen_cooldown_days"), 7))
         logger.info(f"初始化完成, enabled={self._enabled}, cron={self._cron}, "
                     f"库缺集重置={self._reset_missing_enabled}（限频 {self._reset_cooldown_days} 天），"
                     f"对账回退={self._reconcile_enabled}（限频 {self._reconcile_cooldown_days} 天，"
                     f"每轮上限 {self._reconcile_max_per_run} 部，止损 {self._reconcile_stop_count} 次，"
                     f"转洗版兜底 {self._reconcile_grace_days} 天，已拉黑 {len(self._reconcile_blocked)} 条），"
+                    f"完结信号：豆瓣={self._douban_signal_enabled} 站点={self._site_signal_enabled}，"
+                    f"取消确认 {self._cancel_confirm_rounds} 轮，"
+                    f"自动重开={self._reopen_enabled}（限频 {self._reopen_cooldown_days} 天），"
                     f"已取消 {len(self._fixed_ids)} 条")
         if self._enabled:
             # 定时任务交由 MoviePilot 主调度器统一注册（见 get_service）
@@ -334,6 +390,58 @@ class BestVersionGuard(_PluginBase):
                             "persistent-hint": True,
                         },
                     },
+                    {
+                        "component": "VSwitch",
+                        "props": {
+                            "model": "douban_signal_enabled",
+                            "label": "豆瓣完结信号（第二数据源）",
+                            "hint": ("TMDB 之外再查豆瓣：条目「更新至期数 >= 总期数」判已播完。"
+                                     "国内综艺 TMDB 分集数据常缺失，豆瓣按季独立建条目更准。"
+                                     "用于开洗版与保洗版，匹配不上时不影响现有行为。"),
+                            "persistent-hint": True,
+                        },
+                    },
+                    {
+                        "component": "VSwitch",
+                        "props": {
+                            "model": "site_signal_enabled",
+                            "label": "站点全集证据（仅防误取消）",
+                            "hint": ("读取主程序已有搜索缓存标题，命中「全集/完结/全N集」等强表述时"
+                                     "保住洗版不取消（零站点请求）。只用于防误取消，不用于开洗版。"),
+                            "persistent-hint": True,
+                        },
+                    },
+                    {
+                        "component": "VTextField",
+                        "props": {
+                            "model": "cancel_confirm_rounds",
+                            "label": "取消洗版确认轮数",
+                            "type": "number",
+                            "hint": ("有明确未来播出集且三源（TMDB/豆瓣/站点）都无完结证据后，"
+                                     "还需连续该轮数巡检同判才执行取消（每轮约 1 小时），防数据瞬态误取消"),
+                            "persistent-hint": True,
+                        },
+                    },
+                    {
+                        "component": "VSwitch",
+                        "props": {
+                            "model": "reopen_enabled",
+                            "label": "误取消自动重开洗版",
+                            "hint": ("被本插件取消洗版后若出现完结证据（TMDB/豆瓣/站点任一），"
+                                     "自动重开整季洗版并通知，自愈误取消。"),
+                            "persistent-hint": True,
+                        },
+                    },
+                    {
+                        "component": "VTextField",
+                        "props": {
+                            "model": "reopen_cooldown_days",
+                            "label": "自动重开限频（天，0=不限频）",
+                            "type": "number",
+                            "hint": "同一订阅在该天数内最多自动重开一次，防取消↔重开来回翻转",
+                            "persistent-hint": True,
+                        },
+                    },
                 ],
             }
         ], {
@@ -347,6 +455,11 @@ class BestVersionGuard(_PluginBase):
             "reconcile_max_per_run": 5,
             "reconcile_stop_count": 3,
             "reconcile_grace_days": 7,
+            "douban_signal_enabled": True,
+            "site_signal_enabled": True,
+            "cancel_confirm_rounds": 3,
+            "reopen_enabled": True,
+            "reopen_cooldown_days": 7,
         }
 
     def get_page(self) -> Optional[List[dict]]:
@@ -561,6 +674,12 @@ class BestVersionGuard(_PluginBase):
                                icon="mdi-restore-alert"),
                           chip(f"对账限频 {self._reconcile_cooldown_days} 天 / 每轮 {self._reconcile_max_per_run} 部",
                                "secondary", icon="mdi-timer-outline"),
+                          chip(f"豆瓣信号 {'开' if self._douban_signal_enabled else '关'}"
+                               f" / 站点证据 {'开' if self._site_signal_enabled else '关'}",
+                               "info", icon="mdi-database-search"),
+                          chip(f"取消确认 {self._cancel_confirm_rounds} 轮"
+                               f" / 自动重开 {'开' if self._reopen_enabled else '关'}",
+                               "secondary", icon="mdi-refresh"),
                       ]},
                  ]},
             ],
@@ -575,6 +694,8 @@ class BestVersionGuard(_PluginBase):
                           ok_color, "该季已播完，改走整季洗版"),
                 stat_card("mdi-star-off-outline", "累计取消洗版", self._fixed_count,
                           warn_color, "该季未播完，恢复普通订阅"),
+                stat_card("mdi-restart", "累计自动重开", self._reopened_count,
+                          ok_color, "取消后出现完结证据，自愈重开洗版"),
                 stat_card("mdi-restore", "已重置进度", len(self._reset_records),
                           info_color, "库缺集，重置洗版重新补集"),
                 stat_card("mdi-format-list-bulleted", "在管取消记录", len(self._fixed_ids),
@@ -599,6 +720,11 @@ class BestVersionGuard(_PluginBase):
                 "最近一次取消洗版", "mdi-star-off-outline", warn_color,
                 self._last_fixed, "fixed_time", "最近一次检查没有取消洗版的订阅",
                 chip(f"{len(self._last_fixed)} 条", "warning"),
+            ),
+            detail_section(
+                "最近一次自动重开（误取消自愈）", "mdi-restart", ok_color,
+                self._last_reopened, "reopen_time", "没有触发过自动重开",
+                chip(f"{len(self._last_reopened)} 条", "success"),
             ),
             detail_section(
                 "最近一次重置洗版进度", "mdi-restore", info_color,
@@ -632,13 +758,19 @@ class BestVersionGuard(_PluginBase):
                 {"component": "div", "props": {"class": "text-caption", "style": "line-height: 1.7;"},
                  "content": [
                      {"component": "div", "props": {"class": "font-weight-medium mb-1"},
-                      "text": "判定口径"},
+                      "text": "判定口径（2.10.0 多源完结信号 + 严取消门槛）"},
                      {"component": "div",
                       "text": "① 订阅新增那一刻：该季已播完就直接开整季洗版，未播完保持普通订阅；"},
                      {"component": "div",
                       "text": "② 定时巡检只维护已是洗版的订阅：未播完取消洗版，已播完且库缺集则重置洗版进度；"},
                      {"component": "div",
-                      "text": "③ 单季判据＝该季分集已全部播出，或库内该季已齐全；取不到分集信息时保守跳过。"},
+                      "text": "③ 已播完＝任一成立：TMDB Ended/Canceled/末集finale标记/更晚的季/"
+                              "该季分集全部已播/库内齐全/豆瓣「更新至≥总期数」/站点全集强证据（仅保洗版）；"},
+                     {"component": "div",
+                      "text": "④ 取消洗版需同时满足：TMDB 有明确未来播出集 + 三源无完结证据 + "
+                              "连续 N 轮确认（缺日期的集按未知处理，不再触发取消）；"},
+                     {"component": "div",
+                      "text": "⑤ 取消后若出现完结证据自动重开整季洗版（误取消自愈，7 天限频防翻转）。"},
                  ]},
             ],
         })
@@ -664,6 +796,10 @@ class BestVersionGuard(_PluginBase):
                 "reconcile_strikes": {k: dict(v or {}) for k, v in self._reconcile_strikes.items()},
                 "reconcile_blocked": list(self._reconcile_blocked),
                 "convert_records": dict(self._convert_records),
+                "cancel_pending": {k: dict(v or {}) for k, v in self._cancel_pending.items()},
+                "reopen_records": dict(self._reopen_records),
+                "reopened_count": self._reopened_count,
+                "last_reopened": (self._last_reopened or [])[:50],
                 "reconcile_count": self._reconcile_count,
                 "last_reconcile": (self._last_reconcile or [])[:50],
                 "last_high_risk": (self._last_high_risk or [])[:50],
@@ -700,6 +836,15 @@ class BestVersionGuard(_PluginBase):
         if not last:
             return True
         return (time.time() - float(last)) >= self._reconcile_cooldown_days * 86400
+
+    def _can_reopen(self, subscribe_id: Any) -> bool:
+        """误取消自愈重开限频：同一订阅在限频期内不再重开（0 天 = 不限频）。"""
+        if self._reopen_cooldown_days <= 0:
+            return True
+        last = self._reopen_records.get(str(subscribe_id))
+        if not last:
+            return True
+        return (time.time() - float(last)) >= self._reopen_cooldown_days * 86400
 
     def _reconcile_normal_subs(self, subscribes: List[Any], now_str: str
                                ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
@@ -764,12 +909,14 @@ class BestVersionGuard(_PluginBase):
             total_cache[cache_key] = self._get_tmdb_season_total(tmdbid, sub.season)
         season_total = total_cache[cache_key]
         if cache_key not in air_cache:
-            air_cache[cache_key] = self._get_season_air_status(tmdbid, sub.season)
+            # 对账回退沿用 TMDB 分级信号；豆瓣完结信号不参与本路径——
+            # 它决定「转整季洗版」（开洗版方向），按口径只认 TMDB/库内证据。
+            air_cache[cache_key] = self._season_signals(tmdbid, sub.season, None, air_cache)
         air = air_cache[cache_key]
-        if not air or air[0] is None:
-            # 取不到该季分集信息：保守跳过，与巡检同一口径
+        if not air or not air.get("tmdb_ok"):
+            # 取不到该季分集信息：保守跳过，维持原对账口径
             return None
-        season_finished = bool(air[0])
+        season_finished = bool(self._tmdb_ended_tags(air))
         lib_eps = self._get_library_episodes(tmdbid, sub.season, sub.name, sub.year,
                                              getattr(sub, "media_id", None))
         missing_eps = [ep for ep in range(1, season_total + 1) if ep not in lib_eps] if season_total > 0 else []
@@ -1077,50 +1224,196 @@ class BestVersionGuard(_PluginBase):
             pass
         return 0
 
-    def _get_season_air_status(self, tmdbid: int, season: int
-                               ) -> Tuple[Optional[bool], int, int, List[int]]:
-        """判断目标单季是否已播完（只考虑这一季，不看整剧状态）。
+    def _season_signals(self, tmdbid: int, season: int,
+                        tmdb_info: Optional[dict],
+                        cache: Dict[Tuple[int, int], Dict[str, Any]]) -> Dict[str, Any]:
+        """TMDB 单季分级完结信号（同轮按 (tmdbid, season) 缓存，见模块说明「判断逻辑」）。
 
-        返回 (该季是否已播完, 该季总集数, 已播出集数, 尚未播出的集号)。
-        首项为 None 表示取不到分集数据，调用方应保守跳过本轮、不做任何改动。
-
-        判定口径：
-        - 以该季分集的 air_date 为准，全部已过（含今天）才算播完；
-        - air_date 缺失或格式非法的集视为「尚未播出」，宁可判未播完，也不提前判播完；
-        - 分集条数少于 TMDB 报告的该季集数时视为数据不全，同样不判播完。
+        返回字段：
+        - tmdb_ok：是否取到该季分集；
+        - aired / total / unknown：已播集数、该季总集数、缺 air_date 的集数（未知）；
+        - future：air_date 明确在未来、能证明「尚未播完」的集号（唯一可触发取消的强证据）；
+        - all_aired：分集全部有日期且全部已过（单季播完的基础信号）；
+        - finale：该季最后一集带 finale 标记（强完结信号）；
+        - later_season：整剧存在更晚的季（本季必然已播完）；
+        - status：TMDB 剧级状态（Ended/Canceled 为强完结信号）。
         """
+        key = (tmdbid, season)
+        if key in cache:
+            return cache[key]
+        sig: Dict[str, Any] = {
+            "tmdb_ok": False, "aired": 0, "total": 0, "unknown": 0,
+            "future": [], "all_aired": False, "finale": False,
+            "later_season": False, "status": "",
+        }
+        cache[key] = sig
         try:
             episodes = TmdbChain().tmdb_episodes(tmdbid=tmdbid, season=season)
         except Exception as e:
             logger.debug(f"查询 TMDB 季分集失败: {tmdbid} S{season} - {e}")
             episodes = []
-        if not episodes:
-            return None, 0, 0, []
+        sig["tmdb_ok"] = bool(episodes)
+        if episodes:
+            today = date.today()
+            last_aired_no = 0
+            for ep in episodes:
+                ep_no = getattr(ep, "episode_number", None) or 0
+                air_date = (getattr(ep, "air_date", None) or "").strip()
+                if not air_date:
+                    # 缺日期只算「未知」，不再当未播完（旧口径误取消主因）
+                    sig["unknown"] += 1
+                    continue
+                try:
+                    aired_date = datetime.strptime(air_date, "%Y-%m-%d").date()
+                except ValueError:
+                    sig["unknown"] += 1
+                    continue
+                if aired_date > today:
+                    sig["future"].append(ep_no)
+                else:
+                    sig["aired"] += 1
+                    last_aired_no = max(last_aired_no, ep_no)
+            sig["future"] = sorted(x for x in sig["future"] if x > last_aired_no)
+            last_ep = episodes[-1]
+            sig["finale"] = (
+                str(getattr(last_ep, "episode_type", "") or "").strip().lower() == "finale"
+            )
+            sig["all_aired"] = not sig["future"] and not sig["unknown"]
+        sig["total"] = self._get_tmdb_season_total(tmdbid, season) or len(episodes)
+        if tmdb_info:
+            sig["status"] = str(tmdb_info.get("status") or "")
+            for s in (tmdb_info.get("seasons") or []):
+                try:
+                    if int(s.get("season_number") or 0) > season:
+                        sig["later_season"] = True
+                        break
+                except (TypeError, ValueError):
+                    continue
+        return sig
 
-        today = datetime.now().date()
-        pending: List[int] = []
-        aired = 0
-        for ep in episodes:
-            ep_no = getattr(ep, "episode_number", None) or 0
-            air_date = (getattr(ep, "air_date", None) or "").strip()
-            if not air_date:
-                pending.append(ep_no)
-                continue
+    @staticmethod
+    def _tmdb_ended_tags(sig: Dict[str, Any]) -> List[str]:
+        """把 TMDB 分级信号收敛为「已播完」证据标签（任一成立即算播完）。"""
+        tags: List[str] = []
+        if sig.get("status") in ("Ended", "Canceled"):
+            tags.append(f"TMDB {sig['status']}")
+        if sig.get("later_season"):
+            tags.append("TMDB 存在更晚的季")
+        if sig.get("finale") and not sig.get("future"):
+            tags.append("TMDB 末集 finale 标记")
+        if sig.get("all_aired") and sig.get("tmdb_ok"):
+            tags.append(f"该季分集全部已播（{sig['aired']}/{sig['total']}）")
+        return tags
+
+    @staticmethod
+    def _season_year(tmdb_info: Optional[dict], season: int,
+                     fallback: Optional[str]) -> Optional[str]:
+        """取该季播出年份（用于豆瓣按年匹配），取不到时回落订阅年份。"""
+        for s in ((tmdb_info or {}).get("seasons") or []):
             try:
-                aired_date = datetime.strptime(air_date, "%Y-%m-%d").date()
-            except ValueError:
-                pending.append(ep_no)
+                if int(s.get("season_number") or 0) == season:
+                    air = str(s.get("air_date") or "")[:4]
+                    if air.isdigit():
+                        return air
+            except (TypeError, ValueError):
                 continue
-            if aired_date > today:
-                pending.append(ep_no)
-            else:
-                aired += 1
+        return fallback
 
-        season_total = self._get_tmdb_season_total(tmdbid, season)
-        if season_total > len(episodes):
-            # TMDB 报告的该季集数多于已录入的分集，数据不全，不判播完
-            return False, season_total, aired, pending
-        return (len(pending) == 0), (season_total or len(episodes)), aired, pending
+    def _douban_completion(self, sub: Any, season_year: Optional[str]
+                           ) -> Tuple[Optional[bool], str]:
+        """豆瓣完结信号：条目「更新至期数 >= 总期数」判已播完（国内综艺 TMDB 数据常缺）。
+
+        返回 (是否已播完 True/False/None=无法判断, 说明)。
+        匹配收紧：标题完全相等或互含，且年份与该季播出年份 ±1；匹配不上一律返回 None，
+        调用方按「无法判断」处理，不改变现有行为。
+        """
+        if not self._douban_signal_enabled or DoubanApi is None:
+            return None, ""
+        name = (getattr(sub, "name", "") or "").strip()
+        if not name:
+            return None, ""
+        cache_key = f"{name}|{season_year or ''}"
+        if cache_key in self._douban_cache:
+            return self._douban_cache[cache_key]
+        result: Tuple[Optional[bool], str] = (None, "")
+        try:
+            api = DoubanApi()
+            search = api.tv_search(name) or {}
+            best = None  # (匹配级, 年份接近度, target)
+            for item in (search.get("items") or []):
+                target = item.get("target") or {}
+                title = str(target.get("title") or "").strip()
+                if not title:
+                    continue
+                if title == name:
+                    level = 2
+                elif name in title or title in name:
+                    level = 1
+                else:
+                    continue
+                year = str(target.get("year") or "").strip()
+                year_delta = 99
+                if season_year and year.isdigit():
+                    year_delta = abs(int(year) - int(season_year))
+                    if year_delta > 1:
+                        continue
+                if best is None or (level, -year_delta) > (best[0], best[1]):
+                    best = (level, -year_delta, target)
+            if best:
+                target = best[2]
+                detail = api.tv_detail(str(target.get("id") or "")) or {}
+                count = int(detail.get("episodes_count") or 0)
+                last = detail.get("last_episode_number")
+                title = str(target.get("title") or name)
+                if count and last:
+                    ok = int(last) >= count
+                    result = (ok, f"豆瓣《{title}》 {last}/{count} 期已完结"
+                                  if ok else f"豆瓣《{title}》 {last}/{count} 期未完结")
+        except Exception as e:
+            logger.debug(f"豆瓣完结查询失败: {name} - {e}")
+        self._douban_cache[cache_key] = result
+        return result
+
+    def _site_completion_evidence(self, sub: Any) -> Tuple[bool, str]:
+        """站点完结证据：只读主程序 RSS/spider 缓存候选标题，零站点请求。
+
+        强证据 = 命中「完结/全集/全N集/complete」且不含「更至/更新至」等进行中表述；
+        带「全N集」时 N 需不低于订阅总集数（能取到时）才算强证据。
+        仅用于「保住洗版」（防误取消），不用于开洗版——站点标题「全集」在更新中也常见。
+        """
+        if not self._site_signal_enabled:
+            return False, ""
+        try:
+            helper = getattr(TorrentsChain(), "get_subscribe_cache_candidates", None)
+            if not callable(helper):
+                return False, ""
+            contexts = helper(sub, allow_title_match=False) or []
+        except Exception as e:
+            logger.debug(f"读取站点缓存候选失败: {getattr(sub, 'name', '')} - {e}")
+            return False, ""
+        sub_total = int(getattr(sub, "total_episode", 0) or 0)
+        for context in contexts:
+            meta_info = getattr(context, "meta_info", None)
+            torrent_info = getattr(context, "torrent_info", None)
+            text = " ".join(
+                str(value or "")
+                for value in (
+                    getattr(torrent_info, "title", None),
+                    getattr(meta_info, "title", None),
+                    getattr(meta_info, "subtitle", None),
+                )
+            )
+            if not text or not _SITE_COMPLETE_RE.search(text):
+                continue
+            if _SITE_ONGOING_RE.search(text):
+                continue
+            m = _SITE_TOTAL_RE.search(text)
+            if m and sub_total and int(m.group(1)) < sub_total:
+                # 「全N集」但 N 低于目标总集数：更像已放出部分的合集，不算完结
+                continue
+            title = str(getattr(torrent_info, "title", "") or "")[:80]
+            return True, f"站点全集证据: {title}"
+        return False, ""
 
     def _missing_library_episodes(self, tmdbid: int, season: int, total: int,
                                   title: str, year: str,
@@ -1176,9 +1469,11 @@ class BestVersionGuard(_PluginBase):
         fixed_list: List[Dict[str, Any]] = []
         reset_list: List[Dict[str, Any]] = []
         enable_list: List[Dict[str, Any]] = []
+        reopened_this_run = 0
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         tmdb_cache: Dict[int, dict] = {}
+        signal_cache: Dict[Tuple[int, int], Dict[str, Any]] = {}
 
         def _get_tmdb(tmdbid: int) -> Optional[dict]:
             if tmdbid not in tmdb_cache:
@@ -1204,7 +1499,9 @@ class BestVersionGuard(_PluginBase):
             # 由订阅助手Q 的洗版编排自动新建整季洗版订阅（用户口径 2026-09-16）。
             # 「普通订阅 → 洗版」的转换只发生在订阅新增那一刻（allow_enable）。
             # 历史上这里还按 username 区分来源，各分支处置完全相同，已合并。
-            if not allow_enable and not sub.best_version:
+            # 2.10.0：被本插件取消过洗版的普通订阅（_fixed_ids 在管）也放进来，
+        # 完结证据出现时自动重开整季洗版（误取消自愈，见模块说明「判断逻辑」3）。
+            if not allow_enable and not sub.best_version and str(sub.id) not in self._fixed_ids:
                 continue
 
             tmdb_info = _get_tmdb(tmdbid)
@@ -1220,18 +1517,38 @@ class BestVersionGuard(_PluginBase):
                 )
             lib_complete = season_total > 0 and not missing_eps
 
-            # 判断「这一季」是否已播完：只考虑单季，不看整剧状态。
-            # 整剧 Returning Series 只代表还会有下一季，本季是否播完要看本季分集的播出日期。
-            # 取不到分集信息时保守跳过本轮（不取消、不重置），避免 TMDB 数据缺失导致误判。
-            season_finished, season_tmdb_total, aired_count, _pending_eps = \
-                self._get_season_air_status(tmdbid, sub.season)
-            if season_finished is None:
-                logger.warning(f"取不到 TMDB 季分集信息，本轮跳过: {sub.name} S{sub.season}")
+            # ── 多源完结判定（2.10.0，见模块说明「判断逻辑」）──
+            # TMDB 分级信号 + 豆瓣 + 媒体库齐全，任一成立即「已播完」；
+            # 唯一能触发取消的是 TMDB「明确未来播出集」这一强未播完证据。
+            sig = self._season_signals(tmdbid, sub.season, tmdb_info, signal_cache)
+            season_tmdb_total = sig["total"]
+            aired_count = sig["aired"]
+            ended_tags = self._tmdb_ended_tags(sig)
+            douban_ok, douban_note = self._douban_completion(
+                sub, self._season_year(tmdb_info, sub.season, sub.year))
+            if douban_ok:
+                ended_tags.append(douban_note)
+            if not sig["tmdb_ok"] and not lib_complete and douban_ok is None:
+                # TMDB 取不到分集且豆瓣也无法判断、库内也不齐：无任何依据，
+                # 保守跳过本轮（不取消、不重置）。TMDB 缺分集但豆瓣能判时照常处理
+                # ——这正是国内综艺 TMDB 数据缺失的主场景。
+                logger.warning(f"取不到 TMDB 季分集且豆瓣无法判断，本轮跳过: "
+                               f"{sub.name} S{sub.season}")
                 continue
-            # 库内该季已齐全时同样按「已播完」处理：内容都在库里了，本季没有可追的；
-            # 同时兜住 TMDB 分集播出日期缺失/异常（实测有剧库内 190 集齐全，
-            # 但 TMDB 分集日期异常被判「已播 50/190」，仅凭日期会误判成未播完）。
-            season_ended = season_finished or lib_complete
+            # 库内该季已齐全同样按「已播完」处理：内容都在库里，本季没有可追的；
+            # 兜住 TMDB 分集日期缺失/异常（实测库内 190 集齐全却被判「已播 50/190」）。
+            if lib_complete:
+                ended_tags.append("媒体库该季齐全")
+            season_ended = bool(ended_tags)
+            future_eps: List[int] = sig["future"]
+            # 站点全集证据只用于「保住洗版」（防误取消），不参与开洗版
+            site_hit = False
+            site_note = ""
+            if sub.best_version and not season_ended:
+                site_hit, site_note = self._site_completion_evidence(sub)
+                if site_hit:
+                    season_ended = True
+                    ended_tags.append(site_note)
 
             # ── 媒体库文件丢失：库确实缺集，但订阅认为已下完（lack_episode<=0） ──
             # 说明媒体库那份被删了（如硬链接断开后被清理），主程序不会自动补下，
@@ -1278,9 +1595,6 @@ class BestVersionGuard(_PluginBase):
 
             if season_ended:
                 fix_key = str(sub.id)
-                if fix_key in self._fixed_ids:
-                    self._fixed_ids.discard(fix_key)
-                    self._save_state()
                 # 该季已播完：确保处于整季洗版状态（单季播完就洗版）。
                 # 刚订阅的那一刻若还是普通订阅，这里一并开启洗版——同一批集反复
                 # 「下不动→超时删种→补搜→再下」纯属浪费带宽与磁盘 IO，
@@ -1289,7 +1603,25 @@ class BestVersionGuard(_PluginBase):
                 newly_enabled = allow_enable and not sub.best_version
                 if newly_enabled:
                     payload["best_version"] = 1
-                if not sub.best_version_full:
+                # 误取消自愈（2.10.0）：本插件取消过洗版的订阅（在管记录）出现完结证据
+                # 时自动重开整季洗版；同一订阅 reopen_cooldown_days 天内最多一次，防翻转。
+                auto_reopened = False
+                if (not newly_enabled) and not sub.best_version and fix_key in self._fixed_ids:
+                    if self._reopen_enabled and self._can_reopen(sub.id):
+                        auto_reopened = True
+                        payload["best_version"] = 1
+                        payload["best_version_full"] = 1
+                        self._reopen_records[fix_key] = time.time()
+                    else:
+                        # 未启用自动重开或处于重开限频期：保持普通订阅，仅清在管记录
+                        logger.info(f"已取消洗版的订阅出现完结证据，但处于重开限频期"
+                                    f"（{self._reopen_cooldown_days} 天），保持普通订阅: "
+                                    f"{sub.name} S{sub.season}")
+                if fix_key in self._fixed_ids:
+                    self._fixed_ids.discard(fix_key)
+                    self._save_state()
+                if (sub.best_version or payload.get("best_version")) and not sub.best_version_full \
+                        and "best_version_full" not in payload:
                     payload["best_version_full"] = 1
                 if payload:
                     try:
@@ -1301,6 +1633,17 @@ class BestVersionGuard(_PluginBase):
                                 "name": sub.name, "year": sub.year, "season": sub.season,
                                 "reason": "该季已播完", "enable_time": now_str,
                             })
+                        elif auto_reopened:
+                            logger.info(f"误取消自愈：完结证据出现，已自动重开整季洗版: "
+                                        f"{sub.name} S{sub.season}（{'；'.join(ended_tags)}）")
+                            self._reopened_count += 1
+                            reopened_this_run += 1
+                            self._last_reopened.append({
+                                "name": sub.name, "year": sub.year, "season": sub.season,
+                                "reason": f"完结证据：{'；'.join(ended_tags)}",
+                                "reopen_time": now_str,
+                            })
+                            self._save_state()
                         else:
                             logger.info(f"该季已播完，开启整季洗版: {sub.name} S{sub.season}")
                     except Exception as e:
@@ -1328,7 +1671,7 @@ class BestVersionGuard(_PluginBase):
                         })
                 continue
 
-            # ── 该季尚未播完 ──
+            # ── 无完结证据：进入取消洗版门槛（三层同时满足才取消，见模块说明 3）──
             # 只有洗版订阅需要「取消洗版」；普通订阅本就没开洗版，直接跳过（不做无意义动作）。
             if not sub.best_version:
                 continue
@@ -1337,7 +1680,32 @@ class BestVersionGuard(_PluginBase):
                 # 之前取消过洗版但被重新开启了，清除记录重新处理
                 self._fixed_ids.discard(fix_key)
 
-            reason = f"单季未播完（已播 {aired_count}/{season_tmdb_total} 集）"
+            # 门槛 1：TMDB 有明确未来播出的分集（唯一强未播完证据）。
+            # 缺 air_date 的集只算「未知」，不再触发取消（旧口径误取消主因）。
+            if not future_eps:
+                self._cancel_pending.pop(fix_key, None)
+                logger.info(f"无明确未来播出集（未知 {sig['unknown']} 集按未知处理），"
+                            f"不取消洗版: {sub.name} S{sub.season}")
+                continue
+            # 门槛 2 已在上方处理：三源（TMDB/豆瓣/站点）任一完结证据都会转入
+            # season_ended 分支；能走到这里即三源均无完结证据。
+            # 门槛 3：连续 cancel_confirm_rounds 轮巡检证据一致才执行取消。
+            signature = f"{tmdbid}|{sub.season}|{','.join(str(x) for x in future_eps)}"
+            pending = self._cancel_pending.get(fix_key)
+            if pending and pending.get("signature") == signature:
+                count = int(pending.get("count") or 0) + 1
+            else:
+                count = 1
+            if count < self._cancel_confirm_rounds:
+                self._cancel_pending[fix_key] = {"count": count, "signature": signature}
+                self._save_state()
+                logger.info(f"取消洗版待确认({count}/{self._cancel_confirm_rounds}): "
+                            f"{sub.name} S{sub.season}（明确未播集 {future_eps}）")
+                continue
+            self._cancel_pending.pop(fix_key, None)
+
+            reason = (f"明确未播完（未来播出集 {future_eps}，已播 "
+                      f"{aired_count}/{season_tmdb_total} 集，连续 {count} 轮确认，三源无完结证据）")
             if tmdb_status:
                 reason = f"{reason}，TMDB {tmdb_status}"
 
@@ -1381,12 +1749,15 @@ class BestVersionGuard(_PluginBase):
         self._save_state()
 
         logger.info(f"检查完成: 开启洗版 {len(enable_list)} 个，取消洗版 {len(fixed_list)} 个，"
-                    f"重置 {len(reset_list)} 个，对账回退 {len(reconcile_list)} 个"
+                    f"重开洗版 {reopened_this_run} 个，重置 {len(reset_list)} 个，"
+                    f"对账回退 {len(reconcile_list)} 个"
                     + (f"，新增高危 {len(high_risk_list)} 个" if high_risk_list else ""))
 
-        if self._notify and (fixed_list or reset_list or enable_list or reconcile_list or high_risk_list):
+        if self._notify and (fixed_list or reset_list or enable_list or reconcile_list
+                             or high_risk_list or reopened_this_run):
             lines = self._format_lists(fixed_list, reset_list, enable_list,
-                                       reconcile_list=reconcile_list, risk_list=high_risk_list)
+                                       reconcile_list=reconcile_list, risk_list=high_risk_list,
+                                       reopen_count=reopened_this_run)
             self.post_message(title="洗版守护", text="\n".join(lines))
 
     @staticmethod
@@ -1395,8 +1766,9 @@ class BestVersionGuard(_PluginBase):
                       enable_list: Optional[List[Dict[str, Any]]] = None,
                       limit: int = 10,
                       reconcile_list: Optional[List[Dict[str, Any]]] = None,
-                      risk_list: Optional[List[Dict[str, Any]]] = None) -> List[str]:
-        """格式化开启洗版/取消洗版/重置订阅/对账回退/高危清单（前 N 个明细 + 总数后缀），供通知复用。"""
+                      risk_list: Optional[List[Dict[str, Any]]] = None,
+                      reopen_count: int = 0) -> List[str]:
+        """格式化开启/取消/重开洗版、重置订阅、对账回退、高危清单，供通知复用。"""
         lines: List[str] = []
         if enable_list:
             names = "、".join(
@@ -1410,6 +1782,8 @@ class BestVersionGuard(_PluginBase):
             )
             suffix = f"等 {len(fixed_list)} 个" if len(fixed_list) > limit else ""
             lines.append(f"取消洗版: {names}{suffix}")
+        if reopen_count:
+            lines.append(f"误取消自愈：自动重开洗版 {reopen_count} 个")
         if reset_list:
             names = "、".join(
                 f"{f.get('name', '')} S{f.get('season')}" for f in reset_list[:limit]
