@@ -40,7 +40,7 @@ class SeedSourceGuard(_PluginBase):
     plugin_desc = ("检测本地源文件是否有下载器在做种、下载器是否存在文件丢失的无效做种或"
                    "tracker 全部失败的做种任务；连续N天异常可通知或按策略处置，杜绝无效做种与孤儿文件。")
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/seedsourceguard.png"
-    plugin_version = "1.1.20"
+    plugin_version = "1.1.21"
     plugin_label = "下载管理"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -1684,11 +1684,20 @@ class SeedSourceGuard(_PluginBase):
 
     @staticmethod
     def _covered(path: str, task_roots: List[str]) -> bool:
-        """判断目录是否被任一任务根路径覆盖（本身或其下）。"""
+        """判断目录是否被任一任务覆盖：任务根等于该目录、位于其下、
+        或位于其上（任务内容无法排除包含该目录内的文件）均视为覆盖。
+
+        任务根为目录祖先时必须算覆盖：例如任务内容根是整个分类目录，
+        其下各资源目录的文件都属于该任务，若不判覆盖会被当成孤儿源文件
+        按删除处置，误删正在做种的文件。代价是该任务根之上的残留无法
+        被孤儿检测发现（保守方向，不误删）。
+        """
         norm = path.rstrip("/")
         for root in task_roots:
             root_norm = root.rstrip("/")
-            if root_norm == norm or root_norm.startswith(norm + "/"):
+            if (root_norm == norm
+                    or root_norm.startswith(norm + "/")
+                    or norm.startswith(root_norm + "/")):
                 return True
         return False
 
@@ -1715,8 +1724,11 @@ class SeedSourceGuard(_PluginBase):
         if not hash_value:
             return None
         cache = files_cache if files_cache is not None else {}
-        if hash_value in cache:
-            return cache[hash_value]
+        # 缓存键必须含下载器名：同一 infohash 可同时存在于多个下载器
+        # （qb 辅种 + tr 原种），只用 hash 会让两个任务的清单互相串号
+        cache_key = f"{dl_name}:{hash_value}"
+        if cache_key in cache:
+            return cache[cache_key]
         result: Optional[set] = None
         try:
             if services is None:
@@ -1738,7 +1750,7 @@ class SeedSourceGuard(_PluginBase):
                     result = paths or None
         except Exception as err:
             logger.debug(f"读取任务文件清单失败 {dl_name} / {task.get('name', '')}：{err}")
-        cache[hash_value] = result
+        cache[cache_key] = result
         return result
 
     def _allow_remove_files(self, item: Dict[str, Any],
@@ -1852,11 +1864,12 @@ class SeedSourceGuard(_PluginBase):
         red_map_active = {k: v for k, v in red_map_active.items() if k not in exempt_red}
         # 供通知统计使用：只含豁免后仍按红种处置的项
         report["red_active"] = list(red_map_active.values())
-        # 正常辅种覆盖判定集合：按任务身份（下载器+hash）排除本轮无效/红种任务，
-        # 仅“正常任务”可覆盖源文件；同路径的其它正常任务必须保留，
-        # 否则同路径辅种（原种+辅种指向同一份文件）会被误判为无共享而连文件删除
+        # 正常辅种覆盖判定集合：只排除真正即将删除的个别红种（按下载器+hash 身份），
+        # 仅它们不能充当自己的共享者；整站失联豁免与占比保护的任务仍在做种、文件仍是
+        # 有效共享者，无效做种也保留在集合中（其文件可能仍在），三者都必须保留，
+        # 否则与之共享文件的红种会被误判为无共享而连文件删除
         bad_tasks = set()
-        for item in list(invalid_map.values()) + list(red_map.values()):
+        for item in list(red_map_active.values()):
             bad_tasks.add((str(item.get("dl") or ""), str(item.get("hash") or "")))
         healthy_tasks: List[Dict[str, Any]] = []
         for dl_name, tasks in (task_index or {}).items():
