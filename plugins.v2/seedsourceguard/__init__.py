@@ -41,7 +41,7 @@ class SeedSourceGuard(_PluginBase):
     plugin_desc = ("检测本地源文件是否有下载器在做种、下载器是否存在文件丢失的无效做种或"
                    "tracker 全部失败的做种任务；连续N天异常可通知或按策略处置，杜绝无效做种与孤儿文件。")
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/seedsourceguard.png"
-    plugin_version = "1.1.23"
+    plugin_version = "1.1.24"
     plugin_label = "下载管理"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -1969,7 +1969,10 @@ class SeedSourceGuard(_PluginBase):
                 elif prefix == "invalid:" and body not in invalid_map:
                     days_data.pop(old_key, None)
                 elif (prefix == "red:" and body not in red_map_active
-                      and body not in exempt_red):
+                      and body not in exempt_red
+                      # 占比保护项仍在异常中，只是本轮不处置，计数不得清除，
+                      # 否则保护解除后从 1 重计、之前的连续异常累计全部作废
+                      and body not in protected):
                     days_data.pop(old_key, None)
 
         self.save_data("days", days_data)
