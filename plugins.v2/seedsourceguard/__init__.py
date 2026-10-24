@@ -11,8 +11,9 @@
      不按个别红种处置，进跟踪表每 7 天提醒；可选开启超期删除，连续失联达到
      自定义天数后删除该站全部种子任务（文件按正常种子覆盖判定）。
 
-三类异常均按"连续 N 天"宽限期追踪，达标后按配置的动作处理（仅通知 / 移动 / 删除），
-支持 qBittorrent、Transmission、rTorrent 等所有 MoviePilot 已配置的下载器实例。
+三类异常均按"连续 N 天"宽限期追踪，达标后按配置的动作处理（仅通知 / 移动 / 删除）。
+检测只支持具备 tracker 状态数据源的 qBittorrent 与 Transmission；其它类型下载器
+（如 rTorrent）红种判定不可靠，整机拉黑跳过检测，但其任务路径仍纳入孤儿覆盖保护。
 安全设计：下载器连接失败时本轮直接跳过对应下载器，绝不把任何文件误判为孤儿；
 红种占做种数达 80% 阈值时判定站点/网络级故障，自动保护不处置；
 整站红种（两级判定确认站点不可达）不按个别红种处置，每 7 天提醒一次。
@@ -40,7 +41,7 @@ class SeedSourceGuard(_PluginBase):
     plugin_desc = ("检测本地源文件是否有下载器在做种、下载器是否存在文件丢失的无效做种或"
                    "tracker 全部失败的做种任务；连续N天异常可通知或按策略处置，杜绝无效做种与孤儿文件。")
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/seedsourceguard.png"
-    plugin_version = "1.1.21"
+    plugin_version = "1.1.22"
     plugin_label = "下载管理"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -388,7 +389,7 @@ class SeedSourceGuard(_PluginBase):
                                             "items": [
                                                 {"title": "仅通知", "value": "notify"},
                                                 {"title": "删除任务(保留文件)", "value": "delete_torrent"},
-                                                {"title": "删除任务及文件", "value": "delete_all"},
+                                                {"title": "删除任务(无其它辅种时连同源文件删除)", "value": "delete_all"},
                                             ],
                                         },
                                     }
@@ -446,6 +447,7 @@ class SeedSourceGuard(_PluginBase):
                                                      "不按个别红种删除。"
                                                      "删除种子时自动判断：该源文件仍被其它正常任务覆盖则只删种子保留文件；"
                                                      "无任何其它正常辅种时删除种子并连同源文件一起删除。"
+                                                     "无效做种配置为「删除任务(无其它辅种时连同源文件删除)」时同样按此共享判定。"
                                                      "单下载器红种占做种数 80% 以上时触发站点/网络级故障保护，本轮只通知不处置。"),
                                         },
                                     }
@@ -1142,6 +1144,8 @@ class SeedSourceGuard(_PluginBase):
             "unavailable": [],  # [{name, err}]
         }
         task_index = {}   # 下载器名 -> 任务列表 [{hash,name,root,state,complete}]
+        # 不支持类型下载器的任务仅用于孤儿覆盖保护，不参与任何检测与处置
+        unsupported_index: Dict[str, list] = {}
         try:
             self._downloader_helper = self._get_helper()
         except Exception as err:
@@ -1174,6 +1178,19 @@ class SeedSourceGuard(_PluginBase):
                 report["unavailable"].append({"name": name, "err": str(error)[:200]})
                 continue
             normalized = self._normalize_torrents(name, torrents or [])
+            # 拉黑不支持的下载器类型：红种判定依赖 tracker 状态数据源，
+            # qB/Transmission 之外拿不到该数据，检测结果不可靠，整机跳过；
+            # 但其任务路径仍纳入孤儿覆盖保护，避免其管理的文件被误判孤儿删除
+            provider = self._provider_kind(instance)
+            if provider not in ("qb", "tr"):
+                logger.warning(
+                    f"下载器 {name} 类型（{provider}）不支持红种/无效判定，已拉黑跳过检测"
+                    "（其任务路径仍纳入孤儿覆盖保护，不会被误判孤儿）")
+                if normalized:
+                    unsupported_index[name] = normalized
+                report["unavailable"].append(
+                    {"name": name, "err": f"不支持的下载器类型（{provider}），已跳过检测"})
+                continue
             task_index[name] = normalized
             logger.info(f"下载器 {name}：任务 {len(normalized)} 个")
 
@@ -1195,12 +1212,16 @@ class SeedSourceGuard(_PluginBase):
         report["host_stats"] = host_stats
 
         # 4. 孤儿源文件检测
-        no_seed_candidates = self._detect_no_seed(task_index)
+        no_seed_candidates = self._detect_no_seed(task_index, extra_roots=[
+            str(t["root"]) for tasks in unsupported_index.values()
+            for t in tasks if t.get("root")
+        ])
         report["no_seed"] = no_seed_candidates
 
         # 5. 按天计数并处置
         handled_list = self._settle(report, handle=handle, task_index=task_index,
-                                    host_stats=host_stats, services=services)
+                                    host_stats=host_stats, services=services,
+                                    unsupported_index=unsupported_index)
 
         # 6. 落盘与通知
         self._save_report(report, handled_list=handled_list)
@@ -1604,18 +1625,26 @@ class SeedSourceGuard(_PluginBase):
         except Exception:
             return False
 
-    def _detect_no_seed(self, task_index: Dict[str, list]) -> List[Dict[str, Any]]:
-        """检测孤儿源文件：扫描目录中存在但没有任何做种任务覆盖的目录。"""
+    def _detect_no_seed(self, task_index: Dict[str, list],
+                        extra_roots: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+        """检测孤儿源文件：扫描目录中存在但没有任何做种任务覆盖的目录。
+
+        :param extra_roots: 不参与检测但需保护的路径（如已拉黑下载器的任务根），
+            仅纳入覆盖保护，避免其管理的文件被误判孤儿删除
+        """
         if not self._scan_dirs:
             logger.warning("未配置源文件扫描根目录，跳过孤儿文件检测")
             return []
-        # 所有下载器任务根路径集合
+        # 所有下载器任务根路径集合（含拉黑下载器，仅作覆盖保护）
         task_roots = []
         for tasks in task_index.values():
             for task in tasks:
                 root = task["root"]
                 if root:
                     task_roots.append(root)
+        for root in extra_roots or []:
+            if root:
+                task_roots.append(str(root))
         # 建前缀树快速判断：任何任务根路径以 dir 为祖先即覆盖
         no_seed = []
         for scan_root in self._scan_dirs:
@@ -1790,7 +1819,8 @@ class SeedSourceGuard(_PluginBase):
     def _settle(self, report: Dict[str, Any], handle: bool,
                 task_index: Optional[Dict[str, list]] = None,
                 host_stats: Optional[Dict[str, Dict[str, int]]] = None,
-                services: Optional[dict] = None
+                services: Optional[dict] = None,
+                unsupported_index: Optional[Dict[str, list]] = None
                 ) -> List[Dict[str, Any]]:
         """按连续天数阈值推进记录，并执行达标项的处置动作。"""
         days_data = self.get_data("days") or {}
@@ -1809,20 +1839,6 @@ class SeedSourceGuard(_PluginBase):
                 handled_list.append(handled)
                 # 仅当处置真正执行（删除/移动成功）才移出记录；仅通知、未开开关或处置失败时
                 # 保留计数，避免下轮从 1 重新计数（页面出现「已持续 1 次扫描」的假象）
-                if handled.get("disposed"):
-                    days_data.pop(key, None)
-
-        # 无效做种计数
-        invalid_map = {}
-        for item in report["invalid"]:
-            key = f"{item['dl']}:{item['hash'] or item['root']}"
-            invalid_map[key] = item
-        stale_invalid = self._bump_days(days_data, "invalid", invalid_map, today)
-        for key, days in stale_invalid.items():
-            item = invalid_map.get(key) or {}
-            handled = self._handle_invalid(item, days, handle)
-            if handled:
-                handled_list.append(handled)
                 if handled.get("disposed"):
                     days_data.pop(key, None)
 
@@ -1879,7 +1895,31 @@ class SeedSourceGuard(_PluginBase):
                 root_v = (task.get("root") or "").rstrip("/")
                 if root_v:
                     healthy_tasks.append(task)
+        # 已拉黑下载器的任务不参与检测，但仍是活跃做种，
+        # 必须作为共享者参与「连文件删除」判定，否则其共享文件会被误删
+        for tasks in (unsupported_index or {}).values():
+            for task in tasks:
+                if (str(task.get("dl") or ""), str(task.get("hash") or "")) in bad_tasks:
+                    continue
+                root_v = (task.get("root") or "").rstrip("/")
+                if root_v:
+                    healthy_tasks.append(task)
         files_cache: Dict[str, Optional[set]] = {}
+        # 无效做种计数与处置（其「删除任务及文件」需共享判定，必须在 healthy_tasks 构建后）
+        invalid_map = {}
+        for item in report["invalid"]:
+            key = f"{item['dl']}:{item['hash'] or item['root']}"
+            invalid_map[key] = item
+        stale_invalid = self._bump_days(days_data, "invalid", invalid_map, today)
+        for key, days in stale_invalid.items():
+            item = invalid_map.get(key) or {}
+            handled = self._handle_invalid(item, days, handle,
+                                           healthy_tasks, services, files_cache)
+            if handled:
+                handled_list.append(handled)
+                if handled.get("disposed"):
+                    days_data.pop(key, None)
+
         stale_red = self._bump_days(days_data, "red", red_map_active, today)
         for key, days in stale_red.items():
             item = red_map_active.get(key) or {}
@@ -2172,8 +2212,17 @@ class SeedSourceGuard(_PluginBase):
         return None
 
     def _handle_invalid(self, item: Dict[str, Any], days: int,
-                        handle: bool) -> Optional[Dict[str, Any]]:
-        """处置达到天数的无效做种任务。"""
+                        handle: bool,
+                        healthy_tasks: Optional[List[Dict[str, Any]]] = None,
+                        services: Optional[dict] = None,
+                        files_cache: Optional[Dict[str, Optional[set]]] = None,
+                        ) -> Optional[Dict[str, Any]]:
+        """处置达到天数的无效做种任务。
+
+        配置为「删除任务及文件」时与红种同口径做共享判定：源文件仍被其它
+        正常任务覆盖（按文件清单交集）则只删任务保留文件；无共享时连同源
+        文件一起删除。
+        """
         action = self._invalid_action
         name = item.get("name", "")
         dl = item.get("dl", "")
@@ -2188,7 +2237,9 @@ class SeedSourceGuard(_PluginBase):
             return {"time": datetime.now().strftime("%m-%d %H:%M"),
                     "text": f"达标未处置 {text}", "disposed": False}
         if action in ("delete_torrent", "delete_all") and hash_value:
-            delete_file = (action == "delete_all")
+            # 「删除任务及文件」同样做共享判定：仍有其它正常辅种覆盖时只删任务保留文件
+            delete_file = (action == "delete_all") and self._allow_remove_files(
+                item, healthy_tasks or [], services, files_cache)
             try:
                 services = self._downloader_helper.get_services(name_filters=[dl])
                 instance = getattr(services.get(dl), "instance", None) if services else None
