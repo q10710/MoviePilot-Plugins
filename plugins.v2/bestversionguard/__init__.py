@@ -101,7 +101,7 @@ class BestVersionGuard(_PluginBase):
                    "普通订阅库缺集自动对账回退补齐（删掉的文件被订阅重新补回）；"
                    "TMDB+豆瓣+站点多源完结信号，严取消门槛（连续确认），误取消自动重开自愈。")
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/bestversionguard.png"
-    plugin_version = "2.10.1"
+    plugin_version = "2.10.2"
     plugin_label = "订阅"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -179,6 +179,10 @@ class BestVersionGuard(_PluginBase):
     # 即时判定（订阅新增事件）串行化：事件可能在短时间内大量触发（如榜单插件批量建订阅），
     # 若并发执行会同时改插件数据、并按条数放大 TMDB 与媒体库查询压力。
     _single_check_lock = threading.Lock()
+    # 巡检互斥（2.10.2）：定时任务/手动命令/API 三个巡检入口共用，占用即跳过——
+    # 并发跑同一轮会竞争「读计数→改→写回」并重复通知。布尔标志即可：
+    # 巡检本就低频（每小时），跳过的一次会被下一轮覆盖，不需要排队。
+    _patrol_running: bool = False
     # 插件状态落盘互斥：避免并发写入时后写覆盖先写（丢失限频记录/取消记录）
     _state_lock = threading.Lock()
 
@@ -1442,6 +1446,25 @@ class BestVersionGuard(_PluginBase):
     # ── 核心逻辑 ──────────────────────────────────────────────
 
     def _guard_check(self, subscribe_id: Optional[int] = None) -> None:
+        """统一入口：巡检三入口（定时任务/手动命令/API）互斥，即时判定沿用单条锁。
+
+        巡检若被并发触发（如整点调度与手动「立即检查」撞上），后到者直接跳过——
+        并发跑同一轮会竞争「读计数→改→写回」并重复通知。新增即时判定
+        （subscribe_id 非空）不走本互斥，它由 _single_check_lock 单独串行。
+        """
+        if subscribe_id is None:
+            if self._patrol_running:
+                logger.info("已有洗版守护巡检正在运行，本次触发跳过（等下一轮）")
+                return
+            self._patrol_running = True
+            try:
+                self._guard_check_impl()
+            finally:
+                self._patrol_running = False
+        else:
+            self._guard_check_impl(subscribe_id=subscribe_id)
+
+    def _guard_check_impl(self, subscribe_id: Optional[int] = None) -> None:
         """检查订阅。
 
         subscribe_id 不为空：订阅新增的那一刻判定这一条（订阅新增事件触发，见 _on_subscribe_added）——
@@ -1617,12 +1640,13 @@ class BestVersionGuard(_PluginBase):
                         self._fixed_ids.discard(fix_key)
                         self._save_state()
                     elif self._can_reopen(sub.id):
+                        # 只置 payload 与标志；清在管记录、记限频时间戳都挪到
+                        # update() 成功之后——若写库失败，记录保留、限频不消耗，
+                        # 下一轮还能重试（2.10.2：旧版先清后写，写库瞬时失败
+                        # 会让该订阅永久退出自愈监测且 7 天内不再试）。
                         auto_reopened = True
                         payload["best_version"] = 1
                         payload["best_version_full"] = 1
-                        self._reopen_records[fix_key] = time.time()
-                        self._fixed_ids.discard(fix_key)
-                        self._save_state()
                     else:
                         # 重开限频期：保留在管记录、不清除——限频期过后的下一轮
                         # 出现完结证据仍会重开；若像旧版那样清掉记录，该订阅会
@@ -1648,6 +1672,9 @@ class BestVersionGuard(_PluginBase):
                                 "reason": "该季已播完", "enable_time": now_str,
                             })
                         elif auto_reopened:
+                            # 写库成功才清在管记录并消耗限频（2.10.2 顺序修复）
+                            self._reopen_records[fix_key] = time.time()
+                            self._fixed_ids.discard(fix_key)
                             logger.info(f"误取消自愈：完结证据出现，已自动重开整季洗版: "
                                         f"{sub.name} S{sub.season}（{'；'.join(ended_tags)}）")
                             self._reopened_count += 1
@@ -1735,6 +1762,18 @@ class BestVersionGuard(_PluginBase):
                 logger.info(f"取消洗版: {sub.name} S{sub.season} ({reason})")
             except Exception as e:
                 logger.info(f"取消洗版失败: {sub.name} - {e}")
+
+        # 清理已删除订阅的在管取消记录（2.10.2）：订阅被删后其 ID 永久留在
+        # _fixed_ids 里会虚增「在管取消记录」计数；只在巡检模式做，即时判定
+        # 只带一条订阅、会误清其它在管记录。
+        if not single:
+            live_ids = {str(s.id) for s in subscribes}
+            stale_keys = [k for k in self._fixed_ids if k not in live_ids]
+            if stale_keys:
+                for k in stale_keys:
+                    self._fixed_ids.discard(k)
+                logger.info(f"清理已删除订阅的在管取消记录 {len(stale_keys)} 条")
+                self._save_state()
 
         # 普通订阅库缺集对账回退（仅定时巡检；订阅新增事件不触发本逻辑）
         reconcile_list: List[Dict[str, Any]] = []
