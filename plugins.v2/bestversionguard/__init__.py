@@ -87,7 +87,7 @@ TMDB_MEDIA_SOURCE = "themoviedb"
 # 站点完结证据：种子标题命中完结表述（强证据）；带「更至/更新至」或集数对不上总期数的
 # 只算弱证据（仅阻止取消洗版，不作为判完结依据）。
 _SITE_COMPLETE_RE = re.compile(r"\b(?:complete|completed)\b|完结|全集|全\s*\d+\s*[集期话]", re.IGNORECASE)
-_SITE_ONGOING_RE = re.compile(r"更至|更新至|ongoing|连载|预计|待更", re.IGNORECASE)
+_SITE_ONGOING_RE = re.compile(r"更至|更新至|更新中|ongoing|连载|预计|待更", re.IGNORECASE)
 _SITE_TOTAL_RE = re.compile(r"全\s*(\d+)\s*[集期话]")
 
 
