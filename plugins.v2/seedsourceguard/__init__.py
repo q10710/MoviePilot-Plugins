@@ -5,7 +5,8 @@
 2. 孤儿源文件：本地下载目录中存在文件，但所有启用下载器都没有对应的做种任务；
 3. 红种（做种任务 tracker 全部通告失败），只有两类：
    · 个别红种：单个任务失败，不管失败原因（超时/DNS/证书/403/无此种子等）一律计入，
-     连续 N 天按配置删除，源文件无其它正常辅种覆盖时连同源文件一起删除；
+     连续 N 天按配置删除，源文件无其它正常辅种覆盖时连同源文件一起删除
+     （覆盖按任务文件清单交集判定，同路径/跨下载器/目录对单文件的辅种均可识别）；
    · 整站红种：该站任务 ≥90% 连不上、且直接访问站点域名确认不可达（两级判定），
      不按个别红种处置，进跟踪表每 7 天提醒；可选开启超期删除，连续失联达到
      自定义天数后删除该站全部种子任务（文件按正常种子覆盖判定）。
@@ -39,7 +40,7 @@ class SeedSourceGuard(_PluginBase):
     plugin_desc = ("检测本地源文件是否有下载器在做种、下载器是否存在文件丢失的无效做种或"
                    "tracker 全部失败的做种任务；连续N天异常可通知或按策略处置，杜绝无效做种与孤儿文件。")
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/seedsourceguard.png"
-    plugin_version = "1.1.19"
+    plugin_version = "1.1.20"
     plugin_label = "下载管理"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -1199,7 +1200,7 @@ class SeedSourceGuard(_PluginBase):
 
         # 5. 按天计数并处置
         handled_list = self._settle(report, handle=handle, task_index=task_index,
-                                    host_stats=host_stats)
+                                    host_stats=host_stats, services=services)
 
         # 6. 落盘与通知
         self._save_report(report, handled_list=handled_list)
@@ -1256,7 +1257,7 @@ class SeedSourceGuard(_PluginBase):
                     torrent, "hash", "hashString", "id", default=""
                 ) or "")
                 progress = self._tget(torrent, "progress", "percent_done", default=0) or 0
-                root = self._task_root(torrent, dl_name)
+                root, save_path = self._task_paths(torrent, dl_name)
                 if not root or not name:
                     continue
                 result.append({
@@ -1266,6 +1267,7 @@ class SeedSourceGuard(_PluginBase):
                     "state": state,
                     "progress": float(progress or 0),
                     "root": root,
+                    "save_path": save_path,
                     # Transmission 的 get_torrents 已附带 trackerStats，供红种判定；qb/rTorrent 为空
                     "tracker_stats": self._tget(
                         torrent, "trackerStats", "tracker_stats", default=None
@@ -1276,28 +1278,32 @@ class SeedSourceGuard(_PluginBase):
                 continue
         return result
 
-    def _task_root(self, torrent: Any, dl_name: str) -> str:
-        """提取任务内容根路径，兼容 qB/TR/rTorrent 等客户端。"""
+    def _task_paths(self, torrent: Any, dl_name: str) -> Tuple[str, str]:
+        """提取任务内容根路径与保存目录，兼容 qB/TR/rTorrent 等客户端。
+
+        :return: (root, save_path)；qB 的 root 为 content_path（精确到文件或目录），
+            TR/rTorrent 无 content_path 时 root 退回任务目录；save_path 用于把
+            下载器返回的相对文件名拼成绝对路径。
+        """
         try:
             # qBittorrent：content_path 已含文件或目录
             content_path = self._tget(
                 torrent, "content_path", "contentPath", default=""
             )
-            if content_path:
-                return str(content_path).rstrip("/")
-            # 保存目录 + 名称
-            save_path = self._tget(
+            save_path = str(self._tget(
                 torrent, "save_path", "savePath", "downloadDir",
-                "download_dir", "directory", default=""
-            )
+                "download_dir", "directory", default="") or "").rstrip("/")
             name = self._tget(torrent, "name", "torrent_name", default="")
+            if content_path:
+                return str(content_path).rstrip("/"), save_path
+            # 保存目录 + 名称
             if save_path:
-                return str(save_path).rstrip("/")
+                return save_path, save_path
             if name:
                 logger.debug(f"下载器 {dl_name} 任务 {name} 无保存路径信息")
         except Exception as err:
             logger.debug(f"提取任务路径失败：{err}")
-        return ""
+        return "", ""
 
     # ── 异常判定 ──────────────────────────────────────────────
 
@@ -1419,6 +1425,7 @@ class SeedSourceGuard(_PluginBase):
             "hash": task.get("hash", ""),
             "name": task.get("name", ""),
             "root": task.get("root", ""),
+            "save_path": task.get("save_path", ""),
             "state": task.get("state", ""),
             "kind": kind,
             "reason": reason,
@@ -1687,9 +1694,91 @@ class SeedSourceGuard(_PluginBase):
 
     # ── 计数与处置 ────────────────────────────────────────────
 
+    @staticmethod
+    def _paths_overlap(a: str, b: str) -> bool:
+        """判断两个路径是否有包含关系（相等或互为前缀目录）。"""
+        a = (a or "").rstrip("/")
+        b = (b or "").rstrip("/")
+        if not a or not b:
+            return False
+        return a == b or a.startswith(b + "/") or b.startswith(a + "/")
+
+    def _files_of(self, dl_name: str, task: Dict[str, Any],
+                  files_cache: Optional[Dict[str, Optional[set]]] = None,
+                  services: Optional[dict] = None) -> Optional[set]:
+        """读取任务的绝对文件路径集合；不可得时返回 None。
+
+        :param files_cache: 以任务 hash 为键的清单缓存，同一轮内复用，避免重复 RPC
+        :param services: 已获取的下载器服务字典；缺省时按下载器名重新获取
+        """
+        hash_value = str(task.get("hash") or "")
+        if not hash_value:
+            return None
+        cache = files_cache if files_cache is not None else {}
+        if hash_value in cache:
+            return cache[hash_value]
+        result: Optional[set] = None
+        try:
+            if services is None:
+                services = self._downloader_helper.get_services(name_filters=[dl_name])
+            instance = getattr(services.get(dl_name), "instance", None) if services else None
+            if instance is not None:
+                files = instance.get_files(hash_value)
+                if files is not None:
+                    base = str(task.get("save_path") or task.get("root") or "").rstrip("/")
+                    paths = set()
+                    for f in files or []:
+                        name = f.get("name") if isinstance(f, dict) else getattr(f, "name", None)
+                        if not name:
+                            continue
+                        name = str(name).replace("\\", "/").rstrip("/")
+                        if base and not name.startswith("/"):
+                            name = f"{base}/{name.lstrip('/')}"
+                        paths.add(name)
+                    result = paths or None
+        except Exception as err:
+            logger.debug(f"读取任务文件清单失败 {dl_name} / {task.get('name', '')}：{err}")
+        cache[hash_value] = result
+        return result
+
+    def _allow_remove_files(self, item: Dict[str, Any],
+                            healthy_tasks: List[Dict[str, Any]],
+                            services: Optional[dict] = None,
+                            files_cache: Optional[Dict[str, Optional[set]]] = None
+                            ) -> bool:
+        """判定删除该任务时是否允许连同源文件一起删除。
+
+        先按任务根路径等值快判（同路径任务必然共享文件）；不命中时做文件级交集
+        验证：与该任务路径有重叠的正常任务逐一读取文件清单，任一交集非空即视为
+        仍有其它辅种共享。文件清单不可得时保守视为仍有共享（只删任务保留文件），
+        符合「安全第一，绝不误删」。
+        :return: True=无共享可连文件删除；False=仍有共享只删任务。
+        """
+        root = str(item.get("root") or "").rstrip("/")
+        if not root:
+            return False
+        candidates = [
+            t for t in (healthy_tasks or [])
+            if self._paths_overlap(root, str(t.get("root") or ""))
+        ]
+        if not candidates:
+            return True
+        my_files = self._files_of(item.get("dl", ""), item, files_cache, services)
+        if not my_files:
+            return False
+        for cand in candidates:
+            cand_files = self._files_of(cand.get("dl", ""), cand, files_cache, services)
+            if cand_files is None:
+                # 候选文件清单不可得：无法证明无共享，保守只删任务
+                return False
+            if my_files & cand_files:
+                return False
+        return True
+
     def _settle(self, report: Dict[str, Any], handle: bool,
                 task_index: Optional[Dict[str, list]] = None,
-                host_stats: Optional[Dict[str, Dict[str, int]]] = None
+                host_stats: Optional[Dict[str, Dict[str, int]]] = None,
+                services: Optional[dict] = None
                 ) -> List[Dict[str, Any]]:
         """按连续天数阈值推进记录，并执行达标项的处置动作。"""
         days_data = self.get_data("days") or {}
@@ -1763,22 +1852,26 @@ class SeedSourceGuard(_PluginBase):
         red_map_active = {k: v for k, v in red_map_active.items() if k not in exempt_red}
         # 供通知统计使用：只含豁免后仍按红种处置的项
         report["red_active"] = list(red_map_active.values())
-        # 正常辅种覆盖判定集合：排除本轮无效/红种任务根路径后，仅“正常任务”可覆盖源文件
-        bad_roots = set()
+        # 正常辅种覆盖判定集合：按任务身份（下载器+hash）排除本轮无效/红种任务，
+        # 仅“正常任务”可覆盖源文件；同路径的其它正常任务必须保留，
+        # 否则同路径辅种（原种+辅种指向同一份文件）会被误判为无共享而连文件删除
+        bad_tasks = set()
         for item in list(invalid_map.values()) + list(red_map.values()):
-            root_v = (item.get("root") or "").rstrip("/")
-            if root_v:
-                bad_roots.add(root_v)
-        healthy_roots = []
+            bad_tasks.add((str(item.get("dl") or ""), str(item.get("hash") or "")))
+        healthy_tasks: List[Dict[str, Any]] = []
         for dl_name, tasks in (task_index or {}).items():
             for task in tasks:
+                if (dl_name, str(task.get("hash") or "")) in bad_tasks:
+                    continue
                 root_v = (task.get("root") or "").rstrip("/")
-                if root_v and root_v not in bad_roots:
-                    healthy_roots.append(root_v)
+                if root_v:
+                    healthy_tasks.append(task)
+        files_cache: Dict[str, Optional[set]] = {}
         stale_red = self._bump_days(days_data, "red", red_map_active, today)
         for key, days in stale_red.items():
             item = red_map_active.get(key) or {}
-            handled = self._handle_red(item, days, handle, healthy_roots)
+            handled = self._handle_red(item, days, handle,
+                                       healthy_tasks, services, files_cache)
             if handled:
                 handled_list.append(handled)
                 if handled.get("disposed"):
@@ -1788,7 +1881,7 @@ class SeedSourceGuard(_PluginBase):
         # 与红种同口径：只删该站自己的种子任务，别的站正常种子一律不动；
         # 源文件仍被任一正常做种任务覆盖则只删任务保留文件，无任何正常覆盖时连同源文件删除。
         handled_list.extend(self._handle_site_offline_expiry(
-            site_tracking, exempt_red, handle, healthy_roots))
+            site_tracking, exempt_red, handle, healthy_tasks, services, files_cache))
 
         # 清理已恢复的旧记录（保留当前仍异常项的天数历史）
         for prefix in ("no_seed:", "invalid:", "red:"):
@@ -2102,13 +2195,16 @@ class SeedSourceGuard(_PluginBase):
 
     def _handle_red(self, item: Dict[str, Any], days: int,
                     handle: bool,
-                    healthy_roots: Optional[List[str]] = None,
+                    healthy_tasks: Optional[List[Dict[str, Any]]] = None,
+                    services: Optional[dict] = None,
+                    files_cache: Optional[Dict[str, Optional[set]]] = None,
                     ) -> Optional[Dict[str, Any]]:
         """处置达到天数的个别红种任务。
 
-        删除种子时联动判定源文件归属：该源文件仍被其它正常任务覆盖则仅删任务
-        保留文件；无任何其它正常做种任务覆盖时删除任务并连同源文件一起删除。
-        healthy_roots 由结算阶段传入，已排除本轮红种/无效任务的根路径。
+        删除种子时联动判定源文件归属：该源文件仍被其它正常任务覆盖（按任务
+        文件清单交集判定，不只比对路径）则仅删任务保留文件；无任何其它正常
+        做种任务覆盖时删除任务并连同源文件一起删除。
+        healthy_tasks 由结算阶段传入，已按任务身份排除本轮红种/无效任务。
         """
         action = self._red_action
         dl = item.get("dl", "")
@@ -2127,9 +2223,8 @@ class SeedSourceGuard(_PluginBase):
         if not hash_value:
             return None
         # 源文件是否仍被其它正常做种任务覆盖：正常任务集合由结算阶段计算并传入
-        delete_file = True
-        if healthy_roots and root and root.rstrip("/") in healthy_roots:
-            delete_file = False
+        delete_file = self._allow_remove_files(
+            item, healthy_tasks or [], services, files_cache)
         try:
             services = self._downloader_helper.get_services(name_filters=[dl])
             instance = getattr(services.get(dl), "instance", None) if services else None
@@ -2153,12 +2248,14 @@ class SeedSourceGuard(_PluginBase):
     def _handle_site_offline_expiry(self, site_tracking: List[Dict[str, Any]],
                                     exempt_red: Dict[str, Any],
                                     handle: bool,
-                                    healthy_roots: Optional[List[str]] = None,
+                                    healthy_tasks: Optional[List[Dict[str, Any]]] = None,
+                                    services: Optional[dict] = None,
+                                    files_cache: Optional[Dict[str, Optional[set]]] = None,
                                     ) -> List[Dict[str, Any]]:
         """整站失联超期删除：连续失联达到设定天数后删除该站全部种子任务。
 
         与红种处置同一口径：只删除该站（host 匹配）自己的种子任务，其它站正常种子不受影响；
-        源文件仍被任一正常做种任务覆盖（root 命中 healthy_roots）则只删任务保留文件，
+        源文件仍被任一正常做种任务覆盖（按文件清单交集判定）则只删任务保留文件，
         无任何正常种子覆盖时删除任务并连同源文件一起删除。
         删除前把本批清单备份到临时目录，日志记录便于回查。返回本轮处置记录列表。
         """
@@ -2180,17 +2277,23 @@ class SeedSourceGuard(_PluginBase):
         ]
         if not targets:
             return results
+        # 逐项判定是否可连文件删除（文件清单同轮缓存复用），备份与删除共用同一结果
+        pending: List[Tuple[str, Dict[str, Any], bool]] = []
+        for host, item in targets:
+            if not str(item.get("hash") or ""):
+                continue
+            allow_files = self._allow_remove_files(
+                item, healthy_tasks or [], services, files_cache)
+            pending.append((host, item, allow_files))
+        if not pending:
+            return results
         # 删除前备份清单到临时目录（含每项的删除文件判定）
         try:
-            backup_items = []
-            for host, item in targets:
-                root = str(item.get("root") or "").rstrip("/")
-                delete_file = not (healthy_roots and root and root in healthy_roots)
-                backup_items.append({
-                    "host": host, "downloader": item.get("dl", ""),
-                    "hash": item.get("hash", ""), "name": item.get("name", ""),
-                    "root": item.get("root", ""), "delete_file": delete_file,
-                })
+            backup_items = [{
+                "host": host, "downloader": item.get("dl", ""),
+                "hash": item.get("hash", ""), "name": item.get("name", ""),
+                "root": item.get("root", ""), "delete_file": allow_files,
+            } for host, item, allow_files in pending]
             backup_path = Path(settings.TEMP_PATH) / (
                 f"seedsourceguard_offline_delete_{datetime.now():%Y%m%d_%H%M%S}.json")
             backup_path.write_text(
@@ -2198,16 +2301,11 @@ class SeedSourceGuard(_PluginBase):
             logger.info(f"整站失联超期删除：已备份清单 {backup_path}（{len(backup_items)} 项）")
         except Exception as err:
             logger.warning(f"整站失联超期删除清单备份失败（不阻断处置）：{err}")
-        for host, item in targets:
+        for host, item, delete_file in pending:
             dl = item.get("dl", "")
             name = item.get("name", "")
             hash_value = item.get("hash", "")
-            root = str(item.get("root") or "").rstrip("/")
             text = f"整站失联超期 {dl}：{name}（站点 {host} 连续失联 ≥{self._site_offline_delete_days} 天）"
-            if not hash_value:
-                continue
-            # 与红种同口径：源文件仍被任一正常任务覆盖则只删任务保留文件
-            delete_file = not (healthy_roots and root and root in healthy_roots)
             try:
                 services = self._downloader_helper.get_services(name_filters=[dl])
                 instance = getattr(services.get(dl), "instance", None) if services else None
