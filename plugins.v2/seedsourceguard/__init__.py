@@ -41,7 +41,7 @@ class SeedSourceGuard(_PluginBase):
     plugin_desc = ("检测本地源文件是否有下载器在做种、下载器是否存在文件丢失的无效做种或"
                    "tracker 全部失败的做种任务；连续N天异常可通知或按策略处置，杜绝无效做种与孤儿文件。")
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/seedsourceguard.png"
-    plugin_version = "1.1.22"
+    plugin_version = "1.1.23"
     plugin_label = "下载管理"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -120,6 +120,9 @@ class SeedSourceGuard(_PluginBase):
     def init_plugin(self, config: dict = None) -> None:
         """根据插件配置初始化运行状态。"""
         self.stop_service()
+        # 防重入锁：定时任务与手动命令可能并发触发两轮检测，
+        # 并发会竞争 days 计数并对同一任务重复删除
+        self._running = False
         self._enabled = False
         if not config:
             return
@@ -155,8 +158,10 @@ class SeedSourceGuard(_PluginBase):
         self._skip_unreachable = bool(config.get("skip_unreachable", True))
         # 整站失联提醒天数：0 或不填表示不提醒（默认 7 天，之后每 7 天一次）
         try:
-            self._site_offline_alert_days = max(0, int(config.get("site_offline_alert_days")
-                                                       or self._site_offline_alert_days))
+            raw_alert_days = config.get("site_offline_alert_days")
+            # 显式区分「未填」与「填 0」：填 0 表示关闭提醒，不能被 or 回落成默认 7
+            self._site_offline_alert_days = (max(0, int(raw_alert_days))
+                                             if raw_alert_days not in (None, "") else 7)
         except (TypeError, ValueError):
             self._site_offline_alert_days = 7
         # 整站失联超期删除：独立开关，默认关闭；关闭时维持只提醒不处置
@@ -1133,6 +1138,21 @@ class SeedSourceGuard(_PluginBase):
     # ── 核心检测 ──────────────────────────────────────────────
 
     def _run_check(self, handle: bool = False) -> None:
+        """检测入口：加非重入保护后执行实际检测。
+
+        定时任务与聊天命令可能并发触发两轮检测，并发会竞争 days 计数
+        （读改写覆盖）并对同一任务重复删除，故同一时刻只允许一轮在跑。
+        """
+        if getattr(self, "_running", False):
+            logger.warning("做种守卫上一轮检测仍在执行中，本轮跳过（防重入）")
+            return
+        self._running = True
+        try:
+            self._run_check_inner(handle=handle)
+        finally:
+            self._running = False
+
+    def _run_check_inner(self, handle: bool = False) -> None:
         """执行一轮完整检测，handle=True 时按配置处置达标项。"""
         if not self._enabled:
             logger.warning("做种守卫未启用，跳过本轮检测")
@@ -1678,7 +1698,11 @@ class SeedSourceGuard(_PluginBase):
                 continue
             if depth < self._max_depth:
                 # 未覆盖且还有深度：先看下层是否有任务覆盖（分类层级场景）
-                children = [c for c in entry.iterdir() if c.is_dir()]
+                try:
+                    children = [c for c in entry.iterdir() if c.is_dir()]
+                except OSError:
+                    # 目录不可读（权限/已被并发删除）时按无子目录处理，不中断整轮
+                    children = []
                 if children:
                     self._walk_scan(entry, depth + 1, task_roots, no_seed)
                     continue
@@ -2080,9 +2104,6 @@ class SeedSourceGuard(_PluginBase):
 
         返回 (本轮提醒清单, 全部在跟踪中的失联站点清单)。
         """
-        if not self._site_offline_alert_days:
-            self.save_data("site_offline", {})
-            return [], []
         stored = self.get_data("site_offline") or {}
         today = datetime.now().strftime("%Y-%m-%d")
         alerts: List[Dict[str, Any]] = []
@@ -2096,8 +2117,11 @@ class SeedSourceGuard(_PluginBase):
             record["failed"] = stat["failed"]
             stored[host] = record
 
-            threshold = max(1, int(self._site_offline_alert_days) * int(self._scan_times))
-            if record["rounds"] >= threshold:
+            # 提醒天数填 0 只关闭提醒节奏，跟踪仍需照常维护：
+            # 超期删除与页面跟踪表都依赖 rounds 累计，清空会让超期删除永不触发
+            threshold = (max(1, int(self._site_offline_alert_days) * int(self._scan_times))
+                         if self._site_offline_alert_days else 0)
+            if threshold and record["rounds"] >= threshold:
                 last_alert = int(record.get("alert_rounds") or 0)
                 if not last_alert or record["rounds"] - last_alert >= 7 * int(self._scan_times):
                     record["alert_rounds"] = record["rounds"]
