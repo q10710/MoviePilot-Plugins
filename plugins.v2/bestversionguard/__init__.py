@@ -87,7 +87,7 @@ TMDB_MEDIA_SOURCE = "themoviedb"
 # 站点完结证据：种子标题命中完结表述（强证据）；带「更至/更新至」或集数对不上总期数的
 # 只算弱证据（仅阻止取消洗版，不作为判完结依据）。
 _SITE_COMPLETE_RE = re.compile(r"\b(?:complete|completed)\b|完结|全集|全\s*\d+\s*[集期话]", re.IGNORECASE)
-_SITE_ONGOING_RE = re.compile(r"更至|更新至|更新中|ongoing|连载|预计|待更", re.IGNORECASE)
+_SITE_ONGOING_RE = re.compile(r"更至|更新至|更新中|未完结|未完成|ongoing|连载|预计|待更", re.IGNORECASE)
 _SITE_TOTAL_RE = re.compile(r"全\s*(\d+)\s*[集期话]")
 
 
@@ -101,7 +101,7 @@ class BestVersionGuard(_PluginBase):
                    "普通订阅库缺集自动对账回退补齐（删掉的文件被订阅重新补回）；"
                    "TMDB+豆瓣+站点多源完结信号，严取消门槛（连续确认），误取消自动重开自愈。")
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/bestversionguard.png"
-    plugin_version = "2.10.0"
+    plugin_version = "2.10.1"
     plugin_label = "订阅"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -166,8 +166,12 @@ class BestVersionGuard(_PluginBase):
     # 紡计自动重开次数与最近一次明细（数据页/通知展示）
     _reopened_count: int = 0
     _last_reopened: List[Dict[str, Any]] = []
-    # 豆瓣完结查询缓存：「剧名|季播出年」-> (是否完结, 说明)（同轮巡检内复用）
-    _douban_cache: Dict[str, Tuple[Optional[bool], str]] = {}
+    # 豆瓣完结查询缓存：「剧名|季播出年」-> (写入时间戳, 是否完结, 说明)。
+    # 带 TTL（_DOUBAN_CACHE_TTL 秒）而非永久缓存：豆瓣数据随播出推进会变
+    # （11/13 → 13/13），永久缓存会让完结信号逐渐失灵；但也不能每轮清空——
+    # 豆瓣 API 有 60 秒限流，每轮全量重查会打爆。折中 6 小时。
+    _douban_cache: Dict[str, Tuple[float, Optional[bool], str]] = {}
+    _DOUBAN_CACHE_TTL = 6 * 3600
     # 累计对账回退次数与最近一次明细（数据页/通知展示）
     _reconcile_count: int = 0
     _last_reconcile: List[Dict[str, Any]] = []
@@ -1333,8 +1337,9 @@ class BestVersionGuard(_PluginBase):
         if not name:
             return None, ""
         cache_key = f"{name}|{season_year or ''}"
-        if cache_key in self._douban_cache:
-            return self._douban_cache[cache_key]
+        cached = self._douban_cache.get(cache_key)
+        if cached and (time.time() - cached[0]) < self._DOUBAN_CACHE_TTL:
+            return cached[1], cached[2]
         result: Tuple[Optional[bool], str] = (None, "")
         try:
             api = DoubanApi()
@@ -1371,7 +1376,7 @@ class BestVersionGuard(_PluginBase):
                                   if ok else f"豆瓣《{title}》 {last}/{count} 期未完结")
         except Exception as e:
             logger.debug(f"豆瓣完结查询失败: {name} - {e}")
-        self._douban_cache[cache_key] = result
+        self._douban_cache[cache_key] = (time.time(), result[0], result[1])
         return result
 
     def _site_completion_evidence(self, sub: Any) -> Tuple[bool, str]:
@@ -1606,18 +1611,27 @@ class BestVersionGuard(_PluginBase):
                 # 误取消自愈（2.10.0）：本插件取消过洗版的订阅（在管记录）出现完结证据
                 # 时自动重开整季洗版；同一订阅 reopen_cooldown_days 天内最多一次，防翻转。
                 auto_reopened = False
-                if (not newly_enabled) and not sub.best_version and fix_key in self._fixed_ids:
-                    if self._reopen_enabled and self._can_reopen(sub.id):
+                if fix_key in self._fixed_ids and not sub.best_version and not newly_enabled:
+                    if not self._reopen_enabled:
+                        # 用户关闭了自动重开：清掉在管记录，不再监测自愈
+                        self._fixed_ids.discard(fix_key)
+                        self._save_state()
+                    elif self._can_reopen(sub.id):
                         auto_reopened = True
                         payload["best_version"] = 1
                         payload["best_version_full"] = 1
                         self._reopen_records[fix_key] = time.time()
+                        self._fixed_ids.discard(fix_key)
+                        self._save_state()
                     else:
-                        # 未启用自动重开或处于重开限频期：保持普通订阅，仅清在管记录
+                        # 重开限频期：保留在管记录、不清除——限频期过后的下一轮
+                        # 出现完结证据仍会重开；若像旧版那样清掉记录，该订阅会
+                        # 永久退出重开监测，限频期过后也无法自愈。
                         logger.info(f"已取消洗版的订阅出现完结证据，但处于重开限频期"
                                     f"（{self._reopen_cooldown_days} 天），保持普通订阅: "
                                     f"{sub.name} S{sub.season}")
-                if fix_key in self._fixed_ids:
+                elif fix_key in self._fixed_ids:
+                    # 已是洗版订阅（经本插件重开或其它途径恢复）：清掉在管记录即可
                     self._fixed_ids.discard(fix_key)
                     self._save_state()
                 if (sub.best_version or payload.get("best_version")) and not sub.best_version_full \
