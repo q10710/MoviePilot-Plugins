@@ -165,7 +165,7 @@ class LinkChecker(_PluginBase):
     plugin_name = "硬链接检查Q自用版"
     plugin_desc = "扫描下载目录和媒体库目录中的孤立硬链接文件，连续3天孤立自动删除；并可清理只剩元数据、没有视频的空壳季目录/剧目录。"
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/linkchecker.png"
-    plugin_version = "3.3.9"
+    plugin_version = "3.3.10"
     plugin_label = "文件管理"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -965,8 +965,9 @@ class LinkChecker(_PluginBase):
         self._last_deleted = 0
 
         # 扫描两侧全部视频文件（含硬链接），用于建立/更新「曾经硬链接」历史
-        all_dl = self._scan_files(self._download_dirs)
-        all_lib = self._scan_files(self._library_dirs)
+        scan_errors: List[str] = []
+        all_dl = self._scan_files(self._download_dirs, scan_errors)
+        all_lib = self._scan_files(self._library_dirs, scan_errors)
         dl_prefixes = tuple(d.rstrip("/") + "/" for d in self._download_dirs)
 
         current_paths: set = set()
@@ -988,7 +989,15 @@ class LinkChecker(_PluginBase):
         # 否则同路径日后重现的 links=1 文件会被误判为「断开残留」而删除。
         # 断开残留本身仍在某一侧存在，其指纹会被 present_keys 正常保留，
         # 不影响「曾 links≥2、现 links=1」的判定。
-        self._linked_seen &= present_keys
+        # 但本轮扫描不完整（挂载点离线、目录不可读）时必须跳过剪枝：
+        # 缺失侧的文件会被 present_keys 整体漏掉，照常剪枝会把该侧历史指纹
+        # 永久清掉，挂载恢复后这些残留再也无法识别——不可逆，只丢清理能力。
+        if scan_errors:
+            logger.warning(
+                f"本轮 {len(scan_errors)} 处配置目录不可访问，跳过指纹剪枝（防离线整侧剪掉历史）: {scan_errors[:3]}"
+            )
+        else:
+            self._linked_seen &= present_keys
 
         # 展示列表：只列断开残留（下载侧与媒体库侧分开）
         dl_orphans = [f for f in all_dl if f["_path"] in download_side]
@@ -1375,17 +1384,27 @@ class LinkChecker(_PluginBase):
                 return True
         return False
 
-    def _scan_files(self, dirs: List[str]) -> List[Dict[str, Any]]:
+    def _scan_files(self, dirs: List[str], errors: Optional[List[str]] = None) -> List[Dict[str, Any]]:
         """扫描目录下所有视频文件（含硬链接），返回文件信息与链接数。
 
         与旧版不同：这里不过滤 links，保留链接数 ≥2 的文件，用于判断「曾经被硬链接过」——
         只有曾经是硬链接、现在链接数为 1（说明另一侧已被删除）的文件才进入清理候选。
+
+        传入 errors 时收集本轮的目录访问失败（配置目录缺失、挂载点离线、
+        walk 中途报错），供调用方判断扫描是否完整、决定能否执行指纹剪枝。
         """
         results: List[Dict[str, Any]] = []
         for base_dir in dirs:
             if not os.path.isdir(base_dir):
+                if errors is not None:
+                    errors.append(base_dir)
                 continue
-            for root, _, files in os.walk(base_dir):
+
+            def _walk_error(err: OSError) -> None:
+                if errors is not None:
+                    errors.append(str(err))
+
+            for root, _, files in os.walk(base_dir, onerror=_walk_error):
                 for fname in files:
                     ext = os.path.splitext(fname)[1].lower()
                     if ext not in self._VIDEO_EXTS:
