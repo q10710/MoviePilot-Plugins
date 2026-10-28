@@ -41,7 +41,7 @@ class SeedSourceGuard(_PluginBase):
     plugin_desc = ("检测本地源文件是否有下载器在做种、下载器是否存在文件丢失的无效做种或"
                    "tracker 全部失败的做种任务；连续N天异常可通知或按策略处置，杜绝无效做种与孤儿文件。")
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/seedsourceguard.png"
-    plugin_version = "1.1.28"
+    plugin_version = "1.1.29"
     plugin_label = "下载管理"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -1210,7 +1210,17 @@ class SeedSourceGuard(_PluginBase):
 
         services = self._downloader_helper.get_services(name_filters=self._downloaders or None)
         if not services:
+            # 配置的检测范围一个都没匹配上（下载器改名/停用/删除）会让插件静默停摆，
+            # 必须落盘并通知，否则只能靠翻日志才发现
             logger.warning("未获取到任何已配置的下载器，本轮跳过")
+            self._save_report(
+                {"unavailable": [{"name": "-", "err": "未匹配到任何已配置的下载器"}]},
+                last_run="未匹配到下载器，本轮已跳过")
+            self._notify_unavailable(
+                "下载器匹配为空",
+                "「参与检测的下载器」未匹配到任何已配置下载器，请核对配置中的名称"
+                "与「系统设置 - 下载器」是否一致；留空表示检测全部。",
+                handle=handle)
             return
 
         # 1. 逐下载器获取任务
@@ -2154,8 +2164,9 @@ class SeedSourceGuard(_PluginBase):
         """跟踪整站失联的连续轮次，并每 7 天提醒一次。
 
         入参为 `_detect_site_offline` 已确认不可达的站点（含 total/failed/probe）。
-        连续轮次按实际扫描轮次累计，站点恢复可达即立即移出跟踪；已累计轮次不清零，
-        站点再次失联时从原轮次继续累计。首次提醒在连续失联达到
+        连续轮次按实际扫描轮次累计；站点恢复可达即移出跟踪并**清零计数**
+        （2026-10-28 用户拍板：站点可达就移出、清零，再次不可达时从零开始算）。
+        首次提醒在连续失联达到
         `_site_offline_alert_days` 天时发出，之后每 7 天再提醒一次（均换算为扫描轮次），
         避免每轮刷屏。**本方法只做提醒，不对任何种子或文件做处置。**
 
@@ -2191,7 +2202,8 @@ class SeedSourceGuard(_PluginBase):
                         "first_seen": record.get("first_seen", today),
                     })
 
-        # 已恢复（本轮不再整体失联）的站点立即移出跟踪
+        # 已恢复（本轮不再整体失联）的站点立即移出跟踪，rounds 随记录一并清零
+        # （2026-10-28 用户拍板：站点可达就移出、清零，再次失联时从零开始算）
         for host in [h for h in stored if h not in offline_now]:
             stored.pop(host, None)
         if alerts:
@@ -2598,7 +2610,11 @@ class SeedSourceGuard(_PluginBase):
             for item in unavailable[:5]:
                 lines.append(f"  - {item.get('name', '')}: {item.get('err', '')[:80]}")
         if handled_list:
-            done = [h for h in handled_list if str(h.get("text", "")).startswith(("已", "达标未"))]
+            # 除「检测到」（纯通知项，上面统计已含）与「站点级故障保护」外都列出，
+            # 让删除失败、处置失败、配置缺失这类问题在通知里也能看到
+            done = [h for h in handled_list
+                    if str(h.get("text", "")).startswith(
+                        ("已", "达标未", "删除失败", "处置失败", "配置缺失"))]
             if done:
                 lines.append(f"处置动作：{len(done)} 项")
                 for h in done[-3:]:
