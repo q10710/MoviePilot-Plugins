@@ -41,7 +41,7 @@ class SeedSourceGuard(_PluginBase):
     plugin_desc = ("检测本地源文件是否有下载器在做种、下载器是否存在文件丢失的无效做种或"
                    "tracker 全部失败的做种任务；连续N天异常可通知或按策略处置，杜绝无效做种与孤儿文件。")
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/seedsourceguard.png"
-    plugin_version = "1.1.29"
+    plugin_version = "1.1.30"
     plugin_label = "下载管理"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -1266,22 +1266,34 @@ class SeedSourceGuard(_PluginBase):
             self._notify_summary(report, handled=handle)
             return
 
-        # 3. 无效做种检测
-        invalid_candidates = self._detect_invalid(task_index)
-        report["invalid"] = invalid_candidates
+        # 3. 无效做种检测（单类检测异常只记入异常清单，不中断整轮：
+        #    三类检测相互独立，一类出错不该让另外两类的结果也丢失）
+        try:
+            report["invalid"] = self._detect_invalid(task_index)
+        except Exception as err:
+            logger.error(f"无效做种检测异常，本轮跳过该类检测：{err}")
+            report["unavailable"].append({"name": "无效做种检测", "err": str(err)[:200]})
 
         # 3b. 红种做种检测（tracker 全部通告失败）
-        red_candidates, hold_count, host_stats = self._detect_red(task_index, services)
-        report["red"] = red_candidates
-        report["hold_count"] = hold_count
-        report["host_stats"] = host_stats
+        host_stats: Dict[str, Dict[str, int]] = {}
+        try:
+            red_candidates, hold_count, host_stats = self._detect_red(task_index, services)
+            report["red"] = red_candidates
+            report["hold_count"] = hold_count
+            report["host_stats"] = host_stats
+        except Exception as err:
+            logger.error(f"红种检测异常，本轮跳过该类检测：{err}")
+            report["unavailable"].append({"name": "红种检测", "err": str(err)[:200]})
 
         # 4. 孤儿源文件检测
-        no_seed_candidates = self._detect_no_seed(task_index, extra_roots=[
-            str(t["root"]) for tasks in unsupported_index.values()
-            for t in tasks if t.get("root")
-        ])
-        report["no_seed"] = no_seed_candidates
+        try:
+            report["no_seed"] = self._detect_no_seed(task_index, extra_roots=[
+                str(t["root"]) for tasks in unsupported_index.values()
+                for t in tasks if t.get("root")
+            ])
+        except Exception as err:
+            logger.error(f"孤儿源文件检测异常，本轮跳过该类检测：{err}")
+            report["unavailable"].append({"name": "孤儿源文件检测", "err": str(err)[:200]})
 
         # 5. 按天计数并处置
         handled_list = self._settle(report, handle=handle, task_index=task_index,
@@ -1568,6 +1580,14 @@ class SeedSourceGuard(_PluginBase):
         return "unknown"
 
     @staticmethod
+    def _to_int(value: Any, default: int = 0) -> int:
+        """安全转整数：客户端返回非数字时回退默认值，不中断整轮检测。"""
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
     def _tracker_red_verdict(tracker_stats: Any) -> Optional[Tuple[str, str]]:
         """解析 tracker 数据，返回红种归类与失败原因；非红种返回 None。
 
@@ -1619,7 +1639,7 @@ class SeedSourceGuard(_PluginBase):
         reasons: List[str] = []
         for it in real:
             if fget(it, "status") is not None:  # qBittorrent tracker 状态
-                status = int(fget(it, "status") or 0)
+                status = SeedSourceGuard._to_int(fget(it, "status"))
                 if status in (2, 3):  # WORKING / UPDATING：至少一个正常则不红
                     return None
                 # 4=NOT_WORKING、5=TRACKER_ERROR、6=UNREACHABLE 均为明确通告失败；
@@ -1641,7 +1661,7 @@ class SeedSourceGuard(_PluginBase):
                 continue
             # Transmission trackerStats
             succ = fget(it, "lastAnnounceSucceeded")
-            atime = int(fget(it, "lastAnnounceTime") or 0)
+            atime = SeedSourceGuard._to_int(fget(it, "lastAnnounceTime"))
             result = str(fget(it, "lastAnnounceResult") or "")
             if atime > 0:
                 announced = True
@@ -1912,132 +1932,145 @@ class SeedSourceGuard(_PluginBase):
         days_data = self.get_data("days") or {}
         handled_list = []
         today = datetime.now().strftime("%Y-%m-%d")
+        # 三个映射提前初始化：若 try 块中途异常，finally 之后生成活跃清单时
+        # 仍能安全引用，不会因 NameError 把原始异常掩盖掉
+        no_seed_map: Dict[str, Any] = {}
+        invalid_map: Dict[str, Any] = {}
+        red_map_active: Dict[str, Any] = {}
+        try:
 
-        # 孤儿源文件计数
-        no_seed_map = {}
-        for item in report["no_seed"]:
-            no_seed_map[item["path"]] = item
-        stale_no_seed = self._bump_days(days_data, "no_seed", no_seed_map, today)
-        for key, days in stale_no_seed.items():
-            path = key.split(":", 1)[1]
-            handled = self._handle_no_seed(path, days, handle)
-            if handled:
-                handled_list.append(handled)
-                # 仅当处置真正执行（删除/移动成功）才移出记录；仅通知、未开开关或处置失败时
-                # 保留计数，避免下轮从 1 重新计数（页面出现「已持续 1 次扫描」的假象）
-                if handled.get("disposed"):
-                    days_data.pop(key, None)
+            # 孤儿源文件计数
+            no_seed_map = {}
+            for item in report["no_seed"]:
+                no_seed_map[item["path"]] = item
+            stale_no_seed = self._bump_days(days_data, "no_seed", no_seed_map, today)
+            for key, days in stale_no_seed.items():
+                path = key.split(":", 1)[1]
+                handled = self._handle_no_seed(path, days, handle)
+                if handled:
+                    handled_list.append(handled)
+                    # 仅当处置真正执行（删除/移动成功）才移出记录；仅通知、未开开关或处置失败时
+                    # 保留计数，避免下轮从 1 重新计数（页面出现「已持续 1 次扫描」的假象）
+                    if handled.get("disposed"):
+                        days_data.pop(key, None)
 
-        # 个别红种计数（带站点/网络级故障保护）
-        red_map = {}
-        for item in report.get("red") or []:
-            key = f"{item['dl']}:{item['hash'] or item['root']}"
-            red_map[key] = item
-        protected = self._red_protected_keys(red_map, report.get("hold_count") or {})
-        for key in sorted(protected):
-            item = red_map[key]
-            handled_list.append({
-                "time": datetime.now().strftime("%m-%d %H:%M"),
-                "text": (f"站点级故障保护：{item.get('dl', '')} 红种 {protected[key]}，"
-                         "本轮不处置，仅通知"),
-            })
-        # 整站失联：某站的种子「全部连不上」时先判为疑似站点故障，再做一次站点连通性
-        # 二次验证；只有确认站点也不可达，才豁免该站全部种子（不计红种、不处置），
-        # 并按 7 天一次提醒。站点能访问（如仅 announce 异常）或只有部分种子连不上，
-        # 仍按红种处理。站点明确回「无此种子」以及 403/405 等应答类失败一律算红种。
-        site_offline_now: Dict[str, Dict[str, Any]] = {}
-        if self._skip_unreachable:
-            site_offline_now = self._detect_site_offline(red_map, host_stats or {})
-        exempt_red: Dict[str, Any] = {
-            key: item for key, item in red_map.items()
-            if item.get("host") and item.get("host") in site_offline_now
-        } if site_offline_now else {}
-        # 站点级 80% 保护仍按原样生效（整站失联已单独判定，这里只保留其原有用途）
-        if exempt_red:
-            logger.warning(
-                f"整站红种：{len(exempt_red)} 个任务所属站点经连通性验证确认不可达，"
-                "本轮不按个别红种处置（站点恢复后继续累计）"
-            )
-        report["red_exempt"] = list(exempt_red.values())
-        site_alerts, site_tracking = self._track_site_offline(site_offline_now)
-        report["site_offline"] = site_alerts
-        report["site_offline_tracking"] = site_tracking
-        red_map_active = {k: v for k, v in red_map.items() if k not in protected}
-        red_map_active = {k: v for k, v in red_map_active.items() if k not in exempt_red}
-        # 供通知统计使用：只含豁免后仍按红种处置的项
-        report["red_active"] = list(red_map_active.values())
-        # 正常辅种覆盖判定集合：只排除真正即将删除的个别红种（按下载器+hash 身份），
-        # 仅它们不能充当自己的共享者；整站失联豁免与占比保护的任务仍在做种、文件仍是
-        # 有效共享者，无效做种也保留在集合中（其文件可能仍在），三者都必须保留，
-        # 否则与之共享文件的红种会被误判为无共享而连文件删除
-        bad_tasks = set()
-        for item in list(red_map_active.values()):
-            bad_tasks.add((str(item.get("dl") or ""), str(item.get("hash") or "")))
-        healthy_tasks: List[Dict[str, Any]] = []
-        for dl_name, tasks in (task_index or {}).items():
-            for task in tasks:
-                if (dl_name, str(task.get("hash") or "")) in bad_tasks:
-                    continue
-                root_v = (task.get("root") or "").rstrip("/")
-                if root_v:
-                    healthy_tasks.append(task)
-        # 已拉黑下载器的任务不参与检测，但仍是活跃做种，
-        # 必须作为共享者参与「连文件删除」判定，否则其共享文件会被误删
-        for tasks in (unsupported_index or {}).values():
-            for task in tasks:
-                if (str(task.get("dl") or ""), str(task.get("hash") or "")) in bad_tasks:
-                    continue
-                root_v = (task.get("root") or "").rstrip("/")
-                if root_v:
-                    healthy_tasks.append(task)
-        files_cache: Dict[str, Optional[set]] = {}
-        # 无效做种计数与处置（其「删除任务及文件」需共享判定，必须在 healthy_tasks 构建后）
-        invalid_map = {}
-        for item in report["invalid"]:
-            key = f"{item['dl']}:{item['hash'] or item['root']}"
-            invalid_map[key] = item
-        stale_invalid = self._bump_days(days_data, "invalid", invalid_map, today)
-        for key, days in stale_invalid.items():
-            item = invalid_map.get(key) or {}
-            handled = self._handle_invalid(item, days, handle,
+            # 个别红种计数（带站点/网络级故障保护）
+            red_map = {}
+            for item in report.get("red") or []:
+                key = f"{item['dl']}:{item['hash'] or item['root']}"
+                red_map[key] = item
+            protected = self._red_protected_keys(red_map, report.get("hold_count") or {})
+            for key in sorted(protected):
+                item = red_map[key]
+                handled_list.append({
+                    "time": datetime.now().strftime("%m-%d %H:%M"),
+                    "text": (f"站点级故障保护：{item.get('dl', '')} 红种 {protected[key]}，"
+                             "本轮不处置，仅通知"),
+                })
+            # 整站失联：某站的种子「全部连不上」时先判为疑似站点故障，再做一次站点连通性
+            # 二次验证；只有确认站点也不可达，才豁免该站全部种子（不计红种、不处置），
+            # 并按 7 天一次提醒。站点能访问（如仅 announce 异常）或只有部分种子连不上，
+            # 仍按红种处理。站点明确回「无此种子」以及 403/405 等应答类失败一律算红种。
+            site_offline_now: Dict[str, Dict[str, Any]] = {}
+            if self._skip_unreachable:
+                site_offline_now = self._detect_site_offline(red_map, host_stats or {})
+            exempt_red: Dict[str, Any] = {
+                key: item for key, item in red_map.items()
+                if item.get("host") and item.get("host") in site_offline_now
+            } if site_offline_now else {}
+            # 站点级 80% 保护仍按原样生效（整站失联已单独判定，这里只保留其原有用途）
+            if exempt_red:
+                logger.warning(
+                    f"整站红种：{len(exempt_red)} 个任务所属站点经连通性验证确认不可达，"
+                    "本轮不按个别红种处置（站点恢复后继续累计）"
+                )
+            report["red_exempt"] = list(exempt_red.values())
+            site_alerts, site_tracking = self._track_site_offline(site_offline_now)
+            report["site_offline"] = site_alerts
+            report["site_offline_tracking"] = site_tracking
+            red_map_active = {k: v for k, v in red_map.items() if k not in protected}
+            red_map_active = {k: v for k, v in red_map_active.items() if k not in exempt_red}
+            # 供通知统计使用：只含豁免后仍按红种处置的项
+            report["red_active"] = list(red_map_active.values())
+            # 正常辅种覆盖判定集合：只排除真正即将删除的个别红种（按下载器+hash 身份），
+            # 仅它们不能充当自己的共享者；整站失联豁免与占比保护的任务仍在做种、文件仍是
+            # 有效共享者，无效做种也保留在集合中（其文件可能仍在），三者都必须保留，
+            # 否则与之共享文件的红种会被误判为无共享而连文件删除
+            bad_tasks = set()
+            for item in list(red_map_active.values()):
+                bad_tasks.add((str(item.get("dl") or ""), str(item.get("hash") or "")))
+            healthy_tasks: List[Dict[str, Any]] = []
+            for dl_name, tasks in (task_index or {}).items():
+                for task in tasks:
+                    if (dl_name, str(task.get("hash") or "")) in bad_tasks:
+                        continue
+                    root_v = (task.get("root") or "").rstrip("/")
+                    if root_v:
+                        healthy_tasks.append(task)
+            # 已拉黑下载器的任务不参与检测，但仍是活跃做种，
+            # 必须作为共享者参与「连文件删除」判定，否则其共享文件会被误删
+            for tasks in (unsupported_index or {}).values():
+                for task in tasks:
+                    if (str(task.get("dl") or ""), str(task.get("hash") or "")) in bad_tasks:
+                        continue
+                    root_v = (task.get("root") or "").rstrip("/")
+                    if root_v:
+                        healthy_tasks.append(task)
+            files_cache: Dict[str, Optional[set]] = {}
+            # 无效做种计数与处置（其「删除任务及文件」需共享判定，必须在 healthy_tasks 构建后）
+            invalid_map = {}
+            for item in report["invalid"]:
+                key = f"{item['dl']}:{item['hash'] or item['root']}"
+                invalid_map[key] = item
+            stale_invalid = self._bump_days(days_data, "invalid", invalid_map, today)
+            for key, days in stale_invalid.items():
+                item = invalid_map.get(key) or {}
+                handled = self._handle_invalid(item, days, handle,
+                                               healthy_tasks, services, files_cache)
+                if handled:
+                    handled_list.append(handled)
+                    if handled.get("disposed"):
+                        days_data.pop(key, None)
+
+            stale_red = self._bump_days(days_data, "red", red_map_active, today)
+            for key, days in stale_red.items():
+                item = red_map_active.get(key) or {}
+                handled = self._handle_red(item, days, handle,
                                            healthy_tasks, services, files_cache)
-            if handled:
-                handled_list.append(handled)
-                if handled.get("disposed"):
-                    days_data.pop(key, None)
+                if handled:
+                    handled_list.append(handled)
+                    if handled.get("disposed"):
+                        days_data.pop(key, None)
 
-        stale_red = self._bump_days(days_data, "red", red_map_active, today)
-        for key, days in stale_red.items():
-            item = red_map_active.get(key) or {}
-            handled = self._handle_red(item, days, handle,
-                                       healthy_tasks, services, files_cache)
-            if handled:
-                handled_list.append(handled)
-                if handled.get("disposed"):
-                    days_data.pop(key, None)
+            # 整站失联超期删除：独立开关；连续失联达到设定天数后删除该站全部种子任务。
+            # 与红种同口径：只删该站自己的种子任务，别的站正常种子一律不动；
+            # 源文件仍被任一正常做种任务覆盖则只删任务保留文件，无任何正常覆盖时连同源文件删除。
+            handled_list.extend(self._handle_site_offline_expiry(
+                site_tracking, exempt_red, handle, healthy_tasks, services, files_cache))
 
-        # 整站失联超期删除：独立开关；连续失联达到设定天数后删除该站全部种子任务。
-        # 与红种同口径：只删该站自己的种子任务，别的站正常种子一律不动；
-        # 源文件仍被任一正常做种任务覆盖则只删任务保留文件，无任何正常覆盖时连同源文件删除。
-        handled_list.extend(self._handle_site_offline_expiry(
-            site_tracking, exempt_red, handle, healthy_tasks, services, files_cache))
+            # 清理已恢复的旧记录（保留当前仍异常项的天数历史）
+            for prefix in ("no_seed:", "invalid:", "red:"):
+                for old_key in [k for k in days_data if k.startswith(prefix)]:
+                    body = old_key[len(prefix):]
+                    if prefix == "no_seed:" and body not in no_seed_map:
+                        days_data.pop(old_key, None)
+                    elif prefix == "invalid:" and body not in invalid_map:
+                        days_data.pop(old_key, None)
+                    elif (prefix == "red:" and body not in red_map_active
+                          and body not in exempt_red
+                          # 占比保护项仍在异常中，只是本轮不处置，计数不得清除，
+                          # 否则保护解除后从 1 重计、之前的连续异常累计全部作废
+                          and body not in protected):
+                        days_data.pop(old_key, None)
 
-        # 清理已恢复的旧记录（保留当前仍异常项的天数历史）
-        for prefix in ("no_seed:", "invalid:", "red:"):
-            for old_key in [k for k in days_data if k.startswith(prefix)]:
-                body = old_key[len(prefix):]
-                if prefix == "no_seed:" and body not in no_seed_map:
-                    days_data.pop(old_key, None)
-                elif prefix == "invalid:" and body not in invalid_map:
-                    days_data.pop(old_key, None)
-                elif (prefix == "red:" and body not in red_map_active
-                      and body not in exempt_red
-                      # 占比保护项仍在异常中，只是本轮不处置，计数不得清除，
-                      # 否则保护解除后从 1 重计、之前的连续异常累计全部作废
-                      and body not in protected):
-                    days_data.pop(old_key, None)
-
-        self.save_data("days", days_data)
+        finally:
+            # 无论中间是否异常，本轮计数改动都必须落盘：异常那轮的累计若丢失，
+            # 下轮会从旧值重计；持续异常时计数将永不增长、处置永不触发。
+            # days_data 各键相互独立，部分推进后落盘不会造成数据不一致。
+            try:
+                self.save_data("days", days_data)
+            except Exception as save_err:
+                logger.error(f"保存扫描计数失败：{save_err}")
         # 供数据页展示的活跃异常（含持续天数）
         active_no_seed = [
             {"path": path, "days": self._calc_days(days_data, f"no_seed:{path}", today)}
