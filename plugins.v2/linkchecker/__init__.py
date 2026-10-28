@@ -8,8 +8,10 @@
 可按配置在出现后直接删除（媒体库维护，与硬链接判定无关）。
 """
 
+import asyncio
 import os
 import re
+import threading
 import time
 import shutil
 import hashlib
@@ -24,6 +26,12 @@ from app.core.event import eventmanager, Event
 from app.log import logger
 from app.plugins import _PluginBase
 from app.schemas.types import EventType
+
+
+# 扫描/清理互斥锁：API 手动触发、定时扫描、命令事件可能并发进入核心逻辑，
+# 交错执行会写坏跟踪记录（重复计数/重复删除尝试），统一在此串行化。
+# 放在模块级而非实例属性：插件重载会重建类与实例，模块级锁语义稳定，也不受实例拷贝影响。
+_SCAN_LOCK = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -157,7 +165,7 @@ class LinkChecker(_PluginBase):
     plugin_name = "硬链接检查Q自用版"
     plugin_desc = "扫描下载目录和媒体库目录中的孤立硬链接文件，连续3天孤立自动删除；并可清理只剩元数据、没有视频的空壳季目录/剧目录。"
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/linkchecker.png"
-    plugin_version = "3.3.6"
+    plugin_version = "3.3.7"
     plugin_label = "文件管理"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -276,6 +284,9 @@ class LinkChecker(_PluginBase):
             self._last_deleted_dirs = int(last.get("deleted_dirs") or 0)
         except (TypeError, ValueError):
             self._last_deleted_dirs = 0
+        # 恢复上次扫描日期：不恢复的话，重启当天的第二次扫描会把「连续天数」
+        # 多算 1 天，阈值 7 实际最快 6 天就删，比配置的宽限更激进
+        self._last_scan_date = str(last.get("scan_date") or "")
         if not config:
             self._enabled = False
             return
@@ -926,6 +937,7 @@ class LinkChecker(_PluginBase):
             "empty": self._empty_tracker,
             "last": {
                 "time": self._last_scan_time,
+                "scan_date": self._last_scan_date,
                 "download": self._last_download_orphans,
                 "library": self._last_library_orphans,
                 "empty_dirs": self._last_empty_dirs,
@@ -940,6 +952,11 @@ class LinkChecker(_PluginBase):
         return hashlib.md5(str(path).encode("utf-8", errors="ignore")).hexdigest()[:20]
 
     def _do_scan(self) -> None:
+        """执行扫描（对外统一入口，加互斥锁串行化）。"""
+        with _SCAN_LOCK:
+            self._do_scan_impl()
+
+    def _do_scan_impl(self) -> None:
         """执行扫描：找出「曾经被硬链接、如今只剩一份」的文件，按天计数并在达阈值后处置。
 
         判定要点（2026-09-11 重做）：
@@ -1052,28 +1069,29 @@ class LinkChecker(_PluginBase):
         )
 
     def _do_clean(self, target: str) -> int:
-        """手动清理孤立文件。"""
-        deleted = 0
-        files = []
-        if target in ("download", "all"):
-            files.extend(self._last_download_orphans)
-            self._last_download_orphans = []
-        if target in ("library", "all"):
-            files.extend(self._last_library_orphans)
-            self._last_library_orphans = []
-        for f in files:
-            path = f["_path"]
-            try:
-                os.remove(path)
-                deleted += 1
-                # 从跟踪记录中移除
-                self._orphan_tracker.pop(path, None)
-                logger.info(f"手动删除: {path}")
-            except OSError as e:
-                logger.info(f"删除失败: {path} - {e}")
-        self._save_tracker()
-        logger.info(f"手动清理完成: {deleted} 个文件")
-        return deleted
+        """手动清理孤立文件（加互斥锁，避免与定时扫描并发交错）。"""
+        with _SCAN_LOCK:
+            deleted = 0
+            files = []
+            if target in ("download", "all"):
+                files.extend(self._last_download_orphans)
+                self._last_download_orphans = []
+            if target in ("library", "all"):
+                files.extend(self._last_library_orphans)
+                self._last_library_orphans = []
+            for f in files:
+                path = f["_path"]
+                try:
+                    os.remove(path)
+                    deleted += 1
+                    # 从跟踪记录中移除
+                    self._orphan_tracker.pop(path, None)
+                    logger.info(f"手动删除: {path}")
+                except OSError as e:
+                    logger.info(f"删除失败: {path} - {e}")
+            self._save_tracker()
+            logger.info(f"手动清理完成: {deleted} 个文件")
+            return deleted
 
     def _scan_empty_dirs(self, is_new_day: bool) -> None:
         """扫描媒体库空壳目录并按配置清理（独立开关，默认关闭）。
@@ -1175,7 +1193,11 @@ class LinkChecker(_PluginBase):
             except OSError:
                 return None
             if not any(
-                f.lower() in self._MEDIA_MARKER_FILES or f.lower().startswith("season")
+                f.lower() in self._MEDIA_MARKER_FILES
+                or f.lower().startswith("season")
+                # Specials / 第1季 这类季命名子目录也视为条目线索，否则无年份的
+                # 剧目录会被快速路径挡掉，季目录删完后父目录永久剩成空目录
+                or any(re.match(p, f.lower()) for p in self._SEASON_DIR_PATTERNS)
                 for f in direct if not f.startswith(".")
             ):
                 return None
@@ -1240,30 +1262,31 @@ class LinkChecker(_PluginBase):
         return bool(re.search(r"(19|20)\d{2}", name))
 
     def _do_clean_empty(self) -> int:
-        """手动删除本次识别到的空壳目录，返回删除数量。"""
-        deleted = 0
-        for info in sorted(
-            self._last_empty_dirs,
-            key=lambda x: len(Path(x["dir_path"]).parts),
-            reverse=True,
-        ):
-            path = info["dir_path"]
-            if not os.path.isdir(path):
+        """手动删除本次识别到的空壳目录，返回删除数量（加互斥锁）。"""
+        with _SCAN_LOCK:
+            deleted = 0
+            for info in sorted(
+                self._last_empty_dirs,
+                key=lambda x: len(Path(x["dir_path"]).parts),
+                reverse=True,
+            ):
+                path = info["dir_path"]
+                if not os.path.isdir(path):
+                    self._empty_tracker.pop(path, None)
+                    continue
+                try:
+                    shutil.rmtree(path)
+                except OSError as e:
+                    # 同自动删除：失败保留计数，避免反复归零重来
+                    logger.warning(f"删除空壳目录失败(保留计数待重试): {path} - {e}")
+                    continue
+                deleted += 1
+                logger.info(f"手动删除空壳目录: {path}")
                 self._empty_tracker.pop(path, None)
-                continue
-            try:
-                shutil.rmtree(path)
-            except OSError as e:
-                # 同自动删除：失败保留计数，避免反复归零重来
-                logger.warning(f"删除空壳目录失败(保留计数待重试): {path} - {e}")
-                continue
-            deleted += 1
-            logger.info(f"手动删除空壳目录: {path}")
-            self._empty_tracker.pop(path, None)
-        self._last_empty_dirs = []
-        self._last_deleted_dirs += deleted
-        self._save_tracker()
-        return deleted
+            self._last_empty_dirs = []
+            self._last_deleted_dirs += deleted
+            self._save_tracker()
+            return deleted
 
     def _send_notify(self) -> None:
         """发送通知。"""
@@ -1289,8 +1312,8 @@ class LinkChecker(_PluginBase):
     # ── API ───────────────────────────────────────────────────
 
     async def _api_scan(self, apikey: str = "") -> Dict[str, Any]:
-        """API: 触发扫描。"""
-        self._do_scan()
+        """API: 触发扫描（在工作线程执行，扫描期间不阻塞事件循环）。"""
+        await asyncio.to_thread(self._do_scan)
         return {
             "success": True,
             "scan_time": self._last_scan_time,
@@ -1303,20 +1326,28 @@ class LinkChecker(_PluginBase):
         }
 
     async def _api_clean_empty(self, apikey: str = "") -> Dict[str, Any]:
-        """API: 手动清理识别到的空壳目录。"""
-        deleted = self._do_clean_empty()
+        """API: 手动清理识别到的空壳目录（工作线程执行）。"""
+        deleted = await asyncio.to_thread(self._do_clean_empty)
         return {"success": True, "deleted": deleted}
 
     async def _api_clean(self, target: str = "all", apikey: str = "") -> Dict[str, Any]:
-        """API: 手动清理。"""
-        deleted = self._do_clean(target)
+        """API: 手动清理（工作线程执行）。"""
+        deleted = await asyncio.to_thread(self._do_clean, target)
         return {"success": True, "deleted": deleted}
 
+    def _do_reset(self) -> None:
+        """重置跟踪记录（加互斥锁）。"""
+        with _SCAN_LOCK:
+            self._orphan_tracker = {}
+            self._empty_tracker = {}
+            # 故意不清 _linked_seen 指纹：「曾 links≥2」的历史一旦清掉，
+            # 现存 links=1 的残留永远无法再被识别，等于静默关掉整个清理能力
+            self._save_tracker()
+        logger.info("跟踪记录已重置（孤立计数与空壳计数，硬链接指纹历史保留）")
+
     async def _api_reset(self, apikey: str = "") -> Dict[str, Any]:
-        """API: 重置跟踪记录。"""
-        self._orphan_tracker = {}
-        self._save_tracker()
-        logger.info("跟踪记录已重置")
+        """API: 重置跟踪记录（工作线程执行）。"""
+        await asyncio.to_thread(self._do_reset)
         return {"success": True, "message": "跟踪记录已重置"}
 
     # ── 事件处理 ──────────────────────────────────────────────
