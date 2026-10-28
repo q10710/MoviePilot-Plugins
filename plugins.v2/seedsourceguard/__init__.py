@@ -41,7 +41,7 @@ class SeedSourceGuard(_PluginBase):
     plugin_desc = ("检测本地源文件是否有下载器在做种、下载器是否存在文件丢失的无效做种或"
                    "tracker 全部失败的做种任务；连续N天异常可通知或按策略处置，杜绝无效做种与孤儿文件。")
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/seedsourceguard.png"
-    plugin_version = "1.1.27"
+    plugin_version = "1.1.28"
     plugin_label = "下载管理"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -1610,13 +1610,24 @@ class SeedSourceGuard(_PluginBase):
         for it in real:
             if fget(it, "status") is not None:  # qBittorrent tracker 状态
                 status = int(fget(it, "status") or 0)
-                if status in (2, 3):  # working / updating：至少一个正常则不红
+                if status in (2, 3):  # WORKING / UPDATING：至少一个正常则不红
                     return None
-                if status == 4:  # notWorking：明确通告失败
+                # 4=NOT_WORKING、5=TRACKER_ERROR、6=UNREACHABLE 均为明确通告失败；
+                # 0=DISABLED（用户禁用）与 1=NOT_CONTACTED（从未联系）不计入，
+                # 后者对应「从未通告不判红」的保守口径。
+                # qB 状态枚举见 qbittorrentapi.TrackerStatus（对应 qB trackerentrystatus.h）
+                if status in (4, 5, 6):
                     announced = True
                     message = str(fget(it, "msg") or fget(it, "message") or "")
+                    if not message:
+                        message = {4: "tracker not working", 5: "tracker error",
+                                   6: "tracker unreachable"}.get(status, "")
                     reasons.append(message)
-                    kinds.append(SeedSourceGuard._classify_tracker_failure(message))
+                    # 6=UNREACHABLE 语义明确，直接归「连不上」；4/5 按文案归类
+                    if status == 6:
+                        kinds.append("unreachable")
+                    else:
+                        kinds.append(SeedSourceGuard._classify_tracker_failure(message))
                 continue
             # Transmission trackerStats
             succ = fget(it, "lastAnnounceSucceeded")
@@ -2493,10 +2504,21 @@ class SeedSourceGuard(_PluginBase):
         active = self.get_data("active") or {}
         prev_handled = state.get("handled") or []
         new_handled = (handled_list or []) + prev_handled
+        # 同样内容的记录只保留最新一条：「配置缺失」这类每轮重复的提示
+        # 若不去重会迅速占满 50 条缓冲，把正常处置记录冲掉
+        seen_texts = set()
+        deduped = []
+        for item in new_handled:
+            text_key = str((item or {}).get("text", ""))
+            if text_key and text_key in seen_texts:
+                continue
+            if text_key:
+                seen_texts.add(text_key)
+            deduped.append(item)
         state.update({
             "last_run": last_run or datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "unavailable": report.get("unavailable") or [],
-            "handled": new_handled[-50:],
+            "handled": deduped[-50:],
         })
         state.update(active)
         self.save_data("state", state)
