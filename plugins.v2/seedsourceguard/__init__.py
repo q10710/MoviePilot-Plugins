@@ -41,7 +41,7 @@ class SeedSourceGuard(_PluginBase):
     plugin_desc = ("检测本地源文件是否有下载器在做种、下载器是否存在文件丢失的无效做种或"
                    "tracker 全部失败的做种任务；连续N天异常可通知或按策略处置，杜绝无效做种与孤儿文件。")
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/seedsourceguard.png"
-    plugin_version = "1.1.30"
+    plugin_version = "1.1.31"
     plugin_label = "下载管理"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -1168,26 +1168,34 @@ class SeedSourceGuard(_PluginBase):
             text="开始执行检测...",
             userid=event.event_data.get("user"),
         )
-        self._run_check(handle=(action == "run"))
+        # 「立即检测」只看不计数：手动查看不应消耗「连续 N 天」的阈值；
+        # 「立即检测并处置」等同一次真实轮次，照常计数
+        is_run = action == "run"
+        self._run_check(handle=is_run, count=is_run)
 
     # ── 核心检测 ──────────────────────────────────────────────
 
-    def _run_check(self, handle: bool = False) -> None:
+    def _run_check(self, handle: bool = False, count: bool = True) -> None:
         """检测入口：加非重入保护后执行实际检测。
 
         定时任务与聊天命令可能并发触发两轮检测，并发会竞争 days 计数
         （读改写覆盖）并对同一任务重复删除，故同一时刻只允许一轮在跑。
+
+        :param handle: 是否按配置执行处置动作
+        :param count: 是否推进轮次计数。手动「仅检测」传 False——
+            手动查看的本意是了解当前状况，不该影响自动处置节奏，
+            否则频繁手动查看会让「连续 N 天」的阈值被提前耗尽
         """
         if getattr(self, "_running", False):
             logger.warning("做种守卫上一轮检测仍在执行中，本轮跳过（防重入）")
             return
         self._running = True
         try:
-            self._run_check_inner(handle=handle)
+            self._run_check_inner(handle=handle, count=count)
         finally:
             self._running = False
 
-    def _run_check_inner(self, handle: bool = False) -> None:
+    def _run_check_inner(self, handle: bool = False, count: bool = True) -> None:
         """执行一轮完整检测，handle=True 时按配置处置达标项。"""
         if not self._enabled:
             logger.warning("做种守卫未启用，跳过本轮检测")
@@ -1298,7 +1306,7 @@ class SeedSourceGuard(_PluginBase):
         # 5. 按天计数并处置
         handled_list = self._settle(report, handle=handle, task_index=task_index,
                                     host_stats=host_stats, services=services,
-                                    unsupported_index=unsupported_index)
+                                    unsupported_index=unsupported_index, count=count)
 
         # 6. 落盘与通知
         self._save_report(report, handled_list=handled_list)
@@ -1926,9 +1934,15 @@ class SeedSourceGuard(_PluginBase):
                 task_index: Optional[Dict[str, list]] = None,
                 host_stats: Optional[Dict[str, Dict[str, int]]] = None,
                 services: Optional[dict] = None,
-                unsupported_index: Optional[Dict[str, list]] = None
+                unsupported_index: Optional[Dict[str, list]] = None,
+                count: bool = True
                 ) -> List[Dict[str, Any]]:
-        """按连续天数阈值推进记录，并执行达标项的处置动作。"""
+        """按连续天数阈值推进记录，并执行达标项的处置动作。
+
+        :param count: 是否推进轮次计数。手动「仅检测」传 False 时既不推进
+            计数也不处置（stale 恒为空），只更新页面展示用的活跃清单，
+            不影响自动处置的节奏。
+        """
         days_data = self.get_data("days") or {}
         handled_list = []
         today = datetime.now().strftime("%Y-%m-%d")
@@ -1943,7 +1957,8 @@ class SeedSourceGuard(_PluginBase):
             no_seed_map = {}
             for item in report["no_seed"]:
                 no_seed_map[item["path"]] = item
-            stale_no_seed = self._bump_days(days_data, "no_seed", no_seed_map, today)
+            stale_no_seed = (self._bump_days(days_data, "no_seed", no_seed_map, today)
+                             if count else {})
             for key, days in stale_no_seed.items():
                 path = key.split(":", 1)[1]
                 handled = self._handle_no_seed(path, days, handle)
@@ -1985,7 +2000,7 @@ class SeedSourceGuard(_PluginBase):
                     "本轮不按个别红种处置（站点恢复后继续累计）"
                 )
             report["red_exempt"] = list(exempt_red.values())
-            site_alerts, site_tracking = self._track_site_offline(site_offline_now)
+            site_alerts, site_tracking = self._track_site_offline(site_offline_now, count=count)
             report["site_offline"] = site_alerts
             report["site_offline_tracking"] = site_tracking
             red_map_active = {k: v for k, v in red_map.items() if k not in protected}
@@ -2022,7 +2037,8 @@ class SeedSourceGuard(_PluginBase):
             for item in report["invalid"]:
                 key = f"{item['dl']}:{item['hash'] or item['root']}"
                 invalid_map[key] = item
-            stale_invalid = self._bump_days(days_data, "invalid", invalid_map, today)
+            stale_invalid = (self._bump_days(days_data, "invalid", invalid_map, today)
+                             if count else {})
             for key, days in stale_invalid.items():
                 item = invalid_map.get(key) or {}
                 handled = self._handle_invalid(item, days, handle,
@@ -2032,7 +2048,8 @@ class SeedSourceGuard(_PluginBase):
                     if handled.get("disposed"):
                         days_data.pop(key, None)
 
-            stale_red = self._bump_days(days_data, "red", red_map_active, today)
+            stale_red = (self._bump_days(days_data, "red", red_map_active, today)
+                         if count else {})
             for key, days in stale_red.items():
                 item = red_map_active.get(key) or {}
                 handled = self._handle_red(item, days, handle,
@@ -2192,7 +2209,8 @@ class SeedSourceGuard(_PluginBase):
             detail = f"{scheme} 无响应"
         return False, detail
 
-    def _track_site_offline(self, offline_now: Dict[str, Dict[str, Any]]
+    def _track_site_offline(self, offline_now: Dict[str, Dict[str, Any]],
+                            count: bool = True
                             ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         """跟踪整站失联的连续轮次，并每 7 天提醒一次。
 
@@ -2211,7 +2229,11 @@ class SeedSourceGuard(_PluginBase):
 
         for host, stat in offline_now.items():
             record = dict(stored.get(host) or {})
-            record["rounds"] = int(record.get("rounds") or 0) + 1
+            record.setdefault("rounds", 0)
+            # 手动「仅检测」不推进轮次：rounds 只反映真实扫描轮次，
+            # 但 last_seen/total/failed 照常更新，页面仍能看到当前状态
+            if count:
+                record["rounds"] = int(record.get("rounds") or 0) + 1
             record.setdefault("first_seen", today)
             record["last_seen"] = today
             record["total"] = stat["total"]
