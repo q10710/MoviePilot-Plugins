@@ -41,7 +41,7 @@ class SeedSourceGuard(_PluginBase):
     plugin_desc = ("检测本地源文件是否有下载器在做种、下载器是否存在文件丢失的无效做种或"
                    "tracker 全部失败的做种任务；连续N天异常可通知或按策略处置，杜绝无效做种与孤儿文件。")
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/seedsourceguard.png"
-    plugin_version = "1.1.32"
+    plugin_version = "1.1.33"
     plugin_label = "下载管理"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -1596,6 +1596,14 @@ class SeedSourceGuard(_PluginBase):
             return default
 
     @staticmethod
+    def _to_float(value: Any, default: float = 0.0) -> float:
+        """安全转浮点：历史数据格式异常时回退默认值，不中断处置链路。"""
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
     def _tracker_red_verdict(tracker_stats: Any) -> Optional[Tuple[str, str]]:
         """解析 tracker 数据，返回红种归类与失败原因；非红种返回 None。
 
@@ -2507,7 +2515,8 @@ class SeedSourceGuard(_PluginBase):
             return results
         due_hosts = {
             e.get("host", "") for e in site_tracking
-            if str(e.get("host", "")) and float(e.get("days") or 0) >= self._site_offline_delete_days
+            if str(e.get("host", ""))
+            and self._to_float(e.get("days")) >= self._site_offline_delete_days
         }
         if not due_hosts:
             return results
