@@ -1,8 +1,8 @@
 """硬链接孤立文件检查插件。
 
 扫描下载目录和媒体库目录，找出 links=1 的孤立视频文件。
-每次扫描重新检查，不依赖历史记录。
-同一文件连续 3 次扫描都出现在孤立列表中 → 自动删除。
+每次扫描重新检查，删除判定按跟踪天数计数。
+同一文件连续 N 天（阈值 delete_threshold，默认 3）出现在孤立列表中 → 自动删除。
 
 另附「空壳目录」清理：媒体库里只剩 nfo/海报/字幕、没有任何视频的季目录或剧目录，
 可按配置在出现后直接删除（媒体库维护，与硬链接判定无关）。
@@ -165,7 +165,7 @@ class LinkChecker(_PluginBase):
     plugin_name = "硬链接检查Q自用版"
     plugin_desc = "扫描下载目录和媒体库目录中的孤立硬链接文件，连续3天孤立自动删除；并可清理只剩元数据、没有视频的空壳季目录/剧目录。"
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/linkchecker.png"
-    plugin_version = "3.3.8"
+    plugin_version = "3.3.9"
     plugin_label = "文件管理"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -278,8 +278,14 @@ class LinkChecker(_PluginBase):
         except (TypeError, ValueError):
             self._last_deleted_dirs = 0
         # 恢复上次扫描日期：不恢复的话，重启当天的第二次扫描会把「连续天数」
-        # 多算 1 天，阈值 7 实际最快 6 天就删，比配置的宽限更激进
-        self._last_scan_date = str(last.get("scan_date") or "")
+        # 多算 1 天，阈值 7 实际最快 6 天就删，比配置的宽限更激进。
+        # 旧版本（≤3.3.6）没有持久化该字段：升级后首次加载时保守视为
+        # 「今天已扫描过」，避免升级当天重复计数导致提前删除；次日起恢复正常计数。
+        raw_scan_date = last.get("scan_date")
+        if raw_scan_date is None and saved:
+            self._last_scan_date = datetime.now().strftime("%Y-%m-%d")
+        else:
+            self._last_scan_date = str(raw_scan_date or "")
         if not config:
             self._enabled = False
             return
@@ -1329,10 +1335,18 @@ class LinkChecker(_PluginBase):
         with _SCAN_LOCK:
             self._orphan_tracker = {}
             self._empty_tracker = {}
+            # 展示列表与本轮计数一并清空：重置后页面不应继续显示已无跟踪关系
+            # 的候选，否则「清理」按钮还能按旧列表删文件，与「重置」语义矛盾；
+            # 「上次扫描」时间保留（那是客观事实，下一轮扫描会覆盖）
+            self._last_download_orphans = []
+            self._last_library_orphans = []
+            self._last_empty_dirs = []
+            self._last_deleted = 0
+            self._last_deleted_dirs = 0
             # 故意不清 _linked_seen 指纹：「曾 links≥2」的历史一旦清掉，
             # 现存 links=1 的残留永远无法再被识别，等于静默关掉整个清理能力
             self._save_tracker()
-        logger.info("跟踪记录已重置（孤立计数与空壳计数，硬链接指纹历史保留）")
+        logger.info("跟踪记录已重置（孤立计数、空壳计数与展示列表；硬链接指纹历史保留）")
 
     async def _api_reset(self, apikey: str = "") -> Dict[str, Any]:
         """API: 重置跟踪记录（工作线程执行）。"""
