@@ -41,7 +41,7 @@ class SeedSourceGuard(_PluginBase):
     plugin_desc = ("检测本地源文件是否有下载器在做种、下载器是否存在文件丢失的无效做种或"
                    "tracker 全部失败的做种任务；连续N天异常可通知或按策略处置，杜绝无效做种与孤儿文件。")
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/seedsourceguard.png"
-    plugin_version = "1.1.31"
+    plugin_version = "1.1.32"
     plugin_label = "下载管理"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -2065,20 +2065,24 @@ class SeedSourceGuard(_PluginBase):
             handled_list.extend(self._handle_site_offline_expiry(
                 site_tracking, exempt_red, handle, healthy_tasks, services, files_cache))
 
-            # 清理已恢复的旧记录（保留当前仍异常项的天数历史）
-            for prefix in ("no_seed:", "invalid:", "red:"):
-                for old_key in [k for k in days_data if k.startswith(prefix)]:
-                    body = old_key[len(prefix):]
-                    if prefix == "no_seed:" and body not in no_seed_map:
-                        days_data.pop(old_key, None)
-                    elif prefix == "invalid:" and body not in invalid_map:
-                        days_data.pop(old_key, None)
-                    elif (prefix == "red:" and body not in red_map_active
-                          and body not in exempt_red
-                          # 占比保护项仍在异常中，只是本轮不处置，计数不得清除，
-                          # 否则保护解除后从 1 重计、之前的连续异常累计全部作废
-                          and body not in protected):
-                        days_data.pop(old_key, None)
+            # 清理已恢复的旧记录（保留当前仍异常项的天数历史）。
+            # 手动「仅检测」必须跳过清理：本轮未检测到某项，可能是该轮采集抖动
+            # （如 qB 单任务 tracker 查询失败被跳过、站点域名探测偶通），
+            # 不足以证明该项已恢复，不该据此清掉已累计的计数。
+            if count:
+                for prefix in ("no_seed:", "invalid:", "red:"):
+                    for old_key in [k for k in days_data if k.startswith(prefix)]:
+                        body = old_key[len(prefix):]
+                        if prefix == "no_seed:" and body not in no_seed_map:
+                            days_data.pop(old_key, None)
+                        elif prefix == "invalid:" and body not in invalid_map:
+                            days_data.pop(old_key, None)
+                        elif (prefix == "red:" and body not in red_map_active
+                              and body not in exempt_red
+                              # 占比保护项仍在异常中，只是本轮不处置，计数不得清除，
+                              # 否则保护解除后从 1 重计、之前的连续异常累计全部作废
+                              and body not in protected):
+                            days_data.pop(old_key, None)
 
         finally:
             # 无论中间是否异常，本轮计数改动都必须落盘：异常那轮的累计若丢失，
@@ -2244,7 +2248,9 @@ class SeedSourceGuard(_PluginBase):
             # 超期删除与页面跟踪表都依赖 rounds 累计，清空会让超期删除永不触发
             threshold = (max(1, int(self._site_offline_alert_days) * int(self._scan_times))
                          if self._site_offline_alert_days else 0)
-            if threshold and record["rounds"] >= threshold:
+            # 手动「仅检测」不消耗提醒节奏：提醒应由定时任务驱动，
+            # 手动查看不该把本该由定时任务发的那次提醒提前用掉
+            if count and threshold and record["rounds"] >= threshold:
                 last_alert = int(record.get("alert_rounds") or 0)
                 if not last_alert or record["rounds"] - last_alert >= 7 * int(self._scan_times):
                     record["alert_rounds"] = record["rounds"]
@@ -2258,9 +2264,12 @@ class SeedSourceGuard(_PluginBase):
                     })
 
         # 已恢复（本轮不再整体失联）的站点立即移出跟踪，rounds 随记录一并清零
-        # （2026-10-28 用户拍板：站点可达就移出、清零，再次失联时从零开始算）
-        for host in [h for h in stored if h not in offline_now]:
-            stored.pop(host, None)
+        # （2026-10-28 用户拍板：站点可达就移出、清零，再次失联时从零开始算）。
+        # 手动「仅检测」跳过：本轮未判失联可能只是域名探测偶通（抖动），
+        # 不足以证明站点已恢复，不该据此清掉累计轮次
+        if count:
+            for host in [h for h in stored if h not in offline_now]:
+                stored.pop(host, None)
         if alerts:
             _mode = (f"超期 {self._site_offline_delete_days} 天将自动删除"
                      if self._site_offline_delete and self._site_offline_delete_days > 0
