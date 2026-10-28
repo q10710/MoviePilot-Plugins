@@ -165,7 +165,7 @@ class LinkChecker(_PluginBase):
     plugin_name = "硬链接检查Q自用版"
     plugin_desc = "扫描下载目录和媒体库目录中的孤立硬链接文件，连续3天孤立自动删除；并可清理只剩元数据、没有视频的空壳季目录/剧目录。"
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/linkchecker.png"
-    plugin_version = "3.3.10"
+    plugin_version = "3.3.11"
     plugin_label = "文件管理"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -1009,11 +1009,13 @@ class LinkChecker(_PluginBase):
 
         if is_new_day:
             self._last_scan_date = today
-            # 新的一天：本次出现的 +1 天，本次未出现的清零
+            # 新的一天：本次出现的 +1 天，本次未出现的清零。
+            # 扫描不完整（挂载离线）时只给扫到的路径计数、不清理「未出现」的：
+            # 离线侧文件只是没被扫到，清零会把已积累的天数白白丢掉
             for path in list(self._orphan_tracker.keys()):
                 if path in current_paths:
                     self._orphan_tracker[path] += 1
-                else:
+                elif not scan_errors:
                     del self._orphan_tracker[path]
             for path in current_paths:
                 if path not in self._orphan_tracker:
@@ -1024,17 +1026,19 @@ class LinkChecker(_PluginBase):
                 if path not in self._orphan_tracker:
                     self._orphan_tracker[path] = 1
 
-        # 检查是否达到删除阈值
+        # 检查是否达到删除阈值；扫描不完整的轮次不发起任何删除——
+        # 无法确认离线侧文件的当前状态，推迟到下一轮完整扫描再处置
         to_delete: List[str] = []
-        for path, days in self._orphan_tracker.items():
-            if days < self._delete_threshold:
-                continue
-            if path in download_side:
-                if self._auto_delete:
+        if not scan_errors:
+            for path, days in self._orphan_tracker.items():
+                if days < self._delete_threshold:
+                    continue
+                if path in download_side:
+                    if self._auto_delete:
+                        to_delete.append(path)
+                elif self._allow_library_delete:
+                    # 媒体库侧默认只报告；开启后才会删除（那份通常是唯一副本，谨慎）
                     to_delete.append(path)
-            elif self._allow_library_delete:
-                # 媒体库侧默认只报告；开启后才会删除（那份通常是唯一副本，谨慎）
-                to_delete.append(path)
 
         # 删除达到阈值的文件
         for path in to_delete:
@@ -1048,7 +1052,7 @@ class LinkChecker(_PluginBase):
                 logger.info(f"自动删除失败: {path} - {e}")
 
         # 空壳目录清理（媒体库维护，独立开关与阈值）
-        self._scan_empty_dirs(is_new_day)
+        self._scan_empty_dirs(is_new_day, scan_complete=not scan_errors)
 
         self._save_tracker()
 
@@ -1097,14 +1101,15 @@ class LinkChecker(_PluginBase):
             logger.info(f"手动清理完成: {deleted} 个文件")
             return deleted
 
-    def _scan_empty_dirs(self, is_new_day: bool) -> None:
+    def _scan_empty_dirs(self, is_new_day: bool, scan_complete: bool = True) -> None:
         """扫描媒体库空壳目录并按配置清理（独立开关，默认关闭）。
 
         空壳目录 = 目录下只剩元数据/字幕文件、没有任何视频的季目录或剧目录。
         与硬链接判定无关，属媒体库维护：视频被删除或转移后目录里可能只剩 nfo/海报，
         媒体服务器仍会把它显示成剧集条目，因此需要清掉。
         安全边界：只扫媒体库目录；全部文件必须命中元数据白名单；必须能识别为影视条目目录；
-        目录内最新文件需静置足够久；忽略/额外排除目录一律跳过。
+        目录内最新文件需静置足够久；忽略/额外排除目录一律跳过；
+        扫描不完整（scan_complete=False，挂载离线）的轮次不做计数清零、不发起删除。
         """
         self._last_empty_dirs = []
         self._last_deleted_dirs = 0
@@ -1131,11 +1136,12 @@ class LinkChecker(_PluginBase):
 
         current = set(candidates.keys())
         if is_new_day:
-            # 新的一天：本次仍存在的 +1，消失的清零
+            # 新的一天：本次仍存在的 +1，消失的清零；
+            # 扫描不完整时不清零（离线侧目录只是没扫到，清零会丢天数进度）
             for path in list(self._empty_tracker.keys()):
                 if path in current:
                     self._empty_tracker[path] += 1
-                else:
+                elif scan_complete:
                     del self._empty_tracker[path]
             for path in current:
                 self._empty_tracker.setdefault(path, 1)
@@ -1143,10 +1149,12 @@ class LinkChecker(_PluginBase):
             for path in current:
                 self._empty_tracker.setdefault(path, 1)
 
+        # 扫描不完整的轮次不发起空壳删除（同孤立文件：无法确认离线侧状态，
+        # 也不会因挂载缺失把达到阈值的路径误判为「已消失」而清掉计数）
         to_delete = [
             path for path, days in self._empty_tracker.items()
             if days >= self._empty_dir_days
-        ]
+        ] if scan_complete else []
         # 按路径深度倒序：先删季目录，再删已变空的剧目录
         for path in sorted(to_delete, key=lambda p: len(Path(p).parts), reverse=True):
             if not os.path.isdir(path):
