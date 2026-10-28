@@ -41,7 +41,7 @@ class SeedSourceGuard(_PluginBase):
     plugin_desc = ("检测本地源文件是否有下载器在做种、下载器是否存在文件丢失的无效做种或"
                    "tracker 全部失败的做种任务；连续N天异常可通知或按策略处置，杜绝无效做种与孤儿文件。")
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/seedsourceguard.png"
-    plugin_version = "1.1.25"
+    plugin_version = "1.1.26"
     plugin_label = "下载管理"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -249,12 +249,18 @@ class SeedSourceGuard(_PluginBase):
                            "未读取到已配置的下载器，请先在「系统设置 - 下载器」中完成配置，本下拉会自动列出")
 
         def _section(title: str, icon: str) -> dict:
-            """配置分区标题（图标 + 文字）。"""
+            """配置分区标题：浅色背景条 + 图标 + 文字，四个分区一眼分得开。"""
             return {
                 "component": "div",
-                "props": {"class": "d-flex align-center mt-2 mb-1"},
+                "props": {
+                    "class": "d-flex align-center mt-4 mb-2 px-3 py-2 rounded-lg",
+                    "style": ("background: rgba(99,102,241,0.07); "
+                              "border: 1px solid rgba(99,102,241,0.16);"),
+                },
                 "content": [
-                    {"component": "VIcon", "props": {"size": 18, "class": "mr-1"},
+                    {"component": "VIcon",
+                     "props": {"size": 18, "class": "mr-2",
+                               "style": "color: #6366f1;"},
                      "text": icon},
                     {"component": "span",
                      "props": {"class": "text-subtitle-2 font-weight-bold"},
@@ -272,7 +278,7 @@ class SeedSourceGuard(_PluginBase):
                         "content": [
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 3},
+                                "props": {"cols": 12, "md": 4},
                                 "content": [
                                     {
                                         "component": "VSwitch",
@@ -285,7 +291,7 @@ class SeedSourceGuard(_PluginBase):
                             },
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 3},
+                                "props": {"cols": 12, "md": 4},
                                 "content": [
                                     {
                                         "component": "VSwitch",
@@ -298,7 +304,7 @@ class SeedSourceGuard(_PluginBase):
                             },
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 3},
+                                "props": {"cols": 12, "md": 4},
                                 "content": [
                                     {
                                         "component": "VSwitch",
@@ -311,15 +317,23 @@ class SeedSourceGuard(_PluginBase):
                                     }
                                 ],
                             },
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 3},
+                                "props": {"cols": 12, "md": 6},
                                 "content": [
                                     {
                                         "component": "VSelect",
                                         "props": {
                                             "model": "scan_times",
                                             "label": "每日扫描次数",
+                                            "hint": ("扫描时间自动均布：1 次 03:15；2 次 03:15/15:15；"
+                                                     "3 次 03/11/19；4 次 03/09/15/21"),
+                                            "persistent-hint": True,
                                             "items": [
                                                 {"title": "每天 1 次", "value": 1},
                                                 {"title": "每天 2 次", "value": 2},
@@ -330,14 +344,9 @@ class SeedSourceGuard(_PluginBase):
                                     }
                                 ],
                             },
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
+                                "props": {"cols": 12, "md": 6},
                                 "content": [
                                     {
                                         "component": "VTextField",
@@ -345,24 +354,9 @@ class SeedSourceGuard(_PluginBase):
                                             "model": "clean_days",
                                             "label": "清理宽限天数",
                                             "type": "number",
-                                            "hint": ("连续 N 天仍异常才触发处置；内部按实际扫描轮次累计"
-                                                     "（N × 每日扫描次数），关机/停用期不计数"),
-                                        },
-                                    }
-                                ],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 8},
-                                "content": [
-                                    {
-                                        "component": "VAlert",
-                                        "props": {
-                                            "type": "info",
-                                            "variant": "tonal",
-                                            "text": ("扫描时间由每日次数自动生成并均匀分布"
-                                                     "（1 次 03:15；2 次 03:15/15:15；3 次 03/11/19；4 次 03/09/15/21）。"
-                                                     "每轮均为独立全量检测，不读取上次结果。"),
+                                            "hint": ("连续 N 天仍异常才处置；按实际扫描轮次累计"
+                                                     "（N × 每日次数），关机/停用期不计数"),
+                                            "persistent-hint": True,
                                         },
                                     }
                                 ],
@@ -529,15 +523,10 @@ class SeedSourceGuard(_PluginBase):
                                         "props": {
                                             "type": "info",
                                             "variant": "tonal",
-                                            "text": ("红种只有两类：① 个别红种——单个任务 tracker 全部失败，"
-                                                     "不看失败原因（超时/DNS/证书/403/无此种子等）一律计入，"
-                                                     "连续 N 天按本项配置处置；② 整站红种——该站任务 ≥90% 连不上"
-                                                     "且域名探测确认不可达，转由下方「整站失联」跟踪与超期删除管理，"
-                                                     "不按个别红种删除。"
-                                                     "删除种子时自动判断：该源文件仍被其它正常任务覆盖则只删种子保留文件；"
-                                                     "无任何其它正常辅种时删除种子并连同源文件一起删除。"
-                                                     "无效做种配置为「删除任务(无其它辅种时连同源文件删除)」时同样按此共享判定。"
-                                                     "单下载器红种占做种数 80% 以上时触发站点/网络级故障保护，本轮只通知不处置。"),
+                                            "text": ("个别红种＝单个任务 tracker 全部失败（不看原因）；"
+                                                     "整站红种＝该站 ≥90% 连不上且站点域名不可达，"
+                                                     "转下方「整站失联」管理。删除时源文件若还有其它正常辅种覆盖，"
+                                                     "只删任务保留文件。"),
                                         },
                                     }
                                 ],
@@ -557,11 +546,8 @@ class SeedSourceGuard(_PluginBase):
                                         "props": {
                                             "model": "skip_unreachable",
                                             "label": "整站红种判定（整站失联，建议开启）",
-                                            "hint": ("某站任务 ≥90% 连不上、且直接访问该站点域名也不可达时，"
-                                                     "判定为整站红种：该站全部种子不按个别红种删除，"
-                                                     "改为按下方天数跟踪提醒（可再开启「整站失联超期删除」）；站点恢复后继续累计已有轮次。"
-                                                     "站点能访问（仅部分种子连不上，或站点回「无此种子」、403/405 等）"
-                                                     "一律按个别红种处理。"),
+                                            "hint": ("该站 ≥90% 任务连不上、且站点域名也访问不到时判为整站红种："
+                                                     "该站种子不按个别红种删，改为按天数跟踪；站点恢复后自动移出。"),
                                             "persistent-hint": True,
                                         },
                                     }
@@ -635,35 +621,10 @@ class SeedSourceGuard(_PluginBase):
                                         "props": {
                                             "type": "info",
                                             "variant": "tonal",
-                                            "text": ("整站红种判定（两级）：① 该 tracker 域名下做种任务 ≥90% 报「连不上站点」"
-                                                     "（不限任务数，小站同样适用）；② 再直接访问站点域名确认也不可达。"
-                                                     "两级都成立才判为整站红种，该站全部种子不按个别红种删除，"
-                                                     "改为按天数跟踪并在插件数据页按站点列出；站点恢复可达则自动移出跟踪。"
-                                                     "只删该站自己的种子任务，别的站正常种子一律不动；"
-                                                     "源文件只要还有任一种子在做种就不删文件；"
-                                                     "删除前自动备份清单到临时目录，日志可回查。"),
-                                        },
-                                    }
-                                ],
-                            },
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12},
-                                "content": [
-                                    {
-                                        "component": "VAlert",
-                                        "props": {
-                                            "type": "warning",
-                                            "variant": "tonal",
-                                            "text": ("安全规则：下载器连接失败或取不到任务列表时，本轮自动跳过该下载器，"
-                                                     "绝不会把任何文件判为孤儿；红种占做种数达 80% 阈值时自动保护不处置。"
-                                                     "删除/移动类处置要求：连续 N 次扫描仍异常（按实际扫描轮次累计，"
-                                                     "关机/停用期不计数）且本页「允许删除/移动处置」开关已打开。"),
+                                            "text": ("安全兜底：下载器连不上或取不到任务时本轮自动跳过，"
+                                                     "绝不把任何文件判为孤儿；红种占做种数 80% 以上只通知不处置；"
+                                                     "删除/移动需连续 N 次扫描仍异常且「允许删除」开关已打开。"
+                                                     "详细判定口径见插件数据页底部说明。"),
                                         },
                                     }
                                 ],
