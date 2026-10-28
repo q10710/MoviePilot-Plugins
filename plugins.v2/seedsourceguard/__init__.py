@@ -41,7 +41,7 @@ class SeedSourceGuard(_PluginBase):
     plugin_desc = ("检测本地源文件是否有下载器在做种、下载器是否存在文件丢失的无效做种或"
                    "tracker 全部失败的做种任务；连续N天异常可通知或按策略处置，杜绝无效做种与孤儿文件。")
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/seedsourceguard.png"
-    plugin_version = "1.1.26"
+    plugin_version = "1.1.27"
     plugin_label = "下载管理"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -1392,8 +1392,8 @@ class SeedSourceGuard(_PluginBase):
                 if state in self._IGNORE_STATES:
                     continue
                 root = task["root"]
-                # 根路径为空或直接报错状态：判无效
-                broken_state = state in self._INVALID_STATES or not root
+                # 根路径为空的任务在 _normalize_torrents 已被过滤，此处只需判报错状态
+                broken_state = state in self._INVALID_STATES
                 # 路径不存在或目录为空
                 file_broken = False
                 if root:
@@ -1761,12 +1761,18 @@ class SeedSourceGuard(_PluginBase):
         return False
 
     def _is_excluded(self, entry: Path) -> bool:
-        """判断目录是否命中排除关键词（大小写不敏感）。"""
+        """判断目录是否命中排除关键词（大小写不敏感）。
+
+        按配置文案「目录名或路径包含即跳过」实现：关键词既匹配目录名，
+        也匹配完整路径片段，支持用路径段做更精确的排除。
+        """
         if not self._exclude_keys:
             return False
-        full = entry.name.lower()
+        name = entry.name.lower()
+        full = str(entry).lower()
         for key in self._exclude_keys:
-            if key and key.strip().lower() in full:
+            k = key.strip().lower()
+            if k and (k in name or k in full):
                 return True
         return False
 
@@ -2254,13 +2260,22 @@ class SeedSourceGuard(_PluginBase):
             if action == "delete":
                 import shutil
                 shutil.rmtree(path, ignore_errors=True)
+                # rmtree 用了 ignore_errors，失败不会抛异常，必须复查目录是否真的没了，
+                # 否则删除失败会被误报成功并清零计数
+                if Path(path).exists():
+                    logger.error(f"删除孤儿源文件失败（目录仍存在）：{path}")
+                    return {"time": datetime.now().strftime("%m-%d %H:%M"),
+                            "text": f"处置失败 {text}（目录仍存在，未删除）", "disposed": False}
                 logger.info(f"已删除孤儿源文件：{path}")
                 return {"time": datetime.now().strftime("%m-%d %H:%M"),
                         "text": f"已删除 {text}", "disposed": True}
             if action == "move":
                 if not self._move_path:
-                    logger.warning("未配置回收目录，跳过移动")
-                    return None
+                    # 未配置回收目录时必须上报，否则达标项每轮静默跳过、页面无任何提示
+                    logger.warning(f"孤儿源文件 {path} 待移动，但未配置回收目录，跳过处置")
+                    return {"time": datetime.now().strftime("%m-%d %H:%M"),
+                            "text": f"配置缺失 {text}（未设置回收目录，无法移动）",
+                            "disposed": False}
                 import shutil
                 target = Path(self._move_path)
                 target.mkdir(parents=True, exist_ok=True)
@@ -2310,7 +2325,13 @@ class SeedSourceGuard(_PluginBase):
                 if instance is None:
                     logger.warning(f"下载器 {dl} 不可用，无法删除任务")
                     return None
-                instance.delete_torrents(delete_file, [hash_value])
+                # delete_torrents 失败时返回 False 且不抛异常（未连接/请求失败），
+                # 必须检查返回值，否则会误报「已删除」并清零计数
+                deleted = instance.delete_torrents(delete_file, [hash_value])
+                if not deleted:
+                    logger.error(f"删除无效做种任务失败（下载器返回失败）：{dl} / {name}")
+                    return {"time": datetime.now().strftime("%m-%d %H:%M"),
+                            "text": f"删除失败 {text}（下载器返回失败）", "disposed": False}
                 logger.info(f"已删除无效做种任务：{dl} / {name}（delete_file={delete_file}）")
                 return {"time": datetime.now().strftime("%m-%d %H:%M"),
                         "text": f"已删除任务 {'及文件 ' if delete_file else ''}{text}",
@@ -2359,7 +2380,12 @@ class SeedSourceGuard(_PluginBase):
             if instance is None:
                 logger.warning(f"下载器 {dl} 不可用，无法删除任务")
                 return None
-            instance.delete_torrents(delete_file, [hash_value])
+            # delete_torrents 失败时返回 False 且不抛异常，必须检查返回值
+            deleted = instance.delete_torrents(delete_file, [hash_value])
+            if not deleted:
+                logger.error(f"删除个别红种任务失败（下载器返回失败）：{dl} / {name}")
+                return {"time": datetime.now().strftime("%m-%d %H:%M"),
+                        "text": f"删除失败 {text}（下载器返回失败）", "disposed": False}
             logger.info(
                 f"已删除个别红种任务：{dl} / {name}（delete_file={delete_file}）"
             )
@@ -2442,7 +2468,13 @@ class SeedSourceGuard(_PluginBase):
                     results.append({"time": datetime.now().strftime("%m-%d %H:%M"),
                                     "text": f"删除失败 {text}（下载器不可用）", "disposed": False})
                     continue
-                instance.delete_torrents(delete_file, [hash_value])
+                # delete_torrents 失败时返回 False 且不抛异常，必须检查返回值
+                deleted = instance.delete_torrents(delete_file, [hash_value])
+                if not deleted:
+                    logger.error(f"删除整站失联超期任务失败（下载器返回失败）：{dl} / {name}")
+                    results.append({"time": datetime.now().strftime("%m-%d %H:%M"),
+                                    "text": f"删除失败 {text}（下载器返回失败）", "disposed": False})
+                    continue
                 logger.info(f"已删除整站失联超期任务：{dl} / {name}（delete_file={delete_file}）")
                 results.append({"time": datetime.now().strftime("%m-%d %H:%M"),
                                 "text": (f"已删除 {'任务及源文件 ' if delete_file else '任务 '}{text}"),
