@@ -157,7 +157,7 @@ class LinkChecker(_PluginBase):
     plugin_name = "硬链接检查Q自用版"
     plugin_desc = "扫描下载目录和媒体库目录中的孤立硬链接文件，连续3天孤立自动删除；并可清理只剩元数据、没有视频的空壳季目录/剧目录。"
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/linkchecker.png"
-    plugin_version = "3.3.5"
+    plugin_version = "3.3.6"
     plugin_label = "文件管理"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -260,6 +260,22 @@ class LinkChecker(_PluginBase):
         self._orphan_tracker = saved.get("orphans", {})
         self._linked_seen = set(saved.get("linked") or [])
         self._empty_tracker = dict(saved.get("empty") or {})
+        # 恢复最近一次扫描的展示状态（与 _save_tracker 的 "last" 对应）：
+        # 重载后内存里的 _last_* 会回到类默认值，不恢复则数据页在下一次
+        # 定时扫描前会显示「无异常」，造成误判
+        last = saved.get("last") or {}
+        self._last_scan_time = last.get("time")
+        self._last_download_orphans = list(last.get("download") or [])
+        self._last_library_orphans = list(last.get("library") or [])
+        self._last_empty_dirs = list(last.get("empty_dirs") or [])
+        try:
+            self._last_deleted = int(last.get("deleted") or 0)
+        except (TypeError, ValueError):
+            self._last_deleted = 0
+        try:
+            self._last_deleted_dirs = int(last.get("deleted_dirs") or 0)
+        except (TypeError, ValueError):
+            self._last_deleted_dirs = 0
         if not config:
             self._enabled = False
             return
@@ -275,7 +291,15 @@ class LinkChecker(_PluginBase):
         self._relocate_dirs = self._collect_relocate_dirs()
         self._cron = config.get("cron") or ""
         self._auto_delete = bool(config.get("auto_delete"))
-        self._delete_threshold = int(config.get("delete_threshold") or 3)
+        # 阈值需同时防类型异常与负数：配非数字会让初始化抛异常，配负数会让
+        # `days >= 阈值` 恒真、首轮即删（零宽限）。与 empty_dir_days 同级保护。
+        raw_threshold = config.get("delete_threshold")
+        try:
+            self._delete_threshold = int(raw_threshold) if raw_threshold not in (None, "") else 3
+        except (TypeError, ValueError):
+            self._delete_threshold = 3
+        if self._delete_threshold < 1:
+            self._delete_threshold = 1
         self._notify = bool(config.get("notify"))
         self._allow_library_delete = bool(config.get("allow_library_delete"))
         self._clean_empty_dirs = bool(config.get("clean_empty_dirs"))
@@ -891,11 +915,23 @@ class LinkChecker(_PluginBase):
     # ── 核心逻辑 ──────────────────────────────────────────────
 
     def _save_tracker(self) -> None:
-        """持久化跟踪记录。"""
+        """持久化跟踪记录（含最近一次扫描的展示状态）。
+
+        展示状态一并落盘：插件重载后内存里的 `_last_*` 会被清空，
+        若不持久化，数据页在下一次定时扫描前会显示「无异常」，造成误判。
+        """
         self.save_data("tracker", {
             "orphans": self._orphan_tracker,
             "linked": sorted(self._linked_seen),
             "empty": self._empty_tracker,
+            "last": {
+                "time": self._last_scan_time,
+                "download": self._last_download_orphans,
+                "library": self._last_library_orphans,
+                "empty_dirs": self._last_empty_dirs,
+                "deleted": self._last_deleted,
+                "deleted_dirs": self._last_deleted_dirs,
+            },
         })
 
     @staticmethod
@@ -923,9 +959,11 @@ class LinkChecker(_PluginBase):
 
         current_paths: set = set()
         download_side: set = set()
+        present_keys: set = set()
         for f in all_dl + all_lib:
             path = f["_path"]
             key = self._path_key(path)
+            present_keys.add(key)
             if int(f.get("_nlink") or 1) >= 2:
                 # 当前仍是硬链接：记入历史，供以后判断是否断开
                 self._linked_seen.add(key)
@@ -934,6 +972,11 @@ class LinkChecker(_PluginBase):
                 current_paths.add(path)
                 if dl_prefixes and path.startswith(dl_prefixes):
                     download_side.add(path)
+        # 只保留本轮仍存在的文件指纹：两侧都已删除的文件其指纹应当失效，
+        # 否则同路径日后重现的 links=1 文件会被误判为「断开残留」而删除。
+        # 断开残留本身仍在某一侧存在，其指纹会被 present_keys 正常保留，
+        # 不影响「曾 links≥2、现 links=1」的判定。
+        self._linked_seen &= present_keys
 
         # 展示列表：只列断开残留（下载侧与媒体库侧分开）
         dl_orphans = [f for f in all_dl if f["_path"] in download_side]
@@ -1090,10 +1133,14 @@ class LinkChecker(_PluginBase):
             days = self._empty_tracker.get(path, 0)
             try:
                 shutil.rmtree(path)
-                self._last_deleted_dirs += 1
-                logger.info(f"删除空壳目录(连续{days}天): {path}")
             except OSError as e:
-                logger.info(f"删除空壳目录失败: {path} - {e}")
+                # 删除失败必须保留计数：若此时也清掉，会陷入
+                # 「计数到阈值 → 删除失败 → 计数归零 → 从头来」的循环，
+                # 持续失败（如权限问题）的目录永远删不掉
+                logger.warning(f"删除空壳目录失败(保留计数待重试): {path} - {e}")
+                continue
+            self._last_deleted_dirs += 1
+            logger.info(f"删除空壳目录(连续{days}天): {path}")
             self._empty_tracker.pop(path, None)
 
         self._last_empty_dirs = sorted(
@@ -1112,6 +1159,26 @@ class LinkChecker(_PluginBase):
 
     def _empty_dir_candidate(self, root: str) -> Optional[Dict[str, Any]]:
         """判断目录是否为空壳目录，是则返回展示信息，否则返回 None。"""
+        # 快速路径：目录名既不像季目录也不含年份时，先只看直接文件里有没有
+        # 条目标识（tvshow.nfo 等），没有就直接排除，省掉对整棵子树的递归遍历。
+        # 分类目录（国漫/国产剧/欧美剧等）绝大多数在此被挡住，避免外层
+        # 对每个子目录各 walk 一次造成的 O(n²) 重复遍历。
+        name = os.path.basename(root.rstrip("/\\")).lower()
+        looks_entry = (
+            name.startswith("season")
+            or bool(re.search(r"(19|20)\d{2}", name))
+            or any(re.match(p, name) for p in self._SEASON_DIR_PATTERNS)
+        )
+        if not looks_entry:
+            try:
+                direct = os.listdir(root)
+            except OSError:
+                return None
+            if not any(
+                f.lower() in self._MEDIA_MARKER_FILES or f.lower().startswith("season")
+                for f in direct if not f.startswith(".")
+            ):
+                return None
         newest = 0.0
         file_count = 0
         has_marker = False
@@ -1186,10 +1253,12 @@ class LinkChecker(_PluginBase):
                 continue
             try:
                 shutil.rmtree(path)
-                deleted += 1
-                logger.info(f"手动删除空壳目录: {path}")
             except OSError as e:
-                logger.info(f"删除空壳目录失败: {path} - {e}")
+                # 同自动删除：失败保留计数，避免反复归零重来
+                logger.warning(f"删除空壳目录失败(保留计数待重试): {path} - {e}")
+                continue
+            deleted += 1
+            logger.info(f"手动删除空壳目录: {path}")
             self._empty_tracker.pop(path, None)
         self._last_empty_dirs = []
         self._last_deleted_dirs += deleted
@@ -1337,10 +1406,6 @@ class LinkChecker(_PluginBase):
                     })
         results.sort(key=lambda x: (x["dir_path"], x["file_name"]))
         return results
-
-    def _scan_dirs(self, dirs: List[str]) -> List[Dict[str, Any]]:
-        """扫描目录，返回链接数为 1（即两侧只剩一份）的视频文件。"""
-        return [f for f in self._scan_files(dirs) if f.get("_nlink", 1) == 1]
 
     def _extract_media_info(self, filepath: str) -> str:
         """从文件路径提取详细媒体信息。"""
