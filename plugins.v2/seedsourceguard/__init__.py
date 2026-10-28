@@ -41,7 +41,7 @@ class SeedSourceGuard(_PluginBase):
     plugin_desc = ("检测本地源文件是否有下载器在做种、下载器是否存在文件丢失的无效做种或"
                    "tracker 全部失败的做种任务；连续N天异常可通知或按策略处置，杜绝无效做种与孤儿文件。")
     plugin_icon = "https://raw.githubusercontent.com/q10710/MoviePilot-Plugins/main/icons/seedsourceguard.png"
-    plugin_version = "1.1.24"
+    plugin_version = "1.1.25"
     plugin_label = "下载管理"
     plugin_author = "Q"
     author_url = "https://github.com/q10710"
@@ -148,7 +148,13 @@ class SeedSourceGuard(_PluginBase):
             self._max_depth = 1
         self._scan_dirs = self._split_lines(config.get("scan_dirs"))
         self._exclude_keys = self._split_lines(config.get("exclude_dirs"))
-        self._downloaders = self._split_comma(config.get("downloaders"))
+        # 下载器多选：新版配置存数组，旧版是逗号分隔字符串，两种格式都兼容
+        raw_downloaders = config.get("downloaders")
+        if isinstance(raw_downloaders, (list, tuple)):
+            self._downloaders = [str(name).strip() for name in raw_downloaders
+                                 if str(name).strip()]
+        else:
+            self._downloaders = self._split_comma(raw_downloaders)
         self._no_seed_action = str(config.get("no_seed_action") or "notify")
         self._invalid_action = str(config.get("invalid_action") or "notify")
         self._red_action = str(config.get("red_action") or "delete")
@@ -220,17 +226,53 @@ class SeedSourceGuard(_PluginBase):
         return []
 
     def get_form(self) -> Tuple[Optional[List[dict]], Dict[str, Any]]:
-        """返回插件配置表单与默认配置。"""
+        """返回插件配置表单与默认配置。
+
+        2026-10-27 界面改版（仅展示层）：配置按「基础设置 / 检测范围 / 处置策略 /
+        整站失联」四区分组；参与检测的下载器由手填文本框改为动态多选下拉，
+        选项实时读取 MoviePilot 已配置的下载器（配置几个即可选几个，留空＝检测全部）。
+        """
+        # 动态读取已配置下载器作为多选下拉项（通用：配了几个就能选几个）；
+        # 取不到时回退空列表，下拉留空＝检测全部。
+        try:
+            from app.helper.downloader import DownloaderHelper
+            downloader_items = [
+                {"title": name, "value": name}
+                for name in (DownloaderHelper().get_configs() or {}).keys()
+            ]
+        except Exception as err:
+            logger.warning(f"做种守卫：读取已配置下载器失败，多选列表暂为空：{err}")
+            downloader_items = []
+        # 一个下载器都读不到时给出明确指引，避免用户对着空下拉困惑
+        downloader_hint = ("不选则检测全部已配置下载器；配置了几个下载器就能选几个"
+                           if downloader_items else
+                           "未读取到已配置的下载器，请先在「系统设置 - 下载器」中完成配置，本下拉会自动列出")
+
+        def _section(title: str, icon: str) -> dict:
+            """配置分区标题（图标 + 文字）。"""
+            return {
+                "component": "div",
+                "props": {"class": "d-flex align-center mt-2 mb-1"},
+                "content": [
+                    {"component": "VIcon", "props": {"size": 18, "class": "mr-1"},
+                     "text": icon},
+                    {"component": "span",
+                     "props": {"class": "text-subtitle-2 font-weight-bold"},
+                     "text": title},
+                ],
+            }
+
         return [
             {
                 "component": "VForm",
                 "content": [
+                    _section("基础设置", "mdi-cog-outline"),
                     {
                         "component": "VRow",
                         "content": [
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
+                                "props": {"cols": 12, "md": 3},
                                 "content": [
                                     {
                                         "component": "VSwitch",
@@ -243,7 +285,7 @@ class SeedSourceGuard(_PluginBase):
                             },
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
+                                "props": {"cols": 12, "md": 3},
                                 "content": [
                                     {
                                         "component": "VSwitch",
@@ -256,16 +298,34 @@ class SeedSourceGuard(_PluginBase):
                             },
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
+                                "props": {"cols": 12, "md": 3},
                                 "content": [
                                     {
-                                        "component": "VTextField",
+                                        "component": "VSwitch",
                                         "props": {
-                                            "model": "clean_days",
-                                            "label": "清理宽限天数",
-                                            "type": "number",
-                                            "hint": ("连续 N 天仍异常才触发处置；内部按实际扫描轮次累计"
-                                                     "（N × 每日扫描次数），关机/停用期不计数"),
+                                            "model": "allow_delete",
+                                            "label": "允许删除/移动处置",
+                                            "hint": "关闭时即使配置了删除动作也仅提示",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 3},
+                                "content": [
+                                    {
+                                        "component": "VSelect",
+                                        "props": {
+                                            "model": "scan_times",
+                                            "label": "每日扫描次数",
+                                            "items": [
+                                                {"title": "每天 1 次", "value": 1},
+                                                {"title": "每天 2 次", "value": 2},
+                                                {"title": "每天 3 次", "value": 3},
+                                                {"title": "每天 4 次", "value": 4},
+                                            ],
                                         },
                                     }
                                 ],
@@ -280,16 +340,13 @@ class SeedSourceGuard(_PluginBase):
                                 "props": {"cols": 12, "md": 4},
                                 "content": [
                                     {
-                                        "component": "VSelect",
+                                        "component": "VTextField",
                                         "props": {
-                                            "model": "scan_times",
-                                            "label": "每日扫描次数",
-                                            "items": [
-                                                {"title": "每天 1 次", "value": 1},
-                                                {"title": "每天 2 次", "value": 2},
-                                                {"title": "每天 3 次", "value": 3},
-                                                {"title": "每天 4 次", "value": 4},
-                                            ],
+                                            "model": "clean_days",
+                                            "label": "清理宽限天数",
+                                            "type": "number",
+                                            "hint": ("连续 N 天仍异常才触发处置；内部按实际扫描轮次累计"
+                                                     "（N × 每日扫描次数），关机/停用期不计数"),
                                         },
                                     }
                                 ],
@@ -310,16 +367,42 @@ class SeedSourceGuard(_PluginBase):
                                     }
                                 ],
                             },
+                        ],
+                    },
+                    _section("检测范围", "mdi-folder-search-outline"),
+                    {
+                        "component": "VRow",
+                        "content": [
                             {
                                 "component": "VCol",
                                 "props": {"cols": 12, "md": 8},
                                 "content": [
                                     {
-                                        "component": "VTextField",
+                                        "component": "VSelect",
                                         "props": {
                                             "model": "downloaders",
                                             "label": "参与检测的下载器",
-                                            "hint": "留空检测全部；多个用逗号分隔（显示名称）",
+                                            "multiple": True,
+                                            "chips": True,
+                                            "clearable": True,
+                                            "hint": downloader_hint,
+                                            "persistent-hint": True,
+                                            "items": downloader_items,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "max_depth",
+                                            "label": "目录探测深度",
+                                            "type": "number",
+                                            "hint": "默认 3，一般无需修改",
                                         },
                                     }
                                 ],
@@ -361,6 +444,7 @@ class SeedSourceGuard(_PluginBase):
                             },
                         ],
                     },
+                    _section("处置策略", "mdi-shield-alert-outline"),
                     {
                         "component": "VRow",
                         "content": [
@@ -460,53 +544,7 @@ class SeedSourceGuard(_PluginBase):
                             },
                         ],
                     },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
-                                "content": [
-                                    {
-                                        "component": "VTextField",
-                                        "props": {
-                                            "model": "max_depth",
-                                            "label": "目录探测深度",
-                                            "type": "number",
-                                            "hint": "默认 3，一般无需修改",
-                                        },
-                                    }
-                                ],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 8},
-                                "content": [
-                                    {
-                                        "component": "VSwitch",
-                                        "props": {
-                                            "model": "allow_delete",
-                                            "label": "允许执行删除/移动处置",
-                                            "hint": "关闭时即使配置了删除也仅提示，不做任何破坏性操作",
-                                        },
-                                    }
-                                ],
-                            },
-                        ],
-                    },
-                    {
-                        "component": "VAlert",
-                        "props": {
-                            "type": "warning",
-                            "variant": "tonal",
-                            "text": ("安全规则：下载器连接失败或取不到任务列表时，本轮自动跳过该下载器，"
-                                     "绝不会把任何文件判为孤儿；整站失联判定开启时，"
-                                     "该站任务 ≥90% 连不上且域名二次验证不可达的判为整站红种，"
-                                     "不按个别红种删除（是否超期后整站删除由「整站失联超期删除」开关单独控制）；"
-                                     "红种占做种数达 80% 阈值时自动保护不处置。"
-                                     "删除/移动类处置要求：连续 N 次扫描仍异常（按实际扫描轮次累计，关机/停用期不计数） + 本页开关已打开。"),
-                        },
-                    },
+                    _section("整站失联", "mdi-lan-disconnect"),
                     {
                         "component": "VRow",
                         "content": [
@@ -544,9 +582,7 @@ class SeedSourceGuard(_PluginBase):
                                             "model": "site_offline_alert_days",
                                             "label": "整站失联提醒天数",
                                             "type": "number",
-                                            "hint": ("整站失联连续达到该天数后发第一次提醒，"
-                                                     "之后每 7 天提醒一次；本项只管提醒节奏，"
-                                                     "是否到天数自动删除由下方「整站失联超期删除」开关控制。"
+                                            "hint": ("连续失联达到该天数后发第一次提醒，之后每 7 天提醒一次；"
                                                      "填 0 表示不提醒。"),
                                             "persistent-hint": True,
                                         },
@@ -555,40 +591,15 @@ class SeedSourceGuard(_PluginBase):
                             },
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 8},
-                                "content": [
-                                    {
-                                        "component": "VAlert",
-                                        "props": {
-                                            "type": "info",
-                                            "variant": "tonal",
-                                            "text": ("整站红种判定（两级）：① 该 tracker 域名下做种任务 ≥90% 报"
-                                                     "「连不上站点」（不限任务数，只有 1-2 个任务的小站同样适用）；"
-                                                     "② 再直接访问该站点域名，确认也不可达。两级都成立才判为整站红种并进入跟踪。"
-                                                     "达到提醒天数后只发通知并在插件页列出；"
-                                                     "站点恢复可达则自动移出跟踪。"
-                                                     "如需到设定天数后自动清理该站种子，请开启下方「整站失联超期删除」。"),
-                                        },
-                                    }
-                                ],
-                            },
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            {
-                                "component": "VCol",
                                 "props": {"cols": 12, "md": 4},
                                 "content": [
                                     {
                                         "component": "VSwitch",
                                         "props": {
                                             "model": "site_offline_delete",
-                                            "label": "整站失联超期删除（默认关闭）",
-                                            "hint": ("开启后，某站连续失联达到下方设定天数，"
-                                                     "自动删除该站全部种子任务；源文件仍被其它正常种子覆盖则只删任务保留文件，"
-                                                     "无任何正常种子覆盖时连同源文件一起删除。"),
+                                            "label": "整站失联超期删除",
+                                            "hint": ("默认关闭；开启后某站连续失联达到右侧天数，"
+                                                     "自动删除该站全部种子任务。"),
                                             "persistent-hint": True,
                                         },
                                     }
@@ -602,28 +613,57 @@ class SeedSourceGuard(_PluginBase):
                                         "component": "VTextField",
                                         "props": {
                                             "model": "site_offline_delete_days",
-                                            "label": "整站失联超期删除天数",
+                                            "label": "超期删除天数",
                                             "type": "number",
-                                            "hint": ("连续失联达到该天数后删除该站全部种子；"
-                                                     "想填 30 就 30、想填 60 就 60；填 0 表示永不删除，只提醒。"),
+                                            "hint": "填 0 表示永不删除，只提醒。",
                                             "persistent-hint": True,
                                         },
                                     }
                                 ],
                             },
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
+                                "props": {"cols": 12},
+                                "content": [
+                                    {
+                                        "component": "VAlert",
+                                        "props": {
+                                            "type": "info",
+                                            "variant": "tonal",
+                                            "text": ("整站红种判定（两级）：① 该 tracker 域名下做种任务 ≥90% 报「连不上站点」"
+                                                     "（不限任务数，小站同样适用）；② 再直接访问站点域名确认也不可达。"
+                                                     "两级都成立才判为整站红种，该站全部种子不按个别红种删除，"
+                                                     "改为按天数跟踪并在插件数据页按站点列出；站点恢复可达则自动移出跟踪。"
+                                                     "只删该站自己的种子任务，别的站正常种子一律不动；"
+                                                     "源文件只要还有任一种子在做种就不删文件；"
+                                                     "删除前自动备份清单到临时目录，日志可回查。"),
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12},
                                 "content": [
                                     {
                                         "component": "VAlert",
                                         "props": {
                                             "type": "warning",
                                             "variant": "tonal",
-                                            "text": ("与红种删除同一口径：只删该站自己的种子任务，别的站正常种子一律不动；"
-                                                     "源文件只要还有任一种子在做种就不删文件。"
-                                                     "删除前自动备份清单到临时目录，日志可回查。"
-                                                     "仍受「允许执行删除/移动处置」总开关控制。"),
+                                            "text": ("安全规则：下载器连接失败或取不到任务列表时，本轮自动跳过该下载器，"
+                                                     "绝不会把任何文件判为孤儿；红种占做种数达 80% 阈值时自动保护不处置。"
+                                                     "删除/移动类处置要求：连续 N 次扫描仍异常（按实际扫描轮次累计，"
+                                                     "关机/停用期不计数）且本页「允许删除/移动处置」开关已打开。"),
                                         },
                                     }
                                 ],
@@ -637,9 +677,10 @@ class SeedSourceGuard(_PluginBase):
             "notify": True,
             "scan_times": 2,
             "clean_days": 7,
-            "scan_dirs": "/nastools/data/downloads/dianying/\n/nastools/data/downloads/tv/",
-            "exclude_dirs": "音乐\nmusic\n儿童\n临时下载\ndouyin\n杰伦十代\nflac\nape\nwav",
-            "downloaders": "",
+            # 默认值保持通用：不预置任何本机路径或个人目录名，扫描目录由用户按自身环境填写
+            "scan_dirs": "",
+            "exclude_dirs": "音乐\nmusic\n儿童\nflac\nape\nwav",
+            "downloaders": [],
             "max_depth": 3,
             "no_seed_action": "notify",
             "invalid_action": "notify",
@@ -949,38 +990,12 @@ class SeedSourceGuard(_PluginBase):
                if len(red) > max_rows else []),
         ))
 
-        if red_exempt:
-            exempt_rows = [{
-                "component": "tr",
-                "content": [
-                    {"component": "td", "props": {"class": "text-body-2"},
-                     "text": item.get("dl", "") or "-"},
-                    {"component": "td", "props": {"class": "text-caption"},
-                     "text": item.get("name", "") or "-"},
-                    {"component": "td", "props": {"class": "text-caption"},
-                     "text": item.get("reason", "") or item.get("kind", "") or "-"},
-                ],
-            } for item in red_exempt[:max_rows]]
-            page.append(_card(
-                ("整站红种（该站任务连不上且域名探测不可达，不按个别红种"
-                 + (f"；满 {self._site_offline_delete_days} 天整站删除"
-                    if self._site_offline_delete and self._site_offline_delete_days > 0
-                    else "，当前不处置")
-                 + "）"),
-                "mdi-lan-disconnect", info_c, f"{len(red_exempt)} 项", "info",
-                [_scroll_table(["下载器", "种子", "失败原因"], exempt_rows, min_width=900)]
-                + [{"component": "div",
-                    "props": {"class": "text-caption text-medium-emphasis mt-2"},
-                    "text": ("判定依据：该站任务 ≥90% 连不上（不限任务数，小站同样适用），"
-                             "且直接访问该站点域名不可达；站点恢复后自动移出，"
-                             "并回归个别红种判定。")}]
-                + ([{"component": "div",
-                     "props": {"class": "text-caption text-medium-emphasis mt-2"},
-                     "text": f"表格最多显示前 {max_rows} 项。"}]
-                   if len(red_exempt) > max_rows else []),
-            ))
-
-        if site_offline:
+        # 整站红种：按站点聚合展示，不再逐条列出具体种子。
+        # site_offline 是全部跟踪中的站点（含未达提醒天数的），red_exempt 是当前被豁免的种子明细，
+        # 两者同源；用 red_exempt 按 host 补出「涉及下载器」。
+        _site_offline_hosts = {str(item.get("host", "")) for item in site_offline
+                               if isinstance(item, dict) and item.get("host")}
+        if _site_offline_hosts or red_exempt:
             try:
                 from app.db.oper.site import SiteOper
                 _sites = SiteOper().list() or []
@@ -1001,45 +1016,104 @@ class SeedSourceGuard(_PluginBase):
                             getattr(best_site, "domain", "") or h)
                 return h or "-", h or "-"
 
-            offline_rows = [{
-                "component": "tr",
-                "content": [
-                    {"component": "td", "props": {"class": "text-body-2"},
-                     "content": [
-                         {"component": "VChip",
-                          "props": {"size": "x-small", "variant": "tonal",
-                                    "color": "warning", "class": "mr-1"},
-                          "text": _site_disp(item.get("host", ""))[0]},
-                         {"component": "VChip",
-                          "props": {"size": "x-small", "variant": "outlined",
-                                    "color": "grey"},
-                          "text": _site_disp(item.get("host", ""))[1]},
-                     ]},
-                    {"component": "td", "props": {"class": "text-caption"},
-                     "text": str(item.get("failed", 0))},
-                    {"component": "td", "props": {"class": "text-caption"},
-                     "text": f"{item.get('days', 0)} 天"},
-                ],
-            } for item in site_offline[:max_rows]]
+            # 按 host 聚合 red_exempt：涉及下载器集合 + 豁免种子数
+            _exempt_by_host: Dict[str, Dict[str, Any]] = {}
+            for item in red_exempt:
+                if not isinstance(item, dict):
+                    continue
+                host = str(item.get("host", "") or "")
+                if not host:
+                    continue
+                bucket = _exempt_by_host.setdefault(
+                    host, {"dls": set(), "count": 0})
+                dl = str(item.get("dl", "") or "")
+                if dl:
+                    bucket["dls"].add(dl)
+                bucket["count"] += 1
+
+            # 站点清单：以跟踪表为准；跟踪表没有、但当前有豁免种子的站点也纳入
+            merged_sites: Dict[str, Dict[str, Any]] = {}
+            for item in site_offline:
+                if isinstance(item, dict) and item.get("host"):
+                    merged_sites[str(item["host"])] = {
+                        "host": str(item["host"]),
+                        "days": item.get("days", 0),
+                        "failed": item.get("failed", 0),
+                    }
+            for host, agg in _exempt_by_host.items():
+                if host not in merged_sites:
+                    merged_sites[host] = {
+                        "host": host,
+                        "days": 0,
+                        "failed": agg["count"],
+                    }
+
+            def _site_status(days: Any) -> Tuple[str, str]:
+                """按连续失联天数返回（状态文字, chip 颜色）。"""
+                try:
+                    value = float(days or 0)
+                except (TypeError, ValueError):
+                    value = 0.0
+                if self._site_offline_delete and self._site_offline_delete_days > 0:
+                    if value >= self._site_offline_delete_days:
+                        return (f"满 {self._site_offline_delete_days} 天，将删除", "error")
+                    return (f"跟踪中·满 {self._site_offline_delete_days} 天删除", "warning")
+                if self._site_offline_alert_days and value >= self._site_offline_alert_days:
+                    return ("跟踪中·每 7 天提醒", "warning")
+                return ("观察中", "info")
+
+            offline_rows = []
+            for item in sorted(merged_sites.values(),
+                               key=lambda x: -float(x.get("days") or 0))[:max_rows]:
+                host = str(item.get("host", ""))
+                agg = _exempt_by_host.get(host) or {}
+                status_text, status_color = _site_status(item.get("days"))
+                offline_rows.append({
+                    "component": "tr",
+                    "content": [
+                        {"component": "td", "props": {"class": "text-body-2"},
+                         "content": [
+                             {"component": "VChip",
+                              "props": {"size": "x-small", "variant": "tonal",
+                                        "color": "warning", "class": "mr-1"},
+                              "text": _site_disp(host)[0]},
+                             {"component": "VChip",
+                              "props": {"size": "x-small", "variant": "outlined",
+                                        "color": "grey"},
+                              "text": _site_disp(host)[1]},
+                         ]},
+                        {"component": "td", "props": {"class": "text-caption"},
+                         "text": ("、".join(sorted(agg.get("dls") or [])) or "-")},
+                        {"component": "td", "props": {"class": "text-caption"},
+                         "text": str(item.get("failed", 0))},
+                        {"component": "td", "props": {"class": "text-caption"},
+                         "text": f"{item.get('days', 0)} 天"},
+                        {"component": "td", "content": [{
+                            "component": "VChip",
+                            "props": {"size": "x-small", "variant": "tonal",
+                                      "color": status_color},
+                            "text": status_text,
+                        }]},
+                    ],
+                })
             _offline_hint = (
-                "判定依据：该站做种任务 ≥90% 连不上，且直接访问站点域名同样不可达"
-                "（两级都成立才计入）。"
+                "判定依据：该站做种任务 ≥90% 连不上，且直接访问站点域名同样不可达（两级都成立才计入）。"
             )
             if self._site_offline_delete and self._site_offline_delete_days > 0:
                 _offline_hint += (f"已开启超期删除：连续失联满 {self._site_offline_delete_days} 天后，"
                                   "自动删除该站全部种子任务；源文件仍被其它正常种子覆盖则只删任务保留文件，"
                                   "无任何正常种子覆盖时连同源文件一起删除。")
             else:
-                _offline_hint += ("当前仅在此列出并每 7 天提醒一次，不处置；"
-                                  "确认站点已废弃后可自行清理对应种子，或开启「整站失联超期删除」。")
+                _offline_hint += (f"当前不处置：连续失联达到 {self._site_offline_alert_days} 天后每 7 天提醒一次；"
+                                  "确认站点已废弃可自行清理对应种子，或开启「整站失联超期删除」。")
             page.append(_card(
-                (f"整站红种跟踪（连续 ≥{self._site_offline_alert_days} 天起每 7 天提醒"
-                 + (f"，满 {self._site_offline_delete_days} 天自动删除"
-                    if self._site_offline_delete and self._site_offline_delete_days > 0 else "，不处置")
-                 + "）"),
-                "mdi-alert-decagram-outline", warn, f"{len(site_offline)} 个站", "warning",
-                [_scroll_table(["站点", "失联种子数", "连续失联"],
-                               offline_rows, min_width=640)]
+                ("整站红种（站点失联，按站点展示）"
+                 + (f"·满 {self._site_offline_delete_days} 天自动删除"
+                    if self._site_offline_delete and self._site_offline_delete_days > 0
+                    else "·不按个别红种处置")),
+                "mdi-lan-disconnect", warn, f"{len(merged_sites)} 个站", "warning",
+                [_scroll_table(["站点", "涉及下载器", "失联种子数", "连续失联", "状态"],
+                               offline_rows, min_width=860)]
                 + [{"component": "div",
                     "props": {"class": "text-caption text-medium-emphasis mt-2"},
                     "text": _offline_hint}],
@@ -2002,6 +2076,8 @@ class SeedSourceGuard(_PluginBase):
                 "name": item.get("name", ""),
                 "reason": item.get("reason", ""),
                 "kind": item.get("kind", ""),
+                # 站点级展示用：tracker 域名，数据页据此按站点聚合整站红种
+                "host": item.get("host", ""),
             })
         self.save_data("active", {
             "no_seed_active": active_no_seed,
